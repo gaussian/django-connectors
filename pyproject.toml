@@ -104,6 +104,9 @@ ignore = [
 # generated migrations are run through `ruff check --fix` + `ruff format`, which
 # is semantically inert (`makemigrations --check` still reports no changes).
 "django_connectors/migrations/*.py" = ["RUF012"]
+# The example project is linted too — sample code is copied verbatim — but
+# its generated migrations have the same constraint.
+"example/*/migrations/*.py" = ["RUF012"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["django_connectors"]

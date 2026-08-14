@@ -8,7 +8,9 @@ ingestion via dlt. Django library published to PyPI.
 
 - Source: `django_connectors/`
 - Tests: `tests/` — run with `uv run --all-extras pytest`. See "Test tiers" below.
-- Lint + format: `uv run --all-extras ruff check django_connectors/ tests/` and `ruff format --check django_connectors/ tests/` (config in `pyproject.toml`)
+- Lint + format: `uv run --all-extras ruff check django_connectors/ tests/ example/` and
+  `ruff format --check django_connectors/ tests/ example/` (config in `pyproject.toml`).
+  `example/` is linted because hosts copy it verbatim.
 - Default working branch: `develop`. Releases flow `develop` → `main`.
 
 ## Test tiers
@@ -20,6 +22,7 @@ Three tiers, all gated behind the aggregate `ci` check:
 | default | `uv run --all-extras pytest` | everything; landing runs on sqlite, no docker needed |
 | minimal | `uv run pytest` | proves the package works with **no extras installed** |
 | mysql | `uv run --all-extras pytest -m mysql` | defects sqlite cannot express |
+| example | `cd example && python manage.py demo` | the host-integration story end to end |
 
 `@pytest.mark.mysql` tests skip unless `DJANGO_CONNECTORS_TEST_MYSQL_URL` is
 set. They are not optional polish — three verified data-loss defects (silent
@@ -37,7 +40,16 @@ DJANGO_CONNECTORS_TEST_MYSQL_URL=mysql+pymysql://root:connectors@127.0.0.1:33062
 
 The `minimal` tier matters because `--all-extras` installs every extra, so it
 never exercises the "this extra is absent" path that the whole optional
-dependency design depends on.
+dependency design depends on. **Locally it is vacuous by default**: `uv run`
+reuses whatever virtualenv `uv sync --all-extras` populated. To reproduce what
+CI does, point it at a clean environment:
+
+```bash
+UV_PROJECT_ENVIRONMENT=/tmp/dc-minimal uv run pytest
+```
+
+This caught a real failure: a test module importing `rest_framework` at module
+scope, which would have failed collection in that CI job.
 
 ## Branching & releases
 

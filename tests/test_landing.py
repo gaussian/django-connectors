@@ -451,3 +451,26 @@ def test_dlt_defaults_write_disposition_to_append_not_none():
 
     resource = dlt.resource([{"id": 1}], name="x", primary_key="id")
     assert resource._hints.get("write_disposition") == "append"
+
+
+def test_json_columns_read_back_parsed_not_as_text(connectors_settings, make_binding):
+    """Backends disagree about what a JSON column yields.
+
+    sqlite hands back serialized text while MySQL hands back parsed data, so
+    without normalisation the same mapping would produce a string in tests and a
+    dict in production.
+    """
+    binding = make_binding(
+        config=memory_config(
+            batches=[[{"id": "1", "meta": {"plan": "pro"}, "tags": ["a", "b"]}]]
+        )
+    )
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+
+    row = access.sample_rows(binding, "events", limit=1)[0]
+    assert row["meta"] == {"plan": "pro"}
+    assert row["tags"] == ["a", "b"]
+
+    relation = access.binding_relation(binding, "events")
+    streamed = next(iter(access.iter_rows(relation)))
+    assert streamed["meta"] == {"plan": "pro"}

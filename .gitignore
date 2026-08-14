@@ -84,3 +84,8 @@ local_settings.py
 # dlt
 .dlt/secrets.toml
 ~/.dlt/
+
+# example project artifacts
+example/*.sqlite3
+example/landing*.db
+example/.dlt-pipelines/

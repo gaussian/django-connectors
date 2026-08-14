@@ -16,6 +16,9 @@ surface could not express the mapping DSL anyway (it has no ``coalesce``,
 hand-rolling an escaper.
 """
 
+import contextlib
+import json
+
 from django_connectors.exceptions import LandingSchemaError
 from django_connectors.landing.destination import build_pipeline
 from django_connectors.landing.naming import (
@@ -80,6 +83,37 @@ def binding_relation(binding, resource, *, load_ids=None, pipeline=None):
     return relation
 
 
+def json_columns(relation):
+    """Names of columns dlt typed as JSON.
+
+    Needed because backends disagree about what a JSON column reads back as:
+    sqlite hands back the serialized text while MySQL hands back parsed data.
+    Left alone, an identical mapping would produce a string on one backend and a
+    dict on the other — so the same mapping would work in tests and fail in
+    production, or vice versa.
+    """
+    try:
+        schema = dict(relation.columns_schema)
+    except Exception:
+        return frozenset()
+    return frozenset(
+        name
+        for name, column in schema.items()
+        if (column or {}).get("data_type") == "json"
+    )
+
+
+def _decode(row, json_column_names):
+    for name in json_column_names:
+        value = row.get(name)
+        if isinstance(value, str | bytes):
+            # Left as-is on failure: a column dlt typed as JSON that does not
+            # parse is worth surfacing to the mapping author, not swallowing.
+            with contextlib.suppress(TypeError, ValueError):
+                row[name] = json.loads(value)
+    return row
+
+
 def iter_rows(relation, *, chunk_size=1000, order_by=None):
     """Yield landing rows as dicts, in a deterministic order.
 
@@ -89,19 +123,24 @@ def iter_rows(relation, *, chunk_size=1000, order_by=None):
     "retry is idempotent" untestable.
     """
     columns = list(relation.columns)
+    json_names = json_columns(relation)
     if order_by:
         for column in order_by:
             relation = relation.order_by(column, "asc")
     for chunk in relation.iter_fetch(chunk_size):
         for row in chunk:
-            yield dict(zip(columns, row, strict=False))
+            yield _decode(dict(zip(columns, row, strict=False)), json_names)
 
 
 def sample_rows(binding, resource, *, limit, pipeline=None):
     """A bounded sample for the mapping UI. Never unbounded."""
     relation = binding_relation(binding, resource, pipeline=pipeline).limit(limit)
     columns = list(relation.columns)
-    return [dict(zip(columns, row, strict=False)) for row in relation.fetchall()]
+    json_names = json_columns(relation)
+    return [
+        _decode(dict(zip(columns, row, strict=False)), json_names)
+        for row in relation.fetchall()
+    ]
 
 
 def landing_columns(binding, resource, *, pipeline=None):
