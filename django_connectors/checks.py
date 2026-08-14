@@ -128,6 +128,92 @@ def check_registry_paths_import(app_configs, **kwargs):
 
 
 @register(Tags.compatibility)
+def check_secret_configuration(app_configs, **kwargs):
+    """SECRET_STORE must resolve, and a store that persists must know how.
+
+    Deliberately separate from the W005 extras probe below, whose
+    ``except Exception: pass`` exists to keep an unrelated store failure from
+    hiding every other warning — and which therefore swallows exactly the
+    errors reported here.
+
+    Every failure below is one a host otherwise meets at the first credential
+    write, which is inside an OAuth callback: the user has already left for the
+    provider and come back, and what they get is a 500 rather than a page. The
+    settings that cause it are all readable now.
+    """
+    from django_connectors.enums import SecretEncryption
+    from django_connectors.secrets import ModelSecretStore, get_secret_store
+
+    errors = []
+
+    store = None
+    try:
+        store = get_secret_store()
+    except Exception as exc:
+        errors.append(
+            Error(
+                f"{SETTING_NAME}['SECRET_STORE'] could not be resolved: {exc}",
+                hint=(
+                    "It must be a dotted path to a SecretStore subclass (or an "
+                    "instance of one), e.g. "
+                    "'django_connectors.secrets.ModelSecretStore'."
+                ),
+                id="django_connectors.E004",
+            )
+        )
+
+    encryption = conf.SECRET_ENCRYPTION
+    if encryption not in (None, "") and encryption not in SecretEncryption.values:
+        errors.append(
+            Error(
+                f"{SETTING_NAME}['SECRET_ENCRYPTION'] = {encryption!r} is not a "
+                f"known scheme. Valid values: "
+                f"{', '.join(SecretEncryption.values)}.",
+                id="django_connectors.E004",
+            )
+        )
+        return errors
+
+    # Only a store that writes credentials somewhere of its own reads these two
+    # settings; a read-only or external-manager store legitimately ignores them.
+    if not isinstance(store, ModelSecretStore):
+        return errors
+
+    if encryption in (None, ""):
+        errors.append(
+            Error(
+                f"{SETTING_NAME}['SECRET_STORE'] is {store}, which persists "
+                f"credentials, but {SETTING_NAME}['SECRET_ENCRYPTION'] is not "
+                f"set, so every credential write will be refused.",
+                hint=(
+                    f"Set it to {SecretEncryption.FERNET.value!r} (encrypted at "
+                    f"rest) or {SecretEncryption.NONE.value!r} (plaintext "
+                    f"column, django-allauth's trust model). There is "
+                    f"deliberately no default."
+                ),
+                id="django_connectors.E004",
+            )
+        )
+    elif encryption == SecretEncryption.FERNET and conf.SECRET_KEY in (None, ""):
+        errors.append(
+            Error(
+                f"{SETTING_NAME}['SECRET_ENCRYPTION'] is "
+                f"{SecretEncryption.FERNET.value!r} but "
+                f"{SETTING_NAME}['SECRET_KEY'] is not set, so no credential can "
+                f"be written or read.",
+                hint=(
+                    'Generate one with `python -c "from cryptography.fernet '
+                    'import Fernet; print(Fernet.generate_key().decode())"`. It '
+                    "must not be settings.SECRET_KEY: rotating that would make "
+                    "every stored credential unreadable."
+                ),
+                id="django_connectors.E004",
+            )
+        )
+    return errors
+
+
+@register(Tags.compatibility)
 def check_registry_extras_available(app_configs, **kwargs):
     """Warn when a loaded backend declares an extra that is not installed.
 

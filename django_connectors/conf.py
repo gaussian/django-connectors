@@ -85,12 +85,6 @@ DEFAULTS: dict[str, Any] = {
     "ERROR_MESSAGE_MAX_LENGTH": 4096,
 }
 
-# Keys whose value must be a dotted import path (or a mapping of them). Checked
-# by system checks rather than at access time, so `manage.py check` reports all
-# of them at once instead of failing on whichever is touched first.
-DOTTED_PATH_KEYS = frozenset({"SECRET_STORE"})
-DOTTED_PATH_MAPPING_KEYS = frozenset({"SOURCES", "AUTH_BACKENDS"})
-
 
 class Settings:
     """Lazy, validated, cached view over ``settings.DJANGO_CONNECTORS``."""

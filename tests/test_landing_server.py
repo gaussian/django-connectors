@@ -295,6 +295,119 @@ def test_record_updated_at_the_cursor_boundary_survives(server_settings, make_bi
     ]
 
 
+def test_a_key_duplicated_inside_one_batch_keeps_the_newest_on_every_backend(
+    server_settings, make_binding
+):
+    """In-package dedup is done by the destination, so it is dialect-shaped.
+
+    Without a ``dedup_sort`` hint the merge job orders the ROW_NUMBER() window
+    by ``(SELECT NULL)`` and keeps the oldest version — measured identically on
+    sqlite, MySQL and PostgreSQL — while the cursor advances past the newest,
+    which the source will therefore never re-send.
+    """
+    binding = make_binding(
+        config=memory_config(
+            cursor="updated_at",
+            batches=[
+                [
+                    {"id": "1", "updated_at": "2024-01-01T00:00:00Z", "v": "old"},
+                    {"id": "1", "updated_at": "2024-01-02T00:00:00Z", "v": "NEW"},
+                ],
+                [
+                    {"id": "1", "updated_at": "2024-01-03T00:00:00Z", "v": "edited"},
+                    {
+                        "id": "1",
+                        "updated_at": "2024-01-04T00:00:00Z",
+                        DELETED_COLUMN: True,
+                    },
+                ],
+            ],
+        )
+    )
+    first = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert first.status == RunStatus.SUCCEEDED, first.error_message
+    assert [row["v"] for row in access.sample_rows(binding, "events", limit=5)] == [
+        "NEW"
+    ]
+
+    # And a delete emitted after an edit for the same key must win, or the
+    # deletion is dropped and the host keeps a record the provider removed.
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == RunStatus.SUCCEEDED, second.error_message
+    rows = access.sample_rows(binding, "events", limit=5)
+    assert len(rows) == 1
+    assert bool(rows[0][DELETED_COLUMN]) is True
+
+
+# --- pending packages and purge --------------------------------------------
+
+
+def test_an_extract_stage_pending_package_is_drained_on_every_backend(
+    server_settings, make_binding
+):
+    """`pipeline.load()` cannot see a package that was never normalized.
+
+    A worker killed between extract and normalize leaves one. Every later Run
+    then refuses to extract, and a recovery Run that drained nothing used to be
+    recorded as succeeded — advancing `last_success_at` on a wedged Binding.
+    """
+    from django_connectors.landing.destination import build_pipeline
+
+    binding = make_binding(
+        config=memory_config(batches=[[{"id": "1", "v": "extracted"}], [{"id": "2"}]])
+    )
+    definition = sources.get("memory")
+    interrupted = Run.objects.create(binding=binding, trigger=RunTrigger.INITIAL)
+    pipeline = build_pipeline(binding)
+    source = definition.build_source(binding=binding, credentials=None, run=interrupted)
+    instrument_source(
+        source, binding=binding, run=interrupted, source_definition=definition
+    )
+    pipeline.extract(source)
+    assert pipeline.list_extracted_load_packages()
+
+    run = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    recovery = Run.objects.get(binding=binding, trigger=RunTrigger.RECOVERY)
+    assert recovery.status == RunStatus.SUCCEEDED
+    assert recovery.dlt_load_ids, "the recovery run landed nothing"
+
+    table = landing_table_name("memory", "events", binding.landing_key)
+    assert _count(server_settings.url, table) == 2
+    assert not build_pipeline(binding).has_pending_data
+
+
+def test_purge_from_a_worker_that_never_ran_the_binding_drops_the_tables(
+    server_settings, make_binding, tmp_path, settings
+):
+    """dlt's schema store is local to a pipeline directory; the tables are not.
+
+    Issued from any worker but the one that ran the Binding, the purge resolved
+    no schema, dropped nothing, and still stamped `landing_purged_at` — after
+    which the pre_delete guard allowed the Binding to be deleted and its rows
+    were stranded with a `_connector_binding_id` pointing at nothing.
+    """
+    from django_connectors.services import retention
+
+    binding = make_binding(config=memory_config(batches=[[{"id": "1"}, {"id": "2"}]]))
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    table = landing_table_name("memory", "events", binding.landing_key)
+    assert _count(server_settings.url, table) == 2
+
+    settings.DJANGO_CONNECTORS = {
+        **settings.DJANGO_CONNECTORS,
+        "PIPELINES_DIR": str(tmp_path / "second_worker"),
+    }
+
+    assert retention.purge_binding_landing(binding)["dropped_tables"] == [table]
+    # Asserted against the server, not against the purge's own report — the
+    # report is exactly what used to lie.
+    assert _columns(server_settings.url, table) == {}
+
+
 # --- dialect-specific ------------------------------------------------------
 
 

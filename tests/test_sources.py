@@ -403,6 +403,46 @@ def test_rest_guarded_session_refuses_a_redirect_to_an_internal_host(
     assert hops[-1] == "http://169.254.169.254/latest/", hops
 
 
+def test_rest_guarded_session_refuses_a_host_that_rebinds_after_the_check(
+    serve, monkeypatch
+):
+    """The guard's DNS answer is not the one urllib3 connects with.
+
+    A name whose zone the attacker runs answers the check with a public address
+    and the connection with ``127.0.0.1``; nothing in ``assert_safe_url`` can
+    see that, because it never touches the socket. Rebinding is simulated
+    rather than performed — ``_resolve`` is the guard's only view of DNS, so
+    lying to it and letting the real lookup of ``localhost`` stand reproduces
+    exactly the split the attack creates, offline.
+    """
+    from django_connectors.sources import rest as rest_module
+
+    reached = []
+
+    def app(environ, start_response):
+        reached.append(environ["PATH_INFO"])
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"SIMULATED-CLOUD-METADATA-CREDENTIALS"]
+
+    port = serve(app).rsplit(":", 1)[1].rstrip("/")
+    real_resolve = rest_module._resolve
+
+    def rebinding_resolve(host, port_number):
+        # The answer the guard gets. The socket's own lookup of "localhost"
+        # is untouched and still lands on loopback.
+        if host == "localhost":
+            return {"93.184.216.34"}
+        return real_resolve(host, port_number)
+
+    monkeypatch.setattr(rest_module, "_resolve", rebinding_resolve)
+    session = rest_module.guarded_session(allow_private=False)
+
+    with pytest.raises(ConfigurationError, match="rebinding"):
+        session.get(f"http://localhost:{port}/latest/meta-data/", timeout=5)
+
+    assert reached == [], "the request reached the loopback service anyway"
+
+
 # --- sql -------------------------------------------------------------------
 
 

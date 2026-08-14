@@ -9,6 +9,7 @@ from django_connectors.checks import (
     check_landing_url,
     check_registry_extras_available,
     check_registry_paths_import,
+    check_secret_configuration,
 )
 
 GOOD_LANDING = "mysql+pymysql://user:pw@localhost:3306/connectors_landing"
@@ -98,3 +99,86 @@ class SourceNeedingExtra:
 
 class SourceWithPresentExtra:
     required_extras: ClassVar[dict[str, str]] = {"json": "stdlib"}
+
+
+# --- E004: the secret store ---------------------------------------------------
+#
+# Every case here is one a host otherwise meets at the first credential write,
+# i.e. inside an OAuth callback, as a 500 on a page the user came back to.
+
+MODEL_STORE = "django_connectors.secrets.ModelSecretStore"
+FERNET_KEY = "8Jw0aeIZ2Y1sRZgO4rVh0Ck1s9lLPvOL0nP7lqM6VwA="
+
+
+def test_no_secret_error_for_the_default_null_store():
+    """The default stores nothing and reads neither setting."""
+    assert check_secret_configuration(None) == []
+
+
+@override_settings(DJANGO_CONNECTORS={"SECRET_STORE": "django_connectors.Nope"})
+def test_e004_when_the_secret_store_cannot_be_imported():
+    messages = check_secret_configuration(None)
+    assert _ids(messages) == ["django_connectors.E004"]
+    assert "SECRET_STORE" in messages[0].msg
+
+
+@override_settings(DJANGO_CONNECTORS={"SECRET_STORE": "tests.test_checks.NotAStore"})
+def test_e004_when_the_secret_store_is_not_a_secret_store():
+    assert _ids(check_secret_configuration(None)) == ["django_connectors.E004"]
+
+
+@override_settings(DJANGO_CONNECTORS={"SECRET_STORE": MODEL_STORE})
+def test_e004_when_a_persisting_store_has_no_encryption_scheme():
+    """This exact pair is what makes every set() raise. Say so at check time."""
+    messages = check_secret_configuration(None)
+    assert _ids(messages) == ["django_connectors.E004"]
+    assert "SECRET_ENCRYPTION" in messages[0].msg
+
+
+@override_settings(
+    DJANGO_CONNECTORS={"SECRET_STORE": MODEL_STORE, "SECRET_ENCRYPTION": "fernet"}
+)
+def test_e004_when_fernet_has_no_key():
+    messages = check_secret_configuration(None)
+    assert _ids(messages) == ["django_connectors.E004"]
+    assert "SECRET_KEY" in messages[0].msg
+
+
+@override_settings(
+    DJANGO_CONNECTORS={"SECRET_STORE": MODEL_STORE, "SECRET_ENCRYPTION": "rot13"}
+)
+def test_e004_when_the_encryption_scheme_is_unknown():
+    messages = check_secret_configuration(None)
+    assert _ids(messages) == ["django_connectors.E004"]
+    assert "rot13" in messages[0].msg
+
+
+@override_settings(
+    DJANGO_CONNECTORS={"SECRET_STORE": MODEL_STORE, "SECRET_ENCRYPTION": "none"}
+)
+def test_no_secret_error_for_an_explicit_plaintext_choice():
+    """Plaintext is a legitimate, documented choice — it just has to be taken."""
+    assert check_secret_configuration(None) == []
+
+
+@override_settings(
+    DJANGO_CONNECTORS={
+        "SECRET_STORE": MODEL_STORE,
+        "SECRET_ENCRYPTION": "fernet",
+        "SECRET_KEY": FERNET_KEY,
+    }
+)
+def test_no_secret_error_for_a_complete_fernet_configuration():
+    assert check_secret_configuration(None) == []
+
+
+@override_settings(
+    DJANGO_CONNECTORS={"SECRET_STORE": "django_connectors.secrets.SettingsSecretStore"}
+)
+def test_no_secret_error_for_a_store_that_does_not_read_those_settings():
+    """A read-only store legitimately ignores SECRET_ENCRYPTION; do not nag."""
+    assert check_secret_configuration(None) == []
+
+
+class NotAStore:
+    """A dotted path that imports fine and is still not a SecretStore."""

@@ -12,6 +12,13 @@ Binding's cursor then advances past records nobody has.
 So a Run is only marked succeeded when dlt reports no failed jobs, reports at
 least one load id, and those load ids have not already been claimed by an
 earlier Run of the same Binding.
+
+The same rule governs the recovery path. "Pending" covers two stages and
+``pipeline.load()`` covers only the second, so :func:`drain_pending` normalizes
+first and refuses to return at all while anything is still pending — a recovery
+Run recorded as succeeded advances ``binding.last_success_at`` and leaves the
+Binding `active`, which is a health signal reporting green for a Binding that
+has stopped syncing.
 """
 
 import logging
@@ -83,6 +90,19 @@ def execute(binding, run, *, source_definition, credentials, allow_pending=False
 def _verify(binding, run, pipeline, load_info):
     """Turn a LoadInfo into a trustworthy verdict."""
     from django_connectors.models import Run
+
+    if load_info is None:
+        # `Pipeline.load()` returns `pip_ex.step_info` when it cleans up an
+        # aborted package, and that is None when the step failed before it
+        # produced any. Dereferencing it raised `AttributeError: 'NoneType'
+        # object has no attribute 'has_failed_jobs'` from inside the runner —
+        # an undiagnosable error in place of "nothing landed".
+        return {
+            "load_ids": [],
+            "metrics": _metrics(pipeline),
+            "landed": False,
+            "schema": schema_snapshot(pipeline, binding),
+        }
 
     if load_info.has_failed_jobs:
         raise LandingWedgedError(
@@ -157,8 +177,36 @@ def drain_pending(binding, run):
     pipeline = build_pipeline(binding)
     if not has_pending_data(pipeline):
         return {"load_ids": [], "metrics": {}, "landed": False}
-    load_info = pipeline.load()
-    return _verify(binding, run, pipeline, load_info)
+
+    # Two stages, because `has_pending_data` covers both and `load()` covers
+    # only one. A package left at the *extract* stage — a worker killed between
+    # extract and normalize, or a normalize that raised — is invisible to
+    # `load()`, so draining with `load()` alone reported "nothing to do" while
+    # `has_pending_data` stayed true: every later Run refused to extract, and
+    # the Binding wedged forever.
+    if pipeline.list_extracted_load_packages():
+        pipeline.normalize()
+
+    load_info = None
+    if pipeline.list_normalized_load_packages():
+        load_info = pipeline.load()
+
+    result = _verify(binding, run, pipeline, load_info)
+
+    if has_pending_data(pipeline):
+        # The package survived a full drain, so nothing here will ever shift it
+        # and no later Run can extract. Raising keeps the recovery Run off
+        # `succeeded`: recorded as success it would advance
+        # `binding.last_success_at` and leave the Binding `active`, which is a
+        # health signal reporting green for a Binding that has stopped syncing.
+        raise PendingPackageError(
+            f"pipeline {binding.pipeline_name} still holds pending packages "
+            f"after a full drain: extracted="
+            f"{pipeline.list_extracted_load_packages()}, normalized="
+            f"{pipeline.list_normalized_load_packages()}. No later Run can "
+            f"extract until they are removed."
+        )
+    return result
 
 
 def schema_snapshot(pipeline, binding):

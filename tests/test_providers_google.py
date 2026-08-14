@@ -254,6 +254,14 @@ class FakeGmail(_FakeApi):
         self.history_id = history_id
         self.history = []
         self.history_expired = False
+        # When set, every history page answers with this same nextPageToken —
+        # the provider/proxy bug that a walk without a circuit breaker turns
+        # into an unbounded loop holding the Binding's lease. The repeat stops
+        # after `history_repeat_limit` pages purely so that a regression in the
+        # breaker is a failing assertion rather than a hung test suite.
+        self.history_repeat_token = None
+        self.history_repeat_limit = 25
+        self.history_repeats = 0
 
     def __call__(self, environ, start_response):
         self.record(environ)
@@ -301,9 +309,22 @@ class FakeGmail(_FakeApi):
             )
         start = int(query.get("startHistoryId", ["0"])[0])
         records = [record for record in self.history if int(record["id"]) > start]
+        # history.list paginates like every other Google collection, and the
+        # walk has to follow it or it lands a mailbox missing whatever fell
+        # after page one.
+        token = query.get("pageToken", ["0"])[0]
+        offset = int(token) if token.isdigit() else 0
+        size = int(query.get("maxResults", ["100"])[0])
+        page = records[offset : offset + size]
         payload = {"historyId": self.history_id}
-        if records:
-            payload["history"] = records
+        if page:
+            payload["history"] = page
+        if self.history_repeat_token is not None:
+            self.history_repeats += 1
+            if self.history_repeats <= self.history_repeat_limit:
+                payload["nextPageToken"] = self.history_repeat_token
+        elif offset + size < len(records):
+            payload["nextPageToken"] = str(offset + size)
         return _json(start_response, payload)
 
     def _message(self, start_response, message_id):
@@ -738,6 +759,74 @@ def test_gmail_an_empty_history_window_still_advances_the_cursor(
     assert third.status == RunStatus.SUCCEEDED, third.error_message
     starts = [call["query"]["startHistoryId"][0] for call in api.calls("/history")]
     assert starts == ["1010"], "the cursor did not advance across an empty run"
+
+
+def test_gmail_history_walk_follows_every_page(gmail_server, gmail_binding):
+    """history.list paginates too, and stopping at page 1 loses changes silently.
+
+    The lost rows are the ones that changed least recently in the window, so
+    the mailbox looks current and the gap only shows up as rows that never
+    catch up.
+    """
+    api = gmail_server(
+        FakeGmail(messages=[gmail_message(f"m{n}") for n in range(1, 6)])
+    )
+    binding = gmail_binding(page_size=2)
+
+    first = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert first.status == RunStatus.SUCCEEDED, first.error_message
+
+    # Five separate history records, read two pages at a time.
+    api.history_id = "1010"
+    api.history = [
+        {"id": str(1001 + n), "labelsAdded": [{"message": {"id": f"m{n + 1}"}}]}
+        for n in range(5)
+    ]
+    for n in range(1, 6):
+        api.messages[f"m{n}"] = gmail_message(f"m{n}", subject=f"changed {n}")
+    api.requests.clear()
+
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == RunStatus.SUCCEEDED, second.error_message
+
+    tokens = [
+        call["query"].get("pageToken", [None])[0] for call in api.calls("/history")
+    ]
+    assert tokens == [None, "2", "4"], tokens
+
+    rows = {row["id"]: row for row in access.sample_rows(binding, "messages", limit=20)}
+    assert sorted(rows) == ["m1", "m2", "m3", "m4", "m5"]
+    assert [rows[f"m{n}"]["subject"] for n in range(1, 6)] == [
+        f"changed {n}" for n in range(1, 6)
+    ], "a history page after the first was never walked"
+
+
+def test_gmail_a_repeated_history_page_token_fails_instead_of_looping(
+    gmail_server, gmail_binding
+):
+    """A provider echoing one pageToken back must not become an infinite walk.
+
+    Without a breaker the run never returns: it holds the Binding's lease and
+    burns quota until the lease is reaped, and the next worker enters the same
+    loop. Failing the run is recoverable; a wedged worker is not.
+    """
+    api = gmail_server(FakeGmail(messages=[gmail_message("m1")]))
+    binding = gmail_binding()
+
+    first = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert first.status == RunStatus.SUCCEEDED, first.error_message
+
+    api.history_id = "1010"
+    api.history = [{"id": "1005", "labelsAdded": [{"message": {"id": "m1"}}]}]
+    api.history_repeat_token = "stuck-token"
+    api.requests.clear()
+
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == RunStatus.FAILED, second.status
+    assert "pageToken" in second.error_message, second.error_message
+    # Second page, and no further: the repeat is caught the first time it is
+    # seen again, not after the fake stops repeating.
+    assert len(api.calls("/history")) == 2, api.paths()
 
 
 # --- gmail: labels -----------------------------------------------------------
@@ -1278,13 +1367,26 @@ def test_sheets_a_renamed_key_column_fails_loudly(sheets_server, sheets_binding)
 def test_sheets_reads_every_range_in_one_batch_request(
     sheets_server, make_binding, google_connection
 ):
-    """N resources must not become N round trips."""
+    """N resources must not become N round trips — and each must get its own rows.
+
+    The grids are deliberately different shapes: ``values.batchGet`` answers in
+    request order and the response is zipped back onto the resource names by
+    position, because the ``range`` Google echoes is normalized and cannot be
+    used as a key. Nothing else enforces that association, so asserting only
+    row counts would let a reordering land one resource's rows in the other's
+    table — silent cross-resource corruption with every run reporting success.
+    """
     lookup_range = "Lookup!A:B"
     api = sheets_server(
         FakeSheets(
             {
-                ORDERS_RANGE: [["Order ID"], ["o1"]],
-                lookup_range: [["Code", "Label"], ["a", "Alpha"]],
+                ORDERS_RANGE: [["Order ID", "Status"], ["o1", "new"], ["o2", "sent"]],
+                lookup_range: [
+                    ["Code", "Label"],
+                    ["a", "Alpha"],
+                    ["b", "Beta"],
+                    ["c", "Gamma"],
+                ],
             }
         )
     )
@@ -1304,8 +1406,21 @@ def test_sheets_reads_every_range_in_one_batch_request(
     batch_calls = api.calls("/values:batchGet")
     assert len(batch_calls) == 1, api.paths()
     assert batch_calls[0]["query"]["ranges"] == [ORDERS_RANGE, lookup_range]
-    assert len(access.sample_rows(binding, "orders", limit=10)) == 1
-    assert len(access.sample_rows(binding, "lookup", limit=10)) == 1
+
+    orders = access.sample_rows(binding, "orders", limit=10)
+    assert business_columns(orders) == ["order_id", "sheet_row_number", "status"]
+    assert {row["order_id"]: row["status"] for row in orders} == {
+        "o1": "new",
+        "o2": "sent",
+    }
+
+    lookup = access.sample_rows(binding, "lookup", limit=10)
+    assert business_columns(lookup) == ["code", "label", "sheet_row_number"]
+    assert {row["code"]: row["label"] for row in lookup} == {
+        "a": "Alpha",
+        "b": "Beta",
+        "c": "Gamma",
+    }
 
 
 def test_sheets_skip_unchanged_uses_drive_and_leaves_the_rows_alone(

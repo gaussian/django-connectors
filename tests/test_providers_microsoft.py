@@ -28,7 +28,10 @@ plausible ``DltSource`` and lands nothing at all passes any test that stops at
 import datetime as dt
 import io
 import json
+import re
 import threading
+import tracemalloc
+import zipfile
 from collections import deque
 from http import HTTPStatus
 from typing import ClassVar
@@ -1150,6 +1153,36 @@ def test_excel_unmerges_a_merged_header_when_asked(microsoft_settings):
     assert sorted(filled[0][2]) == ["id", "quarter", "quarter_2"], filled[0][2]
 
 
+def test_excel_unmerge_does_not_resurrect_the_rows_below_the_data(microsoft_settings):
+    """Somebody merged A2:A200 over two rows of data; there are still two rows.
+
+    The fill writes the merged value into every cell of the region, so a region
+    running past the last real row makes those rows non-blank — and the
+    trailing-blank trim, which exists precisely to stop all-NULL records
+    landing, then finds nothing to trim. Each resurrected row is blank in every
+    key column but the merged one, so a keyed Binding either fails the Run or
+    collapses 197 empty rows onto one identity.
+    """
+
+    def build(workbook):
+        sheet = workbook.active
+        sheet.title = "Data"
+        sheet.append(["Region", "Amount"])
+        sheet.append(["North", 1])
+        sheet.append([None, 2])
+        sheet.merge_cells("A2:A200")
+
+    data = build_workbook(build)
+
+    records = list(excel_module.worksheet_records(data, unmerge=True))
+
+    assert [(row_number, values) for _, row_number, values in records] == [
+        (2, {"region": "North", "amount": 1}),
+        # Still filled where there is data to fill alongside.
+        (3, {"region": "North", "amount": 2}),
+    ]
+
+
 def test_excel_refuses_a_workbook_larger_than_the_configured_cap(
     microsoft_settings, make_graph_binding, graph
 ):
@@ -1160,6 +1193,80 @@ def test_excel_refuses_a_workbook_larger_than_the_configured_cap(
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     assert run.status == RunStatus.FAILED
     assert "max_file_bytes" in run.error_message, run.error_message
+
+
+def workbook_with_declared_dimension(rows, dimension):
+    """A workbook of `rows` honest rows whose ``<dimension>`` says otherwise.
+
+    Only the declaration is rewritten; the cell data is untouched, so the file
+    stays small and passes ``max_file_bytes`` with room to spare. This is what
+    a hostile (or merely buggy) generator produces.
+    """
+
+    def build(workbook):
+        sheet = workbook.active
+        sheet.title = "Data"
+        sheet.append(["id", "amount"])
+        for index in range(rows):
+            sheet.append([f"r{index}", index])
+
+    original = build_workbook(build)
+    rewritten = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(original)) as source,
+        zipfile.ZipFile(rewritten, "w", zipfile.ZIP_DEFLATED) as target,
+    ):
+        for info in source.infolist():
+            payload = source.read(info.filename)
+            if info.filename.endswith("sheet1.xml"):
+                payload = re.sub(
+                    rb'<dimension ref="[^"]*" ?/>',
+                    f'<dimension ref="{dimension}"/>'.encode(),
+                    payload,
+                )
+                assert dimension.encode() in payload, "the dimension was not rewritten"
+            target.writestr(info, payload)
+    return rewritten.getvalue()
+
+
+def test_excel_does_not_size_its_memory_from_a_workbooks_own_dimension(
+    microsoft_settings,
+):
+    """`max_file_bytes` bounds the download; nothing bounded the parse.
+
+    openpyxl trusts ``<dimension>``, so a read-only sheet pads every row it
+    streams out to the declared width and the grid costs
+    ``real_rows x declared_width``. A 50 KB file 600x under the byte cap
+    therefore asks for hundreds of megabytes, and an unlimited worker is
+    OOM-killed — taking every co-tenant Run with it, which is the exact outcome
+    the byte cap's docstring promises to prevent.
+    """
+    honest = workbook_with_declared_dimension(20, "A1:B21")
+    bomb = workbook_with_declared_dimension(1000, "A1:XFD1048576")
+    assert len(bomb) < 200_000, len(bomb)
+    # Warm every lazy import up, so the measurement below is the parse alone.
+    list(excel_module.worksheet_records(honest))
+
+    tracemalloc.start()
+    try:
+        records = list(excel_module.worksheet_records(bomb, source="bomb.xlsx"))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert len(records) == 1000
+    assert records[-1][2] == {"id": "r999", "amount": 999}
+    # The honest content is ~2,000 cells. Before the pin on openpyxl's declared
+    # extents this measured ~130 MB.
+    assert peak < 20 * 1024 * 1024, f"peak was {peak / 1e6:.0f}MB"
+
+
+def test_excel_refuses_a_sheet_with_more_cells_than_the_cap(microsoft_settings):
+    """The byte cap cannot see cell count; a Run must fail rather than the worker."""
+    data = workbook_with_declared_dimension(500, "A1:B501")
+
+    with pytest.raises(SourceError, match="max_cells"):
+        list(excel_module.worksheet_records(data, source="wide.xlsx", max_cells=100))
 
 
 def test_excel_reports_a_workbook_it_cannot_open(microsoft_settings):

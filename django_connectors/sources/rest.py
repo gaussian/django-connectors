@@ -31,10 +31,15 @@ path onto it, so an absolute URL in ``path`` replaces the host outright, and
 ``requests`` follows redirects, so a 302 to ``169.254.169.254`` walks straight
 past any check made at configuration time. Every request and every redirect hop
 therefore goes through :func:`assert_safe_url` inside the session's ``send``.
+That check alone is still not enough, because it validates a DNS answer that
+urllib3 then throws away and looks up again at connect time — so the guarded
+session also re-runs the check on the address the socket actually connected to
+(see :func:`_pin_connections`).
 """
 
 import ipaddress
 import socket
+from functools import cache
 from typing import ClassVar
 from urllib.parse import urljoin, urlsplit
 
@@ -358,7 +363,9 @@ def guarded_session(*, allow_private):
 
     ``Session.send`` is the single funnel every request *and every redirect
     hop* passes through — ``resolve_redirects`` calls it again per hop — which
-    makes it the only place a URL check cannot be routed around.
+    makes it the only place a URL check cannot be routed around. On top of
+    that, :func:`_pin_connections` re-checks each socket's peer, because the
+    name check and the connection do not share a DNS lookup.
     """
     from dlt.sources.helpers.requests.retry import Client
 
@@ -373,7 +380,100 @@ def guarded_session(*, allow_private):
         return send(request, **kwargs)
 
     session.send = guarded_send
+    if not allow_private:
+        _pin_connections(session)
     return session
+
+
+def _pin_connections(session):
+    """Re-run the address guard on the address each socket actually reached.
+
+    The silent failure this exists for is DNS rebinding. ``assert_safe_url``
+    resolves the hostname, approves those answers, and then hands the *name* to
+    requests — which resolves it a second time inside urllib3 when the socket is
+    opened. An attacker who controls the zone answers the first lookup with a
+    public address and the second with ``169.254.169.254``, and every check in
+    this module passes while the worker talks to the metadata service. Measured:
+    a rebinding name reached a loopback server through a fully enabled guard.
+
+    So each connection re-checks its own peer, which is by definition the
+    resolution that was used, before any request bytes or TLS ClientHello go out.
+    Hostname, SNI and certificate validation are untouched — only the sanity of
+    the address is asserted a second time.
+
+    Requests routed through a proxy are not pinned and do not need to be: the
+    worker never resolves the name in that case, the proxy does, so the
+    destination policy belongs there.
+    """
+    classes = _pinned_pool_classes()
+    for adapter in session.adapters.values():
+        manager = getattr(adapter, "poolmanager", None)
+        if manager is not None:
+            # Per-instance, so dlt's retry adapter keeps every other setting it
+            # was built with; the pools themselves are created lazily, after this.
+            manager.pool_classes_by_scheme = classes
+
+
+@cache
+def _pinned_pool_classes():
+    """urllib3 pool classes whose connections assert their own peer address.
+
+    Built lazily and once: urllib3 arrives with requests, which arrives with
+    dlt, and this module keeps all three off the import path of a host that
+    never runs a pipeline.
+    """
+    from urllib3 import HTTPConnectionPool, HTTPSConnectionPool
+    from urllib3.connection import HTTPConnection, HTTPSConnection
+
+    class PinnedHTTPConnection(HTTPConnection):
+        def _new_conn(self):
+            return _checked(super()._new_conn(), scheme="http", hostname=self.host)
+
+    class PinnedHTTPSConnection(HTTPSConnection):
+        def _new_conn(self):
+            # Runs before `connect` wraps the socket in TLS, so a rebound
+            # address never even sees a ClientHello.
+            return _checked(super()._new_conn(), scheme="https", hostname=self.host)
+
+    class PinnedHTTPConnectionPool(HTTPConnectionPool):
+        ConnectionCls = PinnedHTTPConnection
+
+    class PinnedHTTPSConnectionPool(HTTPSConnectionPool):
+        ConnectionCls = PinnedHTTPSConnection
+
+    return {"http": PinnedHTTPConnectionPool, "https": PinnedHTTPSConnectionPool}
+
+
+def _checked(sock, *, scheme, hostname):
+    """`sock`, or ``ConfigurationError`` if it landed on an internal address."""
+    try:
+        _assert_safe_peer(sock, scheme=scheme, hostname=hostname)
+    except BaseException:
+        # Nothing has been written yet; drop the socket rather than leaving a
+        # half-open connection to whatever answered.
+        sock.close()
+        raise
+    return sock
+
+
+def _assert_safe_peer(sock, *, scheme, hostname):
+    """Raise ``ConfigurationError`` if `sock` landed on an internal address."""
+    peer = sock.getpeername()
+    address, port = peer[0], peer[1]
+    # An IPv6 literal has to go back into a URL bracketed, or urlsplit reads the
+    # last group as a port.
+    literal = f"[{address}]" if ":" in address else address
+    try:
+        # Deliberately the same entry point the hostname went through: one
+        # decision about what "internal" means, and one place to relax it.
+        assert_safe_url(f"{scheme}://{literal}:{port}/", allow_private=False)
+    except ConfigurationError as exc:
+        raise ConfigurationError(
+            f"refusing to talk to {hostname!r}: the connection landed on "
+            f"{address}, which is not what the name resolved to when it was "
+            f"checked. A name that answers differently on the second lookup is "
+            f"a DNS rebinding attempt. {exc}"
+        ) from exc
 
 
 # --- config translation ----------------------------------------------------

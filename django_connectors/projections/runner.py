@@ -7,15 +7,22 @@ The contract handed to a host writer, and the reasons for it:
   idempotent" is not even testable.
 * **One record per identity per batch.** Merge means an identity appears once
   in the landing table, but a full replay across load ids could still surface
-  two versions; the newest wins.
-* **Delete beats upsert, and is emitted last.** A record deleted and re-created
+  two versions, and a target identity coarser than the merge key can collapse
+  two landed records onto one; the newest wins.
+* **Delete beats upsert, for the whole run.** A record deleted and re-created
   within one window must not resurrect because the upsert happened to sort
-  later.
+  later — sort order here is a content hash, not time. Within a batch the
+  delete is emitted last; across batches the identity is remembered, so an
+  upsert in a later batch is suppressed. That is what keeps the host's end
+  state independent of ``PROJECTION_BATCH_SIZE``, which is a streaming detail
+  and not a semantic unit. It costs one identity tuple held per deleted record
+  for the length of the run.
 * **A raised writer means the batch was not applied.** There is no mid-run
   checkpoint: the whole ProjectionRun is retried from the start, so writers
   must be idempotent per identity.
 """
 
+import json
 import logging
 
 from django.utils import timezone
@@ -79,6 +86,18 @@ def execute(projection_run):
         projection.last_error = message
         projection.save(update_fields=["last_failure_at", "last_error"])
         return projection_run
+    except BaseException as exc:
+        # Celery's SoftTimeLimitExceeded, a worker's SIGINT and SystemExit are
+        # not Exception. Without this the row is left RUNNING forever with no
+        # error and no finished_at — there is no reaper for ProjectionRun, and
+        # retry_projection_run admits only FAILED, so it can never be answered.
+        # The Projection itself is not marked failed: an interrupted worker
+        # says nothing about the mapping.
+        error_type, message = describe(exc)
+        projection_run.error_type = error_type[:255]
+        projection_run.error_message = f"interrupted: {message}"
+        _finish(projection_run, ProjectionRunStatus.FAILED)
+        raise
 
     projection_run.records_seen = counts["seen"]
     projection_run.records_written = counts["written"]
@@ -104,6 +123,10 @@ def _run(projection_run, projection):
     counts = {"seen": 0, "written": 0, "deleted": 0}
     batch = []
     batch_index = 0
+    # Run-scoped, not batch-scoped: see the module docstring. Holds identity
+    # tuples only, so it grows with the number of deleted records in the run
+    # rather than with the run.
+    deleted_identities = set()
 
     for row in rows:
         counts["seen"] += 1
@@ -111,12 +134,28 @@ def _run(projection_run, projection):
             continue
         batch.append(_project(row, compiled, target))
         if len(batch) >= batch_size:
-            _write(batch, projection_run, projection, target, batch_index, counts)
+            _write(
+                batch,
+                projection_run,
+                projection,
+                target,
+                batch_index,
+                counts,
+                deleted_identities,
+            )
             batch = []
             batch_index += 1
 
     if batch:
-        _write(batch, projection_run, projection, target, batch_index, counts)
+        _write(
+            batch,
+            projection_run,
+            projection,
+            target,
+            batch_index,
+            counts,
+            deleted_identities,
+        )
     return counts
 
 
@@ -131,7 +170,16 @@ def _project(row, compiled, target):
     deleted = bool(row.get(DELETED_COLUMN))
     values = compiled.apply(row)
 
-    identity = {name: values.get(name) for name in target.identity_fields}
+    # Coercion happens before identity is taken, so the identity a writer joins
+    # on is the declared type. Taking it from the raw values instead delivered
+    # one field twice in one record with two different types, and let a delete
+    # carry a value the target field would have rejected on the upsert path.
+    coerced = {}
+    for name, value in values.items():
+        declared = target.fields.get(name)
+        coerced[name] = declared.coerce(value, field_name=name) if declared else value
+
+    identity = {name: coerced.get(name) for name in target.identity_fields}
     missing = sorted(name for name, value in identity.items() if value is None)
     if missing:
         raise ProjectionError(
@@ -142,10 +190,6 @@ def _project(row, compiled, target):
     if deleted:
         return ProjectedRecord(operation="delete", identity=identity, values={})
 
-    coerced = {}
-    for name, value in values.items():
-        declared = target.fields.get(name)
-        coerced[name] = declared.coerce(value, field_name=name) if declared else value
     _assert_required(coerced, target)
     return ProjectedRecord(operation="upsert", identity=identity, values=coerced)
 
@@ -160,8 +204,10 @@ def _assert_required(values, target):
         )
 
 
-def _write(batch, projection_run, projection, target, batch_index, counts):
-    records = _collapse(batch, target)
+def _write(
+    batch, projection_run, projection, target, batch_index, counts, deleted_identities
+):
+    records = _collapse(batch, target, deleted_identities)
     context = WriterContext(
         owner_content_type_id=projection.binding.connection.owner_content_type_id,
         owner_object_id=projection.binding.connection.owner_object_id,
@@ -190,18 +236,46 @@ def _write(batch, projection_run, projection, target, batch_index, counts):
     counts["deleted"] += sum(1 for r in records if r.operation == "delete")
 
 
-def _collapse(batch, target):
-    """One record per identity, deletes winning and emitted last."""
+def _collapse(batch, target, deleted_identities=None):
+    """One record per identity, deletes winning and emitted last.
+
+    `deleted_identities` is the run's accumulated set of deleted identities and
+    is updated here. Deletes win across the whole run, not just this batch —
+    otherwise the host's end state depends on where the batch boundary happened
+    to fall, which is a tuning knob rather than a statement about the data.
+    """
+    if deleted_identities is None:
+        deleted_identities = set()
     upserts = {}
     deletes = {}
     for record in batch:
-        key = tuple(record.identity.get(name) for name in target.identity_fields)
+        key = _identity_key(record, target)
         if record.operation == "delete":
             deletes[key] = record
+            deleted_identities.add(key)
             upserts.pop(key, None)
-        elif key not in deletes:
+        elif key not in deleted_identities:
             upserts[key] = record
     return [*upserts.values(), *deletes.values()]
+
+
+def _identity_key(record, target):
+    """A hashable key for one record's identity.
+
+    Validation refuses an object-valued identity field, so in practice this
+    only ever sees scalars — but an unforeseen shape reaching here used to
+    surface as a bare ``TypeError: unhashable type: 'dict'`` from the middle of
+    a run, naming neither the field nor the cause.
+    """
+    key = []
+    for name in target.identity_fields:
+        value = record.identity.get(name)
+        try:
+            hash(value)
+        except TypeError:
+            value = json.dumps(value, sort_keys=True, default=str)
+        key.append(value)
+    return tuple(key)
 
 
 def _finish(projection_run, status, *, note=""):

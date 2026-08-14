@@ -7,10 +7,11 @@ caller could act on.
 
 import ast
 import pathlib
+import sqlite3
 
 import pytest
 
-from django_connectors.enums import RunStatus, RunTrigger
+from django_connectors.enums import BindingStatus, RunStatus, RunTrigger
 from django_connectors.exceptions import LandingSchemaError, SourceError
 from django_connectors.landing import access, naming
 from django_connectors.landing.naming import (
@@ -19,7 +20,7 @@ from django_connectors.landing.naming import (
     RUN_ID_COLUMN,
 )
 from django_connectors.services import runs as run_services
-from tests.conftest import memory_config
+from tests.conftest import landing_sqlite_file, memory_config
 
 pytestmark = pytest.mark.django_db
 
@@ -191,6 +192,70 @@ def test_identity_only_tombstone_lands_and_nulls_other_columns(
     assert rows[0]["extra"] is None
 
 
+def test_a_key_duplicated_inside_one_batch_keeps_the_newest_version(
+    connectors_settings, make_binding
+):
+    """Without a dedup_sort hint the merge job keeps an arbitrary duplicate.
+
+    dlt's sqlalchemy merge job dedupes in-package duplicates with ROW_NUMBER()
+    and falls back to ``ORDER BY (SELECT NULL)`` when no ``dedup_sort`` column
+    hint exists, so the *oldest* version wins while the incremental cursor has
+    already advanced past the newest — the newer value is never re-emitted and
+    the stale row survives until the record next changes.
+    """
+    binding = make_binding(
+        config=memory_config(
+            cursor="updated_at",
+            batches=[
+                [
+                    {"id": "1", "updated_at": "2024-01-01T00:00:00Z", "v": "old"},
+                    {"id": "1", "updated_at": "2024-01-02T00:00:00Z", "v": "NEW"},
+                ]
+            ],
+        )
+    )
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    rows = access.sample_rows(binding, "events", limit=10)
+    assert [row["v"] for row in rows] == ["NEW"]
+
+
+def test_a_tombstone_following_an_update_in_one_batch_is_not_discarded(
+    connectors_settings, make_binding
+):
+    """The same in-batch dedup silently drops the deletion.
+
+    A provider that reports an edit and then a delete for one record inside a
+    single page would otherwise land the edit: Projection never sees the
+    deletion, and because the cursor has advanced the provider never re-sends
+    it, so the host keeps a record the provider deleted.
+    """
+    binding = make_binding(
+        config=memory_config(
+            cursor="updated_at",
+            batches=[
+                [{"id": "1", "updated_at": "2024-01-01T00:00:00Z", "v": "a"}],
+                [
+                    {"id": "1", "updated_at": "2024-01-02T00:00:00Z", "v": "edited"},
+                    {
+                        "id": "1",
+                        "updated_at": "2024-01-03T00:00:00Z",
+                        DELETED_COLUMN: True,
+                    },
+                ],
+            ],
+        )
+    )
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == RunStatus.SUCCEEDED, second.error_message
+
+    rows = access.sample_rows(binding, "events", limit=10)
+    assert len(rows) == 1
+    assert bool(rows[0][DELETED_COLUMN]) is True
+
+
 def test_two_bindings_with_identical_remote_ids_do_not_collide(
     connectors_settings, make_binding
 ):
@@ -299,6 +364,159 @@ def test_unknown_resource_is_refused_before_touching_the_dataset(
 
     with pytest.raises(LandingSchemaError):
         access.binding_relation(binding, "_dlt_loads")
+
+
+# --- pending packages ------------------------------------------------------
+
+
+def test_an_extract_stage_pending_package_is_drained_by_the_recovery_run(
+    connectors_settings, make_binding
+):
+    """`pipeline.load()` alone cannot drain a package that was never normalized.
+
+    A worker killed between extract and normalize leaves an *extracted*
+    package. `has_pending_data` is true for it, so every later Run refuses to
+    extract — but `load()` only ever considers normalized packages, so without
+    a `normalize()` first the Binding wedges forever.
+    """
+    from django_connectors.landing.destination import build_pipeline
+    from django_connectors.landing.instrument import instrument_source
+    from django_connectors.models import Run
+    from django_connectors.registry import sources
+
+    binding = make_binding(
+        config=memory_config(batches=[[{"id": "1", "v": "extracted"}], [{"id": "2"}]])
+    )
+    definition = sources.get("memory")
+    interrupted = Run.objects.create(binding=binding, trigger=RunTrigger.INITIAL)
+    pipeline = build_pipeline(binding)
+    source = definition.build_source(binding=binding, credentials=None, run=interrupted)
+    instrument_source(
+        source, binding=binding, run=interrupted, source_definition=definition
+    )
+    pipeline.extract(source)
+    assert pipeline.list_extracted_load_packages()
+
+    run = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    recovery = Run.objects.get(binding=binding, trigger=RunTrigger.RECOVERY)
+    assert recovery.status == RunStatus.SUCCEEDED
+    assert recovery.dlt_load_ids, "the recovery run landed nothing"
+
+    rows = sorted(
+        access.sample_rows(binding, "events", limit=10), key=lambda r: r["id"]
+    )
+    assert [row["id"] for row in rows] == ["1", "2"]
+    assert not build_pipeline(binding).has_pending_data
+
+
+def test_a_pending_package_that_cannot_be_drained_never_reports_success(
+    connectors_settings, make_binding
+):
+    """A recovery Run that drained nothing must not advance the Binding.
+
+    A package that fails at normalize (here: a NULL in a `nullable: False`
+    metadata column) can never be loaded. Reported as succeeded, the recovery
+    Run advances `last_success_at` and leaves the Binding `active` while the
+    package stays pending and no later Run can extract anything — a health
+    signal that lies about a Binding that is wedged.
+    """
+    from django_connectors.models import Run
+
+    binding = make_binding(
+        config=memory_config(
+            batches=[
+                [{"id": "1", DELETED_COLUMN: None}],
+                [{"id": "2", "v": "never reached"}],
+            ]
+        )
+    )
+    first = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert first.status == RunStatus.FAILED
+
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == RunStatus.FAILED
+
+    recoveries = Run.objects.filter(binding=binding, trigger=RunTrigger.RECOVERY)
+    assert recoveries.exists(), "no recovery run was attempted"
+    assert not recoveries.filter(status=RunStatus.SUCCEEDED).exists()
+
+    binding.refresh_from_db()
+    assert binding.last_success_at is None
+    assert binding.last_error
+
+
+# --- purge -----------------------------------------------------------------
+
+
+def test_purge_from_a_worker_that_never_ran_the_binding_drops_the_tables(
+    connectors_settings, make_binding, tmp_path, settings
+):
+    """dlt's schema store is local to a pipeline directory; the tables are not.
+
+    A purge issued from any worker but the one that ran the Binding resolved no
+    schema and dropped nothing — while still reporting success.
+    """
+    from django_connectors.services import retention
+
+    binding = make_binding(config=memory_config(batches=[[{"id": "1"}, {"id": "2"}]]))
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+    table = naming.landing_table_name("memory", "events", binding.landing_key)
+
+    # A second worker: same landing database, no local dlt state at all.
+    settings.DJANGO_CONNECTORS = {
+        **connectors_settings,
+        "PIPELINES_DIR": str(tmp_path / "second_worker"),
+    }
+
+    assert retention.purge_binding_landing(binding)["dropped_tables"] == [table]
+
+    binding.refresh_from_db()
+    assert binding.landing_purged_at is not None
+    # Asserted against the database rather than the purge's own report: the
+    # report is exactly what used to lie.
+    with sqlite3.connect(landing_sqlite_file(tmp_path, "connectors_landing")) as db:
+        remaining = db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchall()
+    assert remaining == []
+
+
+def test_a_purge_that_drops_nothing_is_a_failed_purge(
+    connectors_settings, make_binding, tmp_path, settings
+):
+    """`landing_purged_at` is what the pre_delete guard trusts.
+
+    Stamped by a purge that dropped nothing, it lets the Binding be deleted and
+    strands its rows with a `_connector_binding_id` pointing at a row that no
+    longer exists — the data-retention failure the two-phase delete exists to
+    prevent.
+    """
+    from django_connectors.services import retention
+
+    binding = make_binding(config=memory_config(batches=[[{"id": "1"}]]))
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    # A worker pointed at neither the Binding's pipeline state nor its landing
+    # database: nothing here can drop the real tables.
+    settings.DJANGO_CONNECTORS = {
+        **connectors_settings,
+        "PIPELINES_DIR": str(tmp_path / "elsewhere"),
+        "LANDING_URL": f"sqlite:///{tmp_path / 'elsewhere.db'}",
+    }
+
+    with pytest.raises(LandingSchemaError):
+        retention.purge_binding_landing(binding)
+
+    binding.refresh_from_db()
+    assert binding.landing_purged_at is None
+    assert binding.status != BindingStatus.PURGING
+    with pytest.raises(retention.LandingNotPurged):
+        binding.delete()
 
 
 # --- locking ---------------------------------------------------------------

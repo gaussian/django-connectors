@@ -71,10 +71,14 @@ class LoopbackSalesforceSource(SalesforceSource):
     """
 
     allow_private_addresses = True
+    # The in-process org is not a Salesforce host either, and the host
+    # allow-list is lifted the same deliberate way.
+    allow_custom_login_host = True
 
 
 class LoopbackSalesforceBackend(SalesforceBackend):
     allow_private_addresses = True
+    allow_custom_login_host = True
 
 
 class MemoryStore(SecretStore):
@@ -595,19 +599,61 @@ def test_an_http_instance_url_is_refused_by_default():
         SalesforceSource().validate_config(
             {
                 "objects": {"Account": {"fields": ["Id"]}},
-                "instance_url": "http://93.184.216.34",
+                "instance_url": "http://acme.my.salesforce.com",
             }
         )
 
 
+class CustomHostSalesforceSource(SalesforceSource):
+    """Host allow-list lifted, address guard left on — one layer at a time."""
+
+    allow_custom_login_host = True
+
+
 def test_an_internal_instance_url_is_refused_by_default():
     with pytest.raises(ConfigurationError, match="internal address"):
-        SalesforceSource().validate_config(
+        CustomHostSalesforceSource().validate_config(
             {
                 "objects": {"Account": {"fields": ["Id"]}},
                 "instance_url": "https://169.254.169.254",
             }
         )
+
+
+@pytest.mark.parametrize(
+    "instance_url",
+    [
+        "https://attacker.example.com",
+        "https://login.salesforce.com.attacker.example.com",
+        "https://93.184.216.34",
+    ],
+)
+def test_a_non_salesforce_instance_url_is_refused_by_default(instance_url):
+    """The org session bearer goes wherever instance_url says.
+
+    ``instance_url`` is read from Binding.config and Connection.metadata, both
+    editable by an administrator who is not supposed to be able to read the
+    SecretStore — so a perfectly public, perfectly resolvable attacker host
+    passes every address check there is and still collects the token.
+    """
+    with pytest.raises(ConfigurationError, match="not a Salesforce host"):
+        SalesforceSource().validate_config(
+            {"objects": {"Account": {"fields": ["Id"]}}, "instance_url": instance_url}
+        )
+
+
+@pytest.mark.parametrize(
+    "instance_url",
+    [
+        "https://acme.my.salesforce.com",
+        "https://acme--dev.sandbox.my.salesforce.com",
+        "https://login.salesforce.com",
+    ],
+)
+def test_a_real_salesforce_instance_url_passes_the_host_check(instance_url):
+    from django_connectors.providers.salesforce.auth import assert_salesforce_host
+
+    assert_salesforce_host(instance_url, "instance_url")
 
 
 def test_an_absolute_next_records_url_is_refused():
@@ -1108,6 +1154,44 @@ def test_the_sandbox_flag_selects_the_test_login_host(salesforce_settings):
 
     assert settings["login_url"] == sf_auth.SANDBOX_LOGIN_URL
     assert settings["audience"] == sf_auth.SANDBOX_LOGIN_URL
+
+
+def test_a_login_url_outside_salesforce_never_receives_the_credential(
+    salesforce_settings, make_connection, monkeypatch
+):
+    """``login_url`` decides where the refresh token and client secret are POSTed.
+
+    It is read from ``Connection.metadata``, which the API and the admin let an
+    administrator edit — and that administrator is precisely the party who is
+    not supposed to be able to read the SecretStore. An attacker's host is
+    ordinarily public and resolvable, so the address guard waves it through:
+    only a host allow-list stops the exchange.
+    """
+    posted = []
+
+    def record(self, settings, data):
+        posted.append(data)
+        return {}
+
+    monkeypatch.setattr(sf_auth.SalesforceBackend, "_post_token", record)
+    MemoryStore.values["sf-key"] = {
+        "refresh_token": "5Aep861-REAL-REFRESH-TOKEN",
+        "client_secret": "REAL-CONSUMER-SECRET",
+    }
+    connection = make_connection(
+        provider="salesforce",
+        auth_backend="salesforce",
+        auth_reference="sf-key",
+        metadata={
+            "client_id": "3MVG9consumer",
+            "login_url": "https://attacker.example.com",
+        },
+    )
+
+    with pytest.raises(ConfigurationError, match="not a Salesforce host"):
+        SalesforceBackend().get_credentials(connection)
+
+    assert posted == [], "the secret was sent to the attacker's host"
 
 
 def test_invalid_grant_is_reported_as_revoked(jwt_connection, org):

@@ -19,7 +19,7 @@ from django_connectors.landing.naming import (
     DELETED_COLUMN,
     is_internal_column,
 )
-from django_connectors.projections.compiler import compile_mapping
+from django_connectors.projections.compiler import ObjectNode, compile_mapping
 from django_connectors.projections.fields import UNMAPPABLE_DLT_TYPES
 from django_connectors.projections.targets import get_target
 
@@ -48,12 +48,24 @@ class ValidationResult:
         return {"ok": self.ok, "errors": self.errors, "warnings": self.warnings}
 
 
-def validate_projection(projection, *, landing_columns=None, source_definition=None):
+def validate_projection(
+    projection,
+    *,
+    landing_columns=None,
+    source_definition=None,
+    merge_key_columns=None,
+):
     """Check `projection` against its target and the landed schema.
 
     `landing_columns` is ``{column: dlt column schema}``. When omitted, only the
     checks that do not need the landed schema run — which is what a Projection
     being drafted before the first Run can offer.
+
+    `merge_key_columns` is the merge identity the landed resource actually
+    carries; a tombstone holds those columns and nothing else. It is not
+    derivable from `landing_columns` — the landed *tables* carry no primary key
+    (``destination.create_primary_keys=False``), so the caller reads it from the
+    landed dlt schema.
     """
     result = ValidationResult()
 
@@ -80,7 +92,10 @@ def validate_projection(projection, *, landing_columns=None, source_definition=N
 
     _check_source_columns(result, compiled, landing_columns)
     _check_types(result, target, compiled, landing_columns)
-    _check_identity_is_obtainable(result, target, compiled, source_definition)
+    _check_identity_is_scalar(result, target, compiled)
+    _check_identity_is_obtainable(
+        result, target, compiled, source_definition, merge_key_columns
+    )
     return result
 
 
@@ -159,27 +174,80 @@ def _check_types(result, target, compiled, landing_columns):
                 )
 
 
-def _check_identity_is_obtainable(result, target, compiled, source_definition):
+def _check_identity_is_scalar(result, target, compiled):
+    """An object-valued identity is unhashable where records are collapsed.
+
+    Without this it validates clean, previews clean, and then fails every run
+    with a bare ``TypeError: unhashable type: 'dict'`` naming neither the field
+    nor the cause.
+    """
+    for field_name in target.identity_fields:
+        node = compiled.nodes.get(field_name)
+        if isinstance(node, ObjectNode):
+            result.error(
+                f"identity field {field_name!r} is mapped to an object; "
+                f"identity is the host's join key and must be a scalar"
+            )
+        elif getattr(node, "cast", None) == "json":
+            result.error(
+                f"identity field {field_name!r} casts to json; identity is the "
+                f"host's join key and must be a scalar"
+            )
+
+
+def _check_identity_is_obtainable(
+    result, target, compiled, source_definition, merge_key_columns
+):
     """Identity must survive a tombstone, or deletes carry a broken key."""
     if source_definition is None or not getattr(
         source_definition, "emits_tombstones", False
     ):
         return
 
-    merge_key_columns = {BINDING_ID_COLUMN, DELETED_COLUMN}
+    if not merge_key_columns:
+        # No merge key means the resource landed append/replace, and nothing
+        # about what a tombstone still carries can be established. Say so
+        # rather than passing the projection as checked.
+        result.warn(
+            "the landed resource declares no merge key, so it cannot be "
+            "checked that identity survives a tombstone; a delete may reach "
+            "the host with a null key"
+        )
+        return
+
+    obtainable = set(merge_key_columns) | {BINDING_ID_COLUMN, DELETED_COLUMN}
+    business_key = sorted(
+        column for column in merge_key_columns if not is_internal_column(column)
+    )
+    identity_columns = set()
     for field_name in target.identity_fields:
         node = compiled.nodes.get(field_name)
         if node is None:
             continue
+        identity_columns |= set(node.source_columns)
         outside = sorted(
-            column
-            for column in node.source_columns
-            if column not in merge_key_columns and is_internal_column(column)
+            column for column in node.source_columns if column not in obtainable
         )
         if outside:
             result.error(
-                f"identity field {field_name!r} reads internal column(s) {outside}"
+                f"identity field {field_name!r} reads column(s) {outside}, "
+                f"which are not part of the merge key {business_key}. "
+                f"delete-insert merge replaces the whole row, so a tombstone — "
+                f"which carries the merge key only — nulls every other column, "
+                f"and the host would receive a delete it cannot match"
             )
+
+    # Not an error: it is a legitimate configuration, but the host should know
+    # that two landed records then share one identity, so deleting either one
+    # deletes the host's record.
+    uncovered = sorted(set(business_key) - identity_columns)
+    if business_key and uncovered:
+        result.warn(
+            f"identity {list(target.identity_fields)} does not cover merge key "
+            f"column(s) {uncovered}, so two landed records can collapse onto "
+            f"one target identity. A delete of either one wins over the other's "
+            f"upsert (see the ProjectionRun writer contract)"
+        )
 
 
 def status_for(result):

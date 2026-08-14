@@ -45,6 +45,16 @@ def _uuid7_fallback() -> uuid.UUID:
                 # that sort before ids we have already handed out.
                 timestamp_ms = _last_timestamp_ms
                 _counter += 1
+                if _counter > _COUNTER_MAX:
+                    # The counter must stay inside its 12 bits: it is ORed in at
+                    # bits 64-75, so one more increment carries into the version
+                    # nibble and starts emitting ids that are neither v7 nor in
+                    # order. Waiting for the clock (what the same-millisecond
+                    # branch does) is not available here — the step can be hours
+                    # wide — so borrow the next millisecond instead. It is
+                    # already ahead of the wall clock by construction.
+                    timestamp_ms = _last_timestamp_ms + 1
+                    _counter = 0
             else:
                 _counter = 0
         _last_timestamp_ms = timestamp_ms

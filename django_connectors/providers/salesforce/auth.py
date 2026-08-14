@@ -76,6 +76,20 @@ from django_connectors.exceptions import (
 PRODUCTION_LOGIN_URL = "https://login.salesforce.com"
 SANDBOX_LOGIN_URL = "https://test.salesforce.com"
 
+#: Hosts a Salesforce credential may be sent to. ``login_url`` decides where the
+#: refresh token, the client secret and the signed assertion are POSTed, and
+#: ``instance_url`` decides where the org session bearer goes — and both are
+#: reachable from ``Connection.metadata``, which an administrator can edit. An
+#: unconstrained value therefore turns one Connection edit into credential
+#: exfiltration, with the guard in :func:`~django_connectors.sources.rest.assert_safe_url`
+#: happily approving the attacker's perfectly public host. Same threat model,
+#: and the same answer, as ``EntraBackend.ALLOWED_AUTHORITY_HOSTS``.
+ALLOWED_HOSTS = frozenset({"login.salesforce.com", "test.salesforce.com"})
+
+#: My Domain (every org since Enhanced Domains) and sandbox equivalents. Matched
+#: as suffixes because the subdomain is the customer's own org name.
+ALLOWED_HOST_SUFFIXES = (".my.salesforce.com", ".sandbox.my.salesforce.com")
+
 TOKEN_PATH = "/services/oauth2/token"
 #: Unversioned, so it works on every org and needs no API version to probe with.
 VERSIONS_PATH = "/services/data/"
@@ -138,6 +152,34 @@ REQUEST_LIMIT_ERROR_CODE = "REQUEST_LIMIT_EXCEEDED"
 ERROR_SNIPPET_LENGTH = 300
 
 
+# --- host allow-list -------------------------------------------------------
+
+
+def assert_salesforce_host(url, label, *, allow_custom=False, subject=None):
+    """Raise ``ConfigurationError`` unless `url` is a Salesforce host.
+
+    Checked *before* the address guard, so a rejected host is never even
+    resolved: the point is not that the host is internal — an attacker's host is
+    ordinarily public, and passes every check in
+    :mod:`django_connectors.sources.rest` — but that a credential belonging to
+    Salesforce must only ever be handed to Salesforce.
+    """
+    if allow_custom:
+        return
+    host = (urlsplit(url).hostname or "").lower()
+    if host in ALLOWED_HOSTS or host.endswith(ALLOWED_HOST_SUFFIXES):
+        return
+    name = (subject or SalesforceBackend).__name__
+    raise ConfigurationError(
+        f"refusing to use {host or url!r} as the Salesforce {label}: it is not "
+        f"a Salesforce host, and this Connection's credentials would be sent "
+        f"there. Allowed: {sorted(ALLOWED_HOSTS)} and any host under "
+        f"{list(ALLOWED_HOST_SUFFIXES)}. A deployment that genuinely calls "
+        f"somewhere else should register a {name} subclass with "
+        f"allow_custom_login_host = True."
+    )
+
+
 class SalesforceBackend(AuthBackend):
     """OAuth2 JWT-bearer (or refresh-token) credentials for one Salesforce org.
 
@@ -173,6 +215,13 @@ class SalesforceBackend(AuthBackend):
     key = "salesforce"
     provider = "salesforce"
     required_extras: ClassVar[dict[str, str]] = {"cryptography": "secrets"}
+
+    #: Opt-in escape hatch for a ``login_url`` outside :data:`ALLOWED_HOSTS` — a
+    #: broker in front of the org, or a test double. A class attribute for the
+    #: same reason ``allow_private_addresses`` is one, and for a sharper reason
+    #: here: the value it unlocks decides where a refresh token and a client
+    #: secret are sent.
+    allow_custom_login_host = False
 
     #: Opt-in escape hatch for reaching a private address, matching
     #: ``RestSource.allow_private_addresses``. Deliberately a class attribute
@@ -407,14 +456,19 @@ class SalesforceBackend(AuthBackend):
     def _assert_url(self, url, label):
         from django_connectors.sources.rest import assert_safe_url
 
+        assert_salesforce_host(
+            url, label, allow_custom=self.allow_custom_login_host, subject=type(self)
+        )
         allow_private = self.allow_private_addresses
-        assert_safe_url(url, allow_private=allow_private)
+        # Scheme before resolution: a URL that is wrong on its face should not
+        # need a working DNS answer to be told so.
         if not allow_private and urlsplit(url).scheme != "https":
             raise ConfigurationError(
                 f"Salesforce {label} must be https, got {url!r}. Every request "
                 f"carries a bearer token, and a bearer token sent over http is "
                 f"a bearer token given away."
             )
+        assert_safe_url(url, allow_private=allow_private)
         return url.rstrip("/")
 
 

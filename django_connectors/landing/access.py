@@ -190,20 +190,49 @@ def drop_landing_tables(binding, *, pipeline=None):
     key's other tenants interleaved.
     """
     pipeline = pipeline or build_pipeline(binding)
-    dropped = []
+
+    # Restore the schema from the destination before reading it. dlt's schema
+    # store is *local* to a pipeline working directory, so a worker that never
+    # ran this Binding — or one whose state `reset_binding_state` dropped —
+    # resolves nothing and this used to return an empty list. The caller then
+    # stamped `landing_purged_at` on a purge that dropped nothing, the
+    # pre_delete guard read that flag and allowed the delete, and the
+    # customer's rows were stranded with a `_connector_binding_id` pointing at
+    # a Binding row that no longer exists. Reads already sync (`pipeline.
+    # dataset()` does it internally), which is why only the drop path was blind.
+    with contextlib.suppress(Exception):
+        pipeline.sync_destination()
+
     try:
         schema = pipeline.schemas.get(binding.schema_name)
     except Exception:
         schema = None
-    if schema is None:
-        return dropped
 
-    table_names = [name for name in schema.tables if not name.startswith("_dlt")]
-    if not table_names:
-        return dropped
+    table_names = (
+        []
+        if schema is None
+        else [name for name in schema.tables if not name.startswith("_dlt")]
+    )
 
-    with pipeline.sql_client(schema_name=binding.schema_name) as client:
-        for table_name in table_names:
-            client.drop_tables(table_name)
-            dropped.append(table_name)
+    dropped = []
+    if table_names:
+        with pipeline.sql_client(schema_name=binding.schema_name) as client:
+            for table_name in table_names:
+                client.drop_tables(table_name)
+                dropped.append(table_name)
+
+    # The Binding's own schema snapshot is the record of what it landed, and it
+    # is written by the same successful Run that created these tables. A table
+    # named there that this call did not drop means the purge did not happen,
+    # whatever the reason — an empty purge for a Binding that has landed is a
+    # failed purge, not a clean one.
+    expected = set((binding.landing_schema or {}).get("tables") or {})
+    missed = sorted(expected - set(dropped))
+    if missed:
+        raise LandingSchemaError(
+            f"binding {binding.id} landed tables {missed} but this purge "
+            f"dropped {sorted(dropped)}. Refusing to report a purge that did "
+            f"not happen: the landing rows would stay in the database while "
+            f"the Binding became deletable."
+        )
     return dropped

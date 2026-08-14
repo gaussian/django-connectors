@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 from django_connectors.enums import IdentityScope
 from django_connectors.exceptions import ConfigurationError
-from django_connectors.projections.fields import Field
+from django_connectors.projections.fields import Field, JSONField
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,18 @@ class TargetDefinition:
         if missing:
             raise ConfigurationError(
                 f"target {key!r} identity_fields {missing} are not declared in fields"
+            )
+        # An identity is used as a dict key when records are collapsed, so an
+        # object-valued one is unhashable and fails every run with a raw
+        # TypeError naming neither the field nor the cause. It is also a poor
+        # join key for the host, which is the only thing identity is for.
+        unhashable = [
+            name for name in identity_fields if isinstance(fields[name], JSONField)
+        ]
+        if unhashable:
+            raise ConfigurationError(
+                f"target {key!r} identity_fields {unhashable} are JSONField; "
+                f"identity is a join key and must be a scalar field"
             )
         if not callable(writer):
             raise ConfigurationError(f"target {key!r} writer is not callable")

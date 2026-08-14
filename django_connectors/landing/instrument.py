@@ -32,6 +32,15 @@ Incremental dedup
     value is silently dropped. Verified: run 2 emitted an updated row and the
     table still held the old one.
 
+In-package dedup
+    A key emitted twice inside one load package is resolved by the merge job's
+    ``ROW_NUMBER()``, which orders by ``(SELECT NULL)`` unless a ``dedup_sort``
+    column hint exists — so the *oldest* version wins while the cursor has
+    already advanced past the newest, and an edit-then-delete pair lands the
+    edit. The cursor column is hinted ``dedup_sort: "desc"`` for that reason.
+    See :func:`_dedup_sort_column`, including what a cursor-less resource does
+    and does not promise.
+
 ``hard_delete``
     ``columns={"x": {"hard_delete": True}}`` physically deletes the row on
     merge, which would make deletions unobservable to Projection forever. It is
@@ -156,6 +165,9 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
     incremental = _build_incremental(source_definition, resource.name, binding)
     if incremental is not None:
         hints["incremental"] = incremental
+        dedup_column = _dedup_sort_column(resource, incremental, write_disposition)
+        if dedup_column:
+            hints["columns"][dedup_column] = {"dedup_sort": "desc"}
 
     resource.apply_hints(**hints)
 
@@ -232,6 +244,53 @@ def _build_incremental(source_definition, resource_name, binding):
     # identity columns only and so have no cursor.
     forced.setdefault("on_cursor_value_missing", "include")
     return Incremental(**forced)
+
+
+def _dedup_sort_column(resource, incremental, write_disposition):
+    """The column dlt should order in-package duplicates by, or None.
+
+    Without this hint, dlt's merge job deduplicates a primary key that appears
+    twice inside *one* load package with ``ROW_NUMBER() OVER (... ORDER BY
+    (SELECT NULL))`` and keeps whichever row the database happened to emit
+    first — normally the oldest. The incremental cursor has meanwhile advanced
+    past the newest version, so the source never re-sends it and the stale row
+    survives until the record next changes. Measured on sqlite, MySQL and
+    PostgreSQL: a batch carrying an edit and then a tombstone for one id landed
+    the edit with ``_connector_deleted`` false, and the deletion was lost for
+    good — Projection never saw it and the host kept a record the provider had
+    deleted.
+
+    Ordering by the cursor descending makes the newest version win, which is
+    the same record the cursor claims was consumed.
+
+    Three cases decline the hint rather than risking a worse failure:
+
+    - A cursor that is a JSONPath ("data.updated_at") names no landed column —
+      nesting is off — and dlt would raise ``KeyError`` building the merge SQL,
+      wedging the pipeline on every load instead of on a duplicate.
+    - dlt ignores the hint outside merge disposition, and logs about it.
+    - A second ``dedup_sort`` on one table is a ``SchemaCorruptedException``, so
+      a source that already nominated a column keeps it.
+
+    A cursor-less resource gets no hint and no guarantee: an in-batch duplicate
+    there resolves arbitrarily. There is nothing to order by, and inventing an
+    order would be a guess dressed as a rule.
+    """
+    if write_disposition["disposition"] != "merge":
+        return None
+
+    cursor_path = getattr(incremental, "cursor_path", None)
+    if not isinstance(cursor_path, str) or not cursor_path.isidentifier():
+        return None
+    if cursor_path in METADATA_COLUMN_HINTS:
+        return None
+
+    declared = resource._hints.get("columns") or {}
+    if isinstance(declared, dict) and any(
+        isinstance(hint, dict) and hint.get("dedup_sort") for hint in declared.values()
+    ):
+        return None
+    return cursor_path
 
 
 def _assert_no_hard_delete(resource):

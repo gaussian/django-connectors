@@ -74,6 +74,7 @@ from django_connectors.exceptions import (
 )
 from django_connectors.providers.salesforce.auth import (
     REQUEST_LIMIT_ERROR_CODE,
+    assert_salesforce_host,
     bearer_headers,
     credential_error_for,
     describe_errors,
@@ -175,6 +176,12 @@ class SalesforceSource(SourceDefinition):
     #: and a half-adapter that could not verify a delivery would be an
     #: unauthenticated trigger. Polling only, deliberately.
     webhook = None
+
+    #: Opt-in escape hatch for an ``instance_url`` outside the Salesforce host
+    #: allow-list, matching ``SalesforceBackend.allow_custom_login_host``. A
+    #: class attribute for the same reason: the value it unlocks decides where
+    #: the org's session bearer is sent.
+    allow_custom_login_host = False
 
     @property
     def allow_private_addresses(self):
@@ -468,13 +475,24 @@ class SalesforceSource(SourceDefinition):
     def _assert_instance_url(self, url):
         from django_connectors.sources.rest import assert_safe_url
 
+        # instance_url can arrive from Binding.config or Connection.metadata,
+        # both editable, and it is where the org session bearer is sent — so it
+        # is constrained to Salesforce hosts exactly like login_url.
+        assert_salesforce_host(
+            url,
+            "instance_url",
+            allow_custom=self.allow_custom_login_host,
+            subject=type(self),
+        )
         allow_private = self.allow_private_addresses
-        assert_safe_url(url, allow_private=allow_private)
+        # Scheme before resolution: a URL that is wrong on its face should not
+        # need a working DNS answer to be told so.
         if not allow_private and urlsplit(url).scheme != "https":
             raise ConfigurationError(
                 f"Salesforce instance_url must be https, got {url!r}. Every "
                 f"request carries a bearer token."
             )
+        assert_safe_url(url, allow_private=allow_private)
         return url.rstrip("/")
 
 

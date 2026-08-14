@@ -49,7 +49,7 @@ import datetime as dt
 import logging
 from typing import ClassVar
 
-from django_connectors.exceptions import ConfigurationError
+from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.landing.naming import DELETED_COLUMN
 from django_connectors.providers.google.auth import (
     bearer_token,
@@ -89,6 +89,15 @@ HISTORY_TYPES = ("messageAdded", "messageDeleted", "labelAdded", "labelRemoved")
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 500
+
+# Circuit breaker for the history walk, matching `auth.paginate`'s. The walk
+# cannot simply call `paginate` — it has to inspect the 404 that means "this
+# historyId expired" before the response is raised on — so it carries its own
+# copy of the two guards `paginate` has. Without them a provider or proxy that
+# echoes one pageToken back forever spins inside the run, holding the Binding's
+# lease and burning quota until the lease is reaped, whereupon the next worker
+# enters the same loop.
+MAX_HISTORY_PAGES = 10_000
 
 # Cap on one run's initial backfill. Not a data limit: the remaining pageToken
 # is stored and the next run resumes from it, and the historyId is only
@@ -459,8 +468,9 @@ def _plan_incremental(client, user_id, start_history_id, config):
     changed = {}
     deleted = {}
     history_id = str(start_history_id)
+    seen_tokens = set()
 
-    while True:
+    for page_number in range(MAX_HISTORY_PAGES):
         response = google_request(client, f"users/{user_id}/history", params=query)
         if response.status_code == 404:
             raise _HistoryTooOld(
@@ -477,7 +487,18 @@ def _plan_incremental(client, user_id, start_history_id, config):
         token = payload.get("nextPageToken")
         if not token:
             break
+        if token in seen_tokens:
+            raise SourceError(
+                f"Google repeated pageToken {token[:12]}… while reading Gmail "
+                f"history at page {page_number + 1}; refusing to loop."
+            )
+        seen_tokens.add(token)
         query["pageToken"] = token
+    else:
+        raise SourceError(
+            f"stopped after {MAX_HISTORY_PAGES} pages of Gmail history; the "
+            f"walk did not end."
+        )
 
     # A message that was changed and then deleted is deleted. Fetching it would
     # 404 and the tombstone is the truthful answer either way.

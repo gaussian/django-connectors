@@ -83,6 +83,15 @@ DEFAULT_RESOURCE = "worksheet_rows"
 #: sharing it.
 DEFAULT_MAX_FILE_BYTES = 32 * 1024 * 1024
 
+#: Cells one worksheet may hold before the parse is refused. ``max_file_bytes``
+#: bounds the download and not the memory, and the two are only loosely related:
+#: the grid costs ``rows x width``, and *width* is whatever the workbook's own
+#: ``<dimension>`` element claims — a number nothing validates against the cells
+#: that follow it. This is the second half of the same promise: no single
+#: workbook, however it is shaped, takes the worker (and every co-tenant Run on
+#: it) down with an OOM kill.
+DEFAULT_MAX_CELLS = 2_000_000
+
 #: openpyxl reads these. ``.xls`` (BIFF) and ``.xlsb`` (binary) it cannot open at
 #: all, and a folder full of mixed documents is normal, so non-matching files are
 #: skipped rather than failing the Run — except when the Binding names one
@@ -214,6 +223,17 @@ class EntraExcelSource(EntraFilesSource):
             or max_bytes <= 0
         ):
             raise ConfigurationError("'max_file_bytes' must be a positive integer.")
+
+        max_cells = config.get("max_cells", DEFAULT_MAX_CELLS)
+        if (
+            not isinstance(max_cells, int)
+            or isinstance(max_cells, bool)
+            or max_cells <= 0
+        ):
+            raise ConfigurationError(
+                "'max_cells' must be a positive integer: the most cells one "
+                "worksheet may hold before the parse is refused."
+            )
 
         glob = config.get("name_glob")
         if glob is not None and not isinstance(glob, str):
@@ -369,6 +389,7 @@ class EntraExcelSource(EntraFilesSource):
             skip_rows=int(config.get("skip_rows", 0)),
             include_hidden=bool(config.get("include_hidden_sheets")),
             unmerge=bool(config.get("unmerge")),
+            max_cells=int(config.get("max_cells", DEFAULT_MAX_CELLS)),
         ):
             if key_columns:
                 missing = [column for column in key_columns if column not in values]
@@ -430,6 +451,7 @@ def worksheet_records(
     skip_rows=0,
     include_hidden=False,
     unmerge=False,
+    max_cells=DEFAULT_MAX_CELLS,
 ):
     """Yield ``(sheet_name, row_number, {column: value})`` for one workbook.
 
@@ -477,7 +499,9 @@ def worksheet_records(
 
     try:
         for worksheet in select_sheets(workbook, sheets, include_hidden, source=source):
-            grid = sheet_grid(worksheet, unmerge=unmerge)
+            grid = sheet_grid(
+                worksheet, unmerge=unmerge, max_cells=max_cells, source=source
+            )
             yield from sheet_records(
                 worksheet.title,
                 grid,
@@ -517,34 +541,67 @@ def select_sheets(workbook, sheets, include_hidden, *, source="workbook"):
     ]
 
 
-def sheet_grid(worksheet, *, unmerge=False):
+def sheet_grid(
+    worksheet, *, unmerge=False, max_cells=DEFAULT_MAX_CELLS, source="workbook"
+):
     """The sheet as a rectangular list of rows, trailing emptiness removed.
 
     Excel's ``max_row``/``max_column`` count every cell that has ever been
     *formatted*, so a sheet where somebody once selected a column and set a
     border reports thousands of empty rows. Trimming here is what keeps those
     from landing as thousands of all-NULL records.
-    """
-    grid = [list(row) for row in worksheet.iter_rows(values_only=True)]
 
-    if unmerge:
-        # A merged region stores its value in the top-left cell only; every
-        # other cell of the region reads None. Repeating the value across the
-        # region is what makes a merged header ("Q1" spanning three columns)
-        # produce three usable column names instead of one plus two blanks.
-        merged = getattr(worksheet, "merged_cells", None)
-        for cell_range in getattr(merged, "ranges", ()):
-            top, left = cell_range.min_row - 1, cell_range.min_col - 1
-            if top >= len(grid) or left >= len(grid[top]):
-                continue
-            value = grid[top][left]
-            for row_index in range(top, min(cell_range.max_row, len(grid))):
-                row = grid[row_index]
-                for column_index in range(left, min(cell_range.max_col, len(row))):
-                    row[column_index] = value
+    Three details here are defences rather than tidying:
+
+    ``reset_dimensions`` on a read-only sheet
+        openpyxl believes the workbook's own ``<dimension>`` element, and
+        nothing checks it against the cells that follow. A file declaring
+        ``A1:XFD1048576`` makes openpyxl pad every streamed row out to 16,384
+        columns, so a parse costs ``real_rows x declared_width`` and
+        ``max_file_bytes`` bounds none of it. Measured on a 46 KB workbook of
+        3,000 honest rows: 44 MB and 3s with a truthful dimension, 394 MB and
+        27s with a lying one. Resetting derives the extents from the rows
+        actually parsed.
+
+    each row is trimmed as it streams, not after the grid exists
+        running the trailing trim on a materialised grid runs it after the
+        allocation it exists to prevent.
+
+    the merged fill happens *after* the trailing blank rows are dropped
+        the fill writes a value into every cell of a merged region, so a region
+        extending past the last row of real data (``A2:A200`` over two rows of
+        data) makes those rows non-blank and the trim then finds nothing to
+        remove — 197 all-NULL records, each one a row a keyed merge either
+        refuses or collapses onto one identity. Trimming first lets the
+        ``min(..., len(grid))`` clamps below clip the region to the real data.
+    """
+    # Only read-only worksheets carry (and trust) the declared dimension.
+    reset_dimensions = getattr(worksheet, "reset_dimensions", None)
+    if reset_dimensions is not None:
+        reset_dimensions()
+
+    grid = []
+    cells = 0
+    for row in worksheet.iter_rows(values_only=True):
+        # The unmerge path cannot trim: a merged region's cells read blank
+        # until the fill below has run, and a trimmed row has nowhere to fill.
+        values = list(row) if unmerge else _without_trailing_blanks(row)
+        cells += len(values)
+        if cells > max_cells:
+            raise SourceError(
+                f"sheet {worksheet.title!r} of {source!r} holds more than "
+                f"{max_cells} cells, which will not be parsed: openpyxl builds "
+                f"the whole sheet in memory and the worker is shared. Raise "
+                f"'max_cells' in the Binding config if the sheet really is this "
+                f"large."
+            )
+        grid.append(values)
 
     while grid and all(is_blank(value) for value in grid[-1]):
         grid.pop()
+
+    if unmerge:
+        _fill_merged_ranges(worksheet, grid)
 
     width = 0
     for row in grid:
@@ -554,6 +611,34 @@ def sheet_grid(worksheet, *, unmerge=False):
                 break
 
     return [_fit(row, width) for row in grid]
+
+
+def _without_trailing_blanks(row):
+    """`row` as a list, with its trailing blank cells dropped."""
+    for index in range(len(row) - 1, -1, -1):
+        if not is_blank(row[index]):
+            return list(row[: index + 1])
+    return []
+
+
+def _fill_merged_ranges(worksheet, grid):
+    """Repeat each merged region's value across the region, in place.
+
+    A merged region stores its value in the top-left cell only; every other
+    cell of the region reads None. Repeating the value is what makes a merged
+    header ("Q1" spanning three columns) produce three usable column names
+    instead of one plus two blanks.
+    """
+    merged = getattr(worksheet, "merged_cells", None)
+    for cell_range in getattr(merged, "ranges", ()):
+        top, left = cell_range.min_row - 1, cell_range.min_col - 1
+        if top >= len(grid) or left >= len(grid[top]):
+            continue
+        value = grid[top][left]
+        for row_index in range(top, min(cell_range.max_row, len(grid))):
+            row = grid[row_index]
+            for column_index in range(left, min(cell_range.max_col, len(row))):
+                row[column_index] = value
 
 
 def sheet_records(sheet_name, grid, *, header_row=1, skip_rows=0, source="workbook"):

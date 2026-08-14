@@ -1,8 +1,11 @@
 [build-system]
-requires = [
-  "setuptools>=61.0",
-  "wheel"
-]
+# setuptools>=77, not 61: `license = "MIT"` below is a PEP 639 SPDX string, and
+# setuptools only began accepting one there. An older builder honouring a 61
+# floor rejects it as an invalid license table — a failure that never appears
+# locally, only in whatever environment builds the sdist.
+# `wheel` is deliberately absent; setuptools.build_meta has not needed it for
+# years.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]

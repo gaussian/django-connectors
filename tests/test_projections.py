@@ -90,6 +90,27 @@ def events_target(writer):
     )
 
 
+@pytest.fixture
+def contacts_target(writer):
+    """A target whose identity can be mapped off a non-key column."""
+    return register_target(
+        TargetDefinition(
+            key="contacts",
+            fields={
+                "email": StringField(required=True),
+                "name": StringField(),
+            },
+            identity_fields=("email",),
+            identity_scope="owner",
+            writer=writer,
+            supports_scope_replace=True,
+        )
+    )
+
+
+CONTACT_MAPPING = {"email": {"source": "email"}, "name": {"source": "name"}}
+
+
 BASIC_MAPPING = {
     "external_id": {"source": "id"},
     "occurred_at": {"source": "happened_at", "cast": "datetime"},
@@ -747,3 +768,358 @@ def test_identity_scope_has_no_default(writer):
 
     signature = inspect.signature(TargetDefinition.__init__)
     assert signature.parameters["identity_scope"].default is inspect.Parameter.empty
+
+
+# --- identity obtainability (the delete path) -------------------------------
+
+
+def test_identity_mapped_off_a_non_key_column_is_refused(
+    connectors_settings, make_binding, contacts_target
+):
+    """A tombstone carries the merge key only, so `email` lands NULL on delete.
+
+    Left unchecked this validates clean, runs green for as long as nothing is
+    deleted, and then fails every run forever from the first tombstone on.
+    """
+    binding, _ = _land(
+        make_binding,
+        [[{"id": "1", "email": "a@example.com", "name": "Ada"}]],
+        primary_key="id",
+    )
+    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+
+    result = projection_services.validate_projection(projection)
+    assert not result.ok
+    joined = "; ".join(result.errors)
+    assert "email" in joined
+    assert "merge key" in joined
+    projection.refresh_from_db()
+    assert projection.status == ProjectionStatus.INVALID
+
+
+def test_identity_mapped_off_the_merge_key_validates_clean(
+    connectors_settings, make_binding, contacts_target
+):
+    """The obverse: the check must not refuse the configuration that works."""
+    binding, _ = _land(
+        make_binding,
+        [[{"id": "1", "email": "a@example.com", "name": "Ada"}]],
+        primary_key="email",
+    )
+    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+    result = projection_services.validate_projection(projection)
+    assert result.ok, result.errors
+    assert result.warnings == []
+
+
+def test_a_lowercased_key_column_is_still_the_key(
+    connectors_settings, make_binding, contacts_target
+):
+    """Deriving identity is fine; reading a column outside the key is not."""
+    binding, _ = _land(
+        make_binding,
+        [[{"id": "1", "email": "A@Example.com", "name": "Ada"}]],
+        primary_key="email",
+    )
+    projection = _projection(
+        binding,
+        {
+            "email": {"function": "lower", "args": [{"source": "email"}]},
+            "name": {"source": "name"},
+        },
+        target="contacts",
+    )
+    assert projection_services.validate_projection(projection).ok
+
+
+def test_the_merge_key_comes_from_the_landed_schema_not_the_table(
+    connectors_settings, make_binding, contacts_target
+):
+    """The landed tables carry no primary key: create_primary_keys is False."""
+    binding, _ = _land(
+        make_binding,
+        [[{"id": "1", "email": "a@example.com", "name": "Ada"}]],
+        primary_key="id",
+    )
+    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+
+    from django_connectors.landing import access
+
+    columns = access.landing_columns(binding, "events")
+    assert not any(column.get("primary_key") for column in columns.values())
+    assert projection_services.merge_key_columns_for(projection) == {
+        "_connector_binding_id",
+        "id",
+    }
+
+
+def test_an_identity_coarser_than_the_merge_key_is_flagged_for_review(
+    connectors_settings, make_binding, contacts_target
+):
+    """Two landed records then share one target identity; the host should know."""
+    binding, _ = _land(
+        make_binding,
+        [[{"id": "1", "email": "a@example.com", "name": "Ada"}]],
+        primary_key=["id", "email"],
+    )
+    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+
+    result = projection_services.validate_projection(projection)
+    assert result.ok, result.errors
+    assert any("does not cover merge key" in warning for warning in result.warnings)
+    projection.refresh_from_db()
+    assert projection.status == ProjectionStatus.NEEDS_REVIEW
+
+
+# --- delete beats upsert for the whole run ----------------------------------
+
+
+@pytest.mark.parametrize("batch_size", [1, 10])
+def test_a_delete_wins_over_an_upsert_in_a_later_batch(
+    connectors_settings,
+    make_binding,
+    contacts_target,
+    writer,
+    settings,
+    batch_size,
+):
+    """The host's end state must not depend on PROJECTION_BATCH_SIZE.
+
+    Two landed records collapse onto one target identity, and the tombstone
+    sorts first (earlier load id). Batch-scoped collapse resurrected the record
+    at batch size 1 and deleted it at batch size 10 — same data, same mapping.
+    """
+    from django_connectors.sources.memory import tombstone
+
+    settings.DJANGO_CONNECTORS = {
+        **connectors_settings,
+        "PROJECTION_BATCH_SIZE": batch_size,
+    }
+    binding = make_binding(
+        config=memory_config(
+            batches=[
+                [tombstone({"id": "2", "email": "x@example.com"})],
+                [{"id": "1", "email": "x@example.com", "name": "Ada"}],
+            ],
+            primary_key=["id", "email"],
+        )
+    )
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+
+    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+    projection_run = projection_services.replay_projection(projection)
+
+    assert projection_run.status == ProjectionRunStatus.SUCCEEDED
+    delivered = [
+        (record.operation, record.identity["email"]) for record in writer.records
+    ]
+    assert delivered[0] == ("delete", "x@example.com")
+    # Whatever the batch boundaries, the host ends up with the record deleted.
+    assert ("upsert", "x@example.com") not in delivered
+
+
+def test_a_delete_suppresses_an_upsert_in_a_later_batch(events_target):
+    """The same rule at the seam it is implemented on."""
+    from django_connectors.projections.runner import _collapse
+    from django_connectors.projections.targets import ProjectedRecord, get_target
+
+    target = get_target("events")
+    deleted_identities = set()
+    first = _collapse(
+        [ProjectedRecord(operation="delete", identity={"external_id": "e1"})],
+        target,
+        deleted_identities,
+    )
+    second = _collapse(
+        [
+            ProjectedRecord(
+                operation="upsert", identity={"external_id": "e1"}, values={}
+            ),
+            ProjectedRecord(
+                operation="upsert", identity={"external_id": "e2"}, values={}
+            ),
+        ],
+        target,
+        deleted_identities,
+    )
+    assert [record.operation for record in first] == ["delete"]
+    assert [record.identity["external_id"] for record in second] == ["e2"]
+
+
+# --- identity shape and type ------------------------------------------------
+
+
+def test_an_object_valued_identity_is_refused_by_validation(
+    connectors_settings, make_binding, events_target
+):
+    """It used to validate clean, preview clean, then die with a raw TypeError."""
+    binding, _ = _land(make_binding, [[RECORD]])
+    projection = _projection(
+        binding,
+        {**BASIC_MAPPING, "external_id": {"object": {"id": {"source": "id"}}}},
+    )
+    result = projection_services.validate_projection(projection)
+    assert not result.ok
+    assert "external_id" in "; ".join(result.errors)
+
+
+def test_a_json_cast_identity_is_refused_by_validation(
+    connectors_settings, make_binding, events_target
+):
+    binding, _ = _land(make_binding, [[RECORD]])
+    projection = _projection(
+        binding, {**BASIC_MAPPING, "external_id": {"source": "id", "cast": "json"}}
+    )
+    result = projection_services.validate_projection(projection)
+    assert not result.ok
+    assert "external_id" in "; ".join(result.errors)
+
+
+def test_a_json_identity_field_is_refused_when_the_target_is_declared(writer):
+    """Closed at the boundary: identity is a join key, not a document."""
+    from django_connectors.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="scalar"):
+        TargetDefinition(
+            key="t",
+            fields={"key": JSONField(required=True)},
+            identity_fields=("key",),
+            identity_scope="owner",
+            writer=writer,
+        )
+
+
+def test_an_unhashable_identity_does_not_escape_as_a_bare_type_error(events_target):
+    """Defence in depth for a shape validation did not foresee."""
+    from django_connectors.projections.runner import _collapse
+    from django_connectors.projections.targets import ProjectedRecord, get_target
+
+    target = get_target("events")
+    collapsed = _collapse(
+        [
+            ProjectedRecord(
+                operation="upsert", identity={"external_id": {"a": 1}}, values={}
+            ),
+            ProjectedRecord(
+                operation="delete", identity={"external_id": {"a": 1}}, values={}
+            ),
+        ],
+        target,
+    )
+    assert [record.operation for record in collapsed] == ["delete"]
+
+
+def test_identity_is_coerced_by_the_declared_target_field_on_both_paths(
+    connectors_settings, make_binding, writer
+):
+    """One field must not be delivered with two types in one run."""
+    from django_connectors.sources.memory import tombstone
+
+    register_target(
+        TargetDefinition(
+            key="events",
+            fields={"external_id": StringField(required=True)},
+            identity_fields=("external_id",),
+            identity_scope="owner",
+            writer=writer,
+            supports_scope_replace=True,
+        )
+    )
+    binding = make_binding(
+        config=memory_config(batches=[[{"id": 1001}], [tombstone({"id": 1001})]])
+    )
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+
+    projection = _projection(binding, {"external_id": {"source": "id"}})
+    projection_run = projection_services.replay_projection(projection)
+
+    assert projection_run.status == ProjectionRunStatus.SUCCEEDED
+    assert [record.operation for record in writer.records] == ["delete"]
+    assert writer.records[0].identity == {"external_id": "1001"}
+
+
+# --- mapping compilation errors ---------------------------------------------
+
+
+@pytest.mark.parametrize("cast", [["datetime"], {}, {"name": "datetime"}])
+def test_a_non_string_cast_is_a_validation_error_not_a_type_error(cast):
+    """`cast not in CASTS` hashes the value: a list raised TypeError, i.e. a 500."""
+    with pytest.raises(MappingValidationError, match="unknown cast"):
+        compile_mapping({"a": {"source": "x", "cast": cast}})
+
+
+def test_a_mapping_nested_past_the_limit_is_a_validation_error():
+    """json.loads accepts far deeper than the recursive compiler can walk."""
+    spec = {"source": "x"}
+    for _ in range(200):
+        spec = {"function": "coalesce", "args": [spec]}
+    with pytest.raises(MappingValidationError, match="nests deeper"):
+        compile_mapping({"a": spec})
+
+
+def test_a_rejected_mapping_leaves_the_projection_invalid_not_active(
+    connectors_settings, make_binding, events_target
+):
+    """A bumped version plus a still-ACTIVE status queues runs that all fail."""
+    binding, _ = _land(make_binding, [[RECORD]])
+    projection = _projection(binding)
+
+    updated = projection_services.update_mapping(
+        projection, mapping={**BASIC_MAPPING, "type": {"source": "kind", "cast": ["x"]}}
+    )
+    updated.refresh_from_db()
+    assert updated.status == ProjectionStatus.INVALID
+    assert "unknown cast" in updated.last_error
+
+
+# --- interrupted runs -------------------------------------------------------
+
+
+def test_a_writer_raising_a_base_exception_does_not_leave_the_run_running(
+    connectors_settings, make_binding, writer
+):
+    """SoftTimeLimitExceeded and KeyboardInterrupt are not Exception.
+
+    There is no reaper for ProjectionRun and retry admits only FAILED, so a row
+    left RUNNING can never be answered.
+    """
+
+    def interrupt(records, context):
+        raise KeyboardInterrupt("operator hit ctrl-c")
+
+    register_target(
+        TargetDefinition(
+            key="events",
+            fields={"external_id": StringField(required=True)},
+            identity_fields=("external_id",),
+            identity_scope="owner",
+            writer=interrupt,
+        )
+    )
+    binding, run = _land(make_binding, [[RECORD]])
+    projection = _projection(binding, {"external_id": {"source": "id"}})
+
+    with pytest.raises(KeyboardInterrupt):
+        projection_services.run_projection(projection, source_run=run)
+
+    from django_connectors.models import ProjectionRun
+
+    projection_run = ProjectionRun.objects.get(projection=projection)
+    assert projection_run.status == ProjectionRunStatus.FAILED
+    assert projection_run.finished_at is not None
+    assert "interrupted" in projection_run.error_message
+    # And it can now be retried, which is the point of not leaving it running.
+    register_target(
+        TargetDefinition(
+            key="events",
+            fields={"external_id": StringField(required=True)},
+            identity_fields=("external_id",),
+            identity_scope="owner",
+            writer=writer,
+        ),
+        override=True,
+    )
+    retry = projection_services.retry_projection_run(projection_run)
+    assert retry.status == ProjectionRunStatus.SUCCEEDED

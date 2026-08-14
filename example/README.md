@@ -21,7 +21,16 @@ projection: succeeded seen=2 written=1 deleted=1
 host records:
   evt-1  signup   live     {'detail': {'plan': 'enterprise'}, 'source_system': 'demo'}
   evt-2  login    deleted  ...
+
+demo ok
 ```
+
+`demo ok` is printed only when every step is asserted to have happened: both
+Runs succeeded, the ProjectionRun succeeded, and the host rows above are what
+landed. Anything else exits non-zero — the command is CI's only end-to-end
+gate, and `run_binding` reports a failure as a Run *status* rather than by
+raising, so a demo that merely printed it would exit 0 on almost any
+regression.
 
 ## What to copy
 

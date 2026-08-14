@@ -123,11 +123,25 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
           python-version: '3.12'
+      # `manage.py demo` asserts its own outcome and exits non-zero when the
+      # Run, the ProjectionRun or the resulting host rows are not what
+      # example/README.md documents — `run_binding` records a failure as a Run
+      # status rather than raising, so a demo that only printed the status
+      # would exit 0 on almost every ingestion regression.
       - name: Check, migrate and run the demo
         working-directory: example
+        # `pipefail` matters: the default shell here is `bash -e`, under which
+        # a command piped into anything reports the *pipe's* status, so the
+        # demo's exit code would be discarded by the `tee` below.
+        shell: bash
         run: |
-          uv run --all-extras --project .. python manage.py check
+          uv run --all-extras --project .. python manage.py check --fail-level WARNING
           uv run --all-extras --project .. python manage.py migrate --noinput
+          uv run --all-extras --project .. python manage.py demo | tee "$RUNNER_TEMP/demo.out"
+          grep -q '^demo ok$' "$RUNNER_TEMP/demo.out"
+          # The demo is documented as idempotent, and a second run is the only
+          # thing that exercises the already-created path a host meets on every
+          # deploy after the first.
           uv run --all-extras --project .. python manage.py demo
 
   # Aggregate gate — the ONLY check the branch ruleset requires. Passes only if

@@ -50,6 +50,13 @@ FILTER_OPERATORS = (
 # Operators that take no `value`.
 UNARY_OPERATORS = frozenset({"is_null", "is_not_null"})
 
+#: How deeply a mapping may nest. `json.loads` happily parses far deeper than
+#: the recursive compiler can walk, so without a limit a deep customer payload
+#: leaves the compiler with a RecursionError — which is not a
+#: MappingValidationError, so it escapes the validator and the API's error
+#: handling as a 500 instead of naming the offending field.
+MAX_NESTING_DEPTH = 32
+
 MISSING = object()
 
 
@@ -252,7 +259,11 @@ def compile_mapping(mapping, filters=None):
     return CompiledMapping(nodes, compile_filters(filters))
 
 
-def _compile_node(spec):
+def _compile_node(spec, depth=0):
+    if depth > MAX_NESTING_DEPTH:
+        raise MappingValidationError(
+            f"mapping nests deeper than {MAX_NESTING_DEPTH} levels"
+        )
     if not isinstance(spec, dict):
         raise MappingValidationError(
             'each mapping entry must be an object, e.g. {"source": "column"}'
@@ -267,7 +278,11 @@ def _compile_node(spec):
     form = forms[0]
 
     cast = spec.get("cast")
-    if cast is not None and cast not in CASTS:
+    # The type check is not redundant: `cast not in CASTS` hashes `cast`, so a
+    # list or dict arriving through the API's bare JSONField raises TypeError
+    # rather than MappingValidationError, and a TypeError escapes both the
+    # validator and the view as a 500.
+    if cast is not None and (not isinstance(cast, str) or cast not in CASTS):
         raise MappingValidationError(
             f"unknown cast {cast!r}; available: {', '.join(sorted(CASTS))}"
         )
@@ -299,7 +314,10 @@ def _compile_node(spec):
         if not isinstance(members, dict) or not members:
             raise MappingValidationError("object must be a non-empty mapping")
         return ObjectNode(
-            {str(key): _compile_node(value) for key, value in members.items()}
+            {
+                str(key): _compile_node(value, depth + 1)
+                for key, value in members.items()
+            }
         )
 
     name = spec["function"]
@@ -312,7 +330,9 @@ def _compile_node(spec):
         raise MappingValidationError(f"function {name!r} needs a non-empty args list")
     if name in ("lower", "upper") and len(args) != 1:
         raise MappingValidationError(f"function {name!r} takes exactly one argument")
-    return FunctionCall(name, [_compile_node(arg) for arg in args], cast=cast)
+    return FunctionCall(
+        name, [_compile_node(arg, depth + 1) for arg in args], cast=cast
+    )
 
 
 def compile_filters(filters):
@@ -353,24 +373,28 @@ def compile_filters(filters):
     return compiled
 
 
-def _assert_json_literal(value):
+def _assert_json_literal(value, depth=0):
     """Reject anything that is not plain JSON data.
 
     The mapping arrives as JSON, so this should be unreachable — but the field
     is also writable from Python by host code, and a callable or model instance
     slipping into a "constant" would be evaluated against every row.
     """
+    if depth > MAX_NESTING_DEPTH:
+        raise MappingValidationError(
+            f"literal nests deeper than {MAX_NESTING_DEPTH} levels"
+        )
     if isinstance(value, str | int | float | bool | type(None)):
         return
     if isinstance(value, list):
         for item in value:
-            _assert_json_literal(item)
+            _assert_json_literal(item, depth + 1)
         return
     if isinstance(value, dict):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise MappingValidationError("object keys must be strings")
-            _assert_json_literal(item)
+            _assert_json_literal(item, depth + 1)
         return
     raise MappingValidationError(
         f"{type(value).__name__} is not a JSON literal; mappings may contain "

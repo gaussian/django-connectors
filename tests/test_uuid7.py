@@ -6,6 +6,8 @@ primary key scatters InnoDB inserts across the index and carries no ordering.
 
 import uuid
 
+import pytest
+
 from django_connectors._uuid import uuid7
 
 
@@ -64,3 +66,60 @@ def test_ordering_holds_across_threads():
     assert len(set(produced)) == len(produced)
     # Ids appended under the lock must already be non-decreasing.
     assert produced == sorted(produced)
+
+
+# --- the fallback's own state machine ---------------------------------------
+#
+# These drive `_uuid7_fallback` directly rather than `uuid7`: from Python 3.14
+# the stdlib implementation is preferred, and the branch under test is ours.
+
+
+@pytest.fixture
+def rewound_clock():
+    """Leave the fallback believing the clock just stepped an hour backwards.
+
+    Restores the module globals afterwards, or every later test in this file
+    would generate ids stamped an hour in the future.
+    """
+    import time
+
+    from django_connectors import _uuid
+
+    previous = (_uuid._last_timestamp_ms, _uuid._counter)
+    ahead = time.time_ns() // 1_000_000 + 3_600_000
+    _uuid._last_timestamp_ms = ahead
+    _uuid._counter = 0
+    try:
+        yield ahead
+    finally:
+        _uuid._last_timestamp_ms, _uuid._counter = previous
+
+
+def test_a_backwards_clock_step_cannot_overflow_the_counter(rewound_clock):
+    """The counter is 12 bits and sits directly under the version nibble.
+
+    Unbounded, the 4097th id issued inside a backwards step carries into the
+    version bits: ids stop being v7 and stop sorting, which is the sole reason
+    this module exists. The step's whole width is spent in this branch, so
+    4096 ids is not a theoretical burst — it is a busy minute.
+    """
+    from django_connectors._uuid import _uuid7_fallback
+
+    values = [_uuid7_fallback() for _ in range(40_000)]
+
+    assert {value.version for value in values} == {7}
+    assert all((value.int >> 62) & 0b11 == 0b10 for value in values)
+    assert values == sorted(values)
+    assert len(set(values)) == len(values)
+
+
+def test_a_backwards_clock_step_still_sorts_after_ids_issued_before_it(
+    rewound_clock,
+):
+    """Ordering across the step is the point: ids issued before it must sort first."""
+    from django_connectors._uuid import _uuid7_fallback
+
+    earlier = _uuid7_fallback()
+    later = [_uuid7_fallback() for _ in range(5_000)]
+
+    assert earlier < min(later)

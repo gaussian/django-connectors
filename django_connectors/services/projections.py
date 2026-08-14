@@ -12,6 +12,7 @@ from django_connectors.enums import (
 )
 from django_connectors.exceptions import ConfigurationError, ProjectionError
 from django_connectors.landing import access
+from django_connectors.landing.naming import landing_table_name
 from django_connectors.models import Projection, ProjectionRun
 from django_connectors.projections import preview as preview_module
 from django_connectors.projections import runner as projection_runner
@@ -33,6 +34,38 @@ def landing_columns_for(projection):
         return None
 
 
+def merge_key_columns_for(projection):
+    """The merge identity the landed resource carries, or None if unknowable.
+
+    Read from the landed dlt schema rather than from ``Binding.config``: where
+    the key is declared is source-specific — per resource for the memory, REST
+    and filesystem sources, top-level for sql, hard-coded for every provider —
+    while ``instrument_source`` writes exactly one merge identity into the
+    schema for all of them. The landed *tables* cannot answer this at all,
+    because the destination is configured with ``create_primary_keys=False``.
+
+    None means the resource has not landed, or landed under append/replace and
+    so has no merge key.
+    """
+    binding = projection.binding
+    if binding.landing_schema_at is None:
+        return None
+    try:
+        schema = access.binding_dataset(binding).schema
+        table = schema.tables[
+            landing_table_name(binding.source, projection.resource, binding.landing_key)
+        ]
+        columns = {
+            name
+            for name, column in (table.get("columns") or {}).items()
+            if (column or {}).get("primary_key")
+        }
+    except Exception as exc:
+        logger.debug("landing merge key unavailable: %s", type(exc).__name__)
+        return None
+    return columns or None
+
+
 def validate_projection(projection, *, save=True):
     """Validate and, by default, move the Projection to the matching status."""
     source_definition = None
@@ -43,6 +76,7 @@ def validate_projection(projection, *, save=True):
         projection,
         landing_columns=landing_columns_for(projection),
         source_definition=source_definition,
+        merge_key_columns=merge_key_columns_for(projection),
     )
     if save:
         projection.status = validator_module.status_for(result)
@@ -93,13 +127,21 @@ def update_mapping(
             f"proceed."
         )
 
-    if mapping is not None:
-        projection.mapping = mapping
-    if filters is not None:
-        projection.filters = filters
-    projection.version += 1
-    projection.save(update_fields=["mapping", "filters", "version"])
-    validate_projection(projection)
+    # Atomic with the validation that follows it. A mapping that cannot even
+    # compile is expected to land with status INVALID — that is how the editor
+    # sees what is wrong — but only if `status` was actually reached. If
+    # validation raises instead, the rejected mapping would otherwise stay
+    # persisted with a bumped version and status still ACTIVE, which supersedes
+    # every in-flight ProjectionRun and makes the sweeper queue runs that all
+    # fail the same way.
+    with transaction.atomic():
+        if mapping is not None:
+            projection.mapping = mapping
+        if filters is not None:
+            projection.filters = filters
+        projection.version += 1
+        projection.save(update_fields=["mapping", "filters", "version"])
+        validate_projection(projection)
     return projection
 
 
