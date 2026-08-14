@@ -7,9 +7,37 @@ ingestion via dlt. Django library published to PyPI.
 ## Repo shape
 
 - Source: `django_connectors/`
-- Tests: `tests/` — run with `uv run --all-extras pytest`
+- Tests: `tests/` — run with `uv run --all-extras pytest`. See "Test tiers" below.
 - Lint + format: `uv run --all-extras ruff check django_connectors/ tests/` and `ruff format --check django_connectors/ tests/` (config in `pyproject.toml`)
 - Default working branch: `develop`. Releases flow `develop` → `main`.
+
+## Test tiers
+
+Three tiers, all gated behind the aggregate `ci` check:
+
+| Tier | Command | Covers |
+| --- | --- | --- |
+| default | `uv run --all-extras pytest` | everything; landing runs on sqlite, no docker needed |
+| minimal | `uv run pytest` | proves the package works with **no extras installed** |
+| mysql | `uv run --all-extras pytest -m mysql` | defects sqlite cannot express |
+
+`@pytest.mark.mysql` tests skip unless `DJANGO_CONNECTORS_TEST_MYSQL_URL` is
+set. They are not optional polish — three verified data-loss defects (silent
+load loss when pipelines share a landing table, unindexed merge cost, and
+`>64KB` `TEXT` values that wedge a pipeline permanently) are **invisible on
+sqlite**. Locally:
+
+```bash
+docker run -d --name dc-mysql -e MYSQL_ROOT_PASSWORD=connectors \
+  -e MYSQL_DATABASE=connectors_landing -p 33062:3306 mysql:8.4
+
+DJANGO_CONNECTORS_TEST_MYSQL_URL=mysql+pymysql://root:connectors@127.0.0.1:33062/connectors_landing \
+  uv run --all-extras pytest -m mysql
+```
+
+The `minimal` tier matters because `--all-extras` installs every extra, so it
+never exercises the "this extra is absent" path that the whole optional
+dependency design depends on.
 
 ## Branching & releases
 

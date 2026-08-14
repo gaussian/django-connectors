@@ -13,9 +13,32 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
+  # `dlt[sqlalchemy]` — not bare `dlt`. The sqlalchemy destination is the only
+  # route to a MySQL landing database, and it is not part of dlt's core install:
+  # bare `dlt` cannot construct a landing destination at all.
   "Django>=6.0",
-  "dlt>=1.0",
+  "dlt[sqlalchemy]>=1.30",
 ]
+
+[project.optional-dependencies]
+# Installing an extra never enables behaviour on its own — the corresponding
+# backend/source must also be named in the DJANGO_CONNECTORS setting.
+mysql = ["PyMySQL>=1.1"]
+drf = ["djangorestframework>=3.15"]
+celery = ["celery>=5.4"]
+allauth = ["django-allauth>=65.0"]
+secrets = ["cryptography>=43.0"]
+sql = ["dlt[sql-database]>=1.30"]
+csv = ["pandas>=2.2"]
+parquet = ["dlt[parquet]>=1.30"]
+s3 = ["dlt[s3]>=1.30"]
+# Provider SDKs are pulled in for *credential acquisition only* — never for data
+# access. Token signing (service-account JWTs, Entra client assertions) is the
+# one thing we must not hand-roll; the API calls themselves go through dlt's
+# rest_client, which keeps the sources synchronous and mockable. This is why
+# msgraph-sdk is absent: it is async-first and dlt resources are sync generators.
+google = ["google-auth>=2.35"]
+microsoft = ["azure-identity>=1.19", "openpyxl>=3.1"]
 
 [project.urls]
 Homepage = "https://github.com/gaussian/django-connectors"
@@ -37,6 +60,13 @@ testpaths = ["tests"]
 # manage.py for pytest-django to locate the project from.
 pythonpath = ["."]
 DJANGO_SETTINGS_MODULE = "tests.settings"
+markers = [
+  # Three MySQL-only defects (silent load loss under concurrency, unindexed
+  # merge cost, >64KB TEXT poison pills) are invisible on sqlite. These tests
+  # skip unless DJANGO_CONNECTORS_TEST_MYSQL_URL is set; CI runs them against a
+  # service container. Everything unmarked must pass on sqlite with no docker.
+  "mysql: requires a MySQL server (set DJANGO_CONNECTORS_TEST_MYSQL_URL)",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -69,6 +99,11 @@ ignore = [
 "__init__.py" = ["F401"]
 # Test settings modules are flat namespaces of constants by design.
 "tests/settings.py" = ["F403", "F405"]
+# Django generates `dependencies`/`operations` as mutable class attributes and
+# there is no way to make it emit tuples. Everything else still applies —
+# generated migrations are run through `ruff check --fix` + `ruff format`, which
+# is semantically inert (`makemigrations --check` still reports no changes).
+"django_connectors/migrations/*.py" = ["RUF012"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["django_connectors"]

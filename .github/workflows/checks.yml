@@ -46,16 +46,70 @@ jobs:
       - name: Run tests
         run: uv run --all-extras pytest
 
+  # `--all-extras` installs every extra, so it never exercises the code path the
+  # whole optional-dependency design rests on: an extra being ABSENT. This job is
+  # the only thing that proves a bare `pip install django-connectors` works.
+  # Plain `uv run` still includes the `dev` group, so pytest is present.
+  test-minimal:
+    name: test-minimal
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: '3.12'
+      - name: Run tests with no extras installed
+        run: uv run pytest
+
+  # Three verified data-loss defects are MySQL-only and invisible on sqlite:
+  # silent load loss under concurrent pipelines, unindexed merge cost, and
+  # >64KB TEXT poison pills that wedge a pipeline permanently. Without this job
+  # they stay untested forever.
+  test-mysql:
+    name: test-mysql
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: connectors
+          MYSQL_DATABASE: connectors_landing
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pconnectors"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: '3.12'
+      - name: Run MySQL-backed tests
+        env:
+          DJANGO_CONNECTORS_TEST_MYSQL_URL: mysql+pymysql://root:connectors@127.0.0.1:3306/connectors_landing
+        run: uv run --all-extras pytest -m mysql
+
   # Aggregate gate — the ONLY check the branch ruleset requires. Passes only if
   # every needed job succeeded. `if: always()` is required so a failed/skipped
   # upstream job can't let this be skipped (which GitHub treats as passing).
   # Add checks or matrix versions freely; the required-check name stays "ci".
   ci:
     name: ci
-    needs: [lint, test]
+    needs: [lint, test, test-minimal, test-mysql]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: All required checks passed
         run: |
-          [ "${{ needs.lint.result }}" = "success" ] && [ "${{ needs.test.result }}" = "success" ] || { echo "a required check did not succeed"; exit 1; }
+          for r in "${{ needs.lint.result }}" \
+                   "${{ needs.test.result }}" \
+                   "${{ needs.test-minimal.result }}" \
+                   "${{ needs.test-mysql.result }}"; do
+            [ "$r" = "success" ] || { echo "a required check did not succeed"; exit 1; }
+          done
