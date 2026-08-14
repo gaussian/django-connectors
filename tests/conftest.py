@@ -51,6 +51,66 @@ def landing_sqlite_file(tmp_path, dataset_name, *, staging=False):
     return tmp_path / f"landing__{dataset_name}{suffix}.db"
 
 
+MEMORY_SOURCE = "django_connectors.sources.memory.MemorySource"
+
+
+@pytest.fixture
+def connectors_settings(landing_url, tmp_path, settings):
+    """Configure django-connectors against an isolated sqlite landing DB."""
+    settings.DJANGO_CONNECTORS = {
+        "LANDING_URL": landing_url,
+        "LANDING_DATASET": "connectors_landing",
+        "PIPELINES_DIR": str(tmp_path / "pipelines"),
+        "SOURCES": {"memory": MEMORY_SOURCE},
+    }
+    return settings.DJANGO_CONNECTORS
+
+
+@pytest.fixture
+def make_connection(db):
+    from django.contrib.contenttypes.models import ContentType
+
+    from django_connectors.enums import ConnectionStatus
+    from django_connectors.models import Connection
+
+    def factory(owner_id="1", **kwargs):
+        return Connection.objects.create(
+            owner_content_type=ContentType.objects.get_for_model(ContentType),
+            owner_object_id=owner_id,
+            provider=kwargs.pop("provider", "memory"),
+            auth_backend=kwargs.pop("auth_backend", ""),
+            status=kwargs.pop("status", ConnectionStatus.ACTIVE),
+            **kwargs,
+        )
+
+    return factory
+
+
+@pytest.fixture
+def make_binding(make_connection):
+    from django_connectors.models import Binding
+
+    def factory(*, config=None, owner_id="1", connection=None, **kwargs):
+        return Binding.objects.create(
+            connection=connection or make_connection(owner_id=owner_id),
+            source=kwargs.pop("source", "memory"),
+            config=config or {},
+            **kwargs,
+        )
+
+    return factory
+
+
+def memory_config(
+    *, resource="events", batches, primary_key="id", cursor=None, **extra
+):
+    """Build a MemorySource config for one resource."""
+    spec = {"primary_key": primary_key, "batches": batches}
+    if cursor:
+        spec["cursor"] = cursor
+    return {"resources": {resource: spec}, **extra}
+
+
 @pytest.fixture
 def mysql_url():
     """A real MySQL landing DSN, or skip.

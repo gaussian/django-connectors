@@ -1,0 +1,240 @@
+"""The only path by which a source reaches a pipeline.
+
+Every rule applied here neutralises a behaviour verified against dlt 1.30 that
+silently loses or corrupts data:
+
+``add_map`` arity
+    dlt decides how to call a map function by counting its signature
+    parameters: exactly one means ``f(item)``, **anything else** means
+    ``f(item, meta)`` and dlt passes ``meta=None`` into your second parameter.
+    So the natural ``def inject(row, binding_id=...)`` writes ``NULL`` binding
+    ids into every row — cross-tenant contamination with no error at all.
+    ``functools.partial`` is worse: three signature parameters, ``TypeError`` at
+    extract time. A one-argument closure is the only safe shape, and the
+    assertion below enforces it.
+
+Nested tables
+    ``add_map`` stamps root records only, so child tables carry no tenant scope
+    and no run filter and are structurally unprojectable. Nested merges also
+    inject ``DROP``/``CREATE TABLE`` into the merge SQL; MySQL commits
+    implicitly on DDL, and a concurrent reader was measured seeing a fully
+    committed landing table at ``COUNT(*) = 0`` of 20,000 rows. So nesting is
+    off, with no opt-out, and dicts/lists land as JSON columns instead.
+
+Merge identity
+    The compound key ``(_connector_binding_id, *resource_pk)`` guards against a
+    second Binding deleting the first's rows — measured removing 10 of 50 when
+    keyed on the remote id alone.
+
+Incremental dedup
+    dlt defaults the dedup key to the resource's primary key, and with
+    ``range_start="closed"`` a record updated at *exactly* the stored cursor
+    value is silently dropped. Verified: run 2 emitted an updated row and the
+    table still held the old one.
+
+``hard_delete``
+    ``columns={"x": {"hard_delete": True}}`` physically deletes the row on
+    merge, which would make deletions unobservable to Projection forever. It is
+    never set, and its absence is asserted.
+"""
+
+import inspect
+
+from django_connectors.exceptions import SourceError
+from django_connectors.landing.naming import (
+    BINDING_ID_COLUMN,
+    DELETED_COLUMN,
+    RUN_ID_COLUMN,
+    landing_table_name,
+)
+
+# Pinned types for the injected columns. `precision` matters: without it dlt
+# maps str to MySQL TEXT, which cannot be indexed without a prefix length
+# (error 1170); with it the column is varchar(N) and indexes normally.
+# `nullable: False` turns the add_map arity bug into a loud
+# CannotCoerceNullException at normalize time instead of silent NULL tenancy.
+#
+# 36, not 32: these hold canonical UUID strings, which include four hyphens.
+# MySQL rejects the overflow outright ("Data too long for column"), while sqlite
+# accepts any width — so getting this wrong is invisible until production.
+UUID_STRING_LENGTH = 36
+
+METADATA_COLUMN_HINTS = {
+    BINDING_ID_COLUMN: {
+        "data_type": "text",
+        "precision": UUID_STRING_LENGTH,
+        "nullable": False,
+    },
+    RUN_ID_COLUMN: {
+        "data_type": "text",
+        "precision": UUID_STRING_LENGTH,
+        "nullable": False,
+    },
+    DELETED_COLUMN: {"data_type": "bool", "nullable": False},
+}
+
+
+def make_metadata_injector(binding_id, run_id):
+    """A one-argument closure stamping tenant and load metadata onto a record.
+
+    Must take exactly one parameter. See the module docstring: any other count
+    changes how dlt calls it and silently nulls the binding id.
+    """
+
+    def inject(row):
+        if not isinstance(row, dict):
+            raise SourceError(
+                f"Landing records must be dicts, got {type(row).__name__}. "
+                f"Arrow/pandas batches cannot be annotated with tenant metadata "
+                f"(dlt raises 'object does not support item assignment'), so "
+                f"SQL sources must force backend='sqlalchemy'."
+            )
+        row[BINDING_ID_COLUMN] = binding_id
+        row[RUN_ID_COLUMN] = run_id
+        # A source that detects deletions sets this itself; default False keeps
+        # the landing schema uniform across sources that cannot.
+        row.setdefault(DELETED_COLUMN, False)
+        return row
+
+    if len(inspect.signature(inject).parameters) != 1:  # pragma: no cover
+        raise SourceError(
+            "the metadata injector must take exactly one parameter, or dlt will "
+            "call it as f(item, meta) and null the binding id on every row"
+        )
+    return inject
+
+
+def instrument_source(source, *, binding, run, source_definition=None):
+    """Apply every landing invariant to `source`, in place, and return it.
+
+    Note the schema rename: dlt takes the schema name from the source, and a
+    cold restore resolves a schema *by name* from ``_dlt_version`` taking the
+    newest row. With Bindings sharing a schema name in one dataset, a restore
+    was measured handing Binding A the schema of Binding B, and A's own column
+    vanished. Because the schema object is replaced, sources must declare hints
+    on their resources rather than on a source-level schema.
+    """
+    from dlt.common.schema import Schema
+
+    if source.schema.name != binding.schema_name:
+        source.schema = Schema(binding.schema_name)
+
+    # No opt-out. See the module docstring.
+    source.max_table_nesting = 0
+
+    resources = list(source.resources.values())
+    if not resources:
+        raise SourceError(f"source {binding.source!r} produced no resources")
+
+    for resource in resources:
+        _instrument_resource(
+            resource,
+            binding=binding,
+            run=run,
+            source_definition=source_definition,
+        )
+    return source
+
+
+def _instrument_resource(resource, *, binding, run, source_definition=None):
+    table_name = landing_table_name(binding.source, resource.name, binding.landing_key)
+
+    declared_primary_key = _as_tuple(resource._hints.get("primary_key"))
+    write_disposition = _normalize_write_disposition(
+        resource._hints.get("write_disposition"), resource.name, declared_primary_key
+    )
+
+    hints = {
+        "table_name": table_name,
+        "write_disposition": write_disposition,
+        "columns": dict(METADATA_COLUMN_HINTS),
+    }
+    if write_disposition["disposition"] == "merge":
+        # Unconditional: the binding id always leads the merge identity.
+        hints["primary_key"] = (BINDING_ID_COLUMN, *declared_primary_key)
+
+    incremental = _build_incremental(source_definition, resource.name, binding)
+    if incremental is not None:
+        hints["incremental"] = incremental
+
+    resource.apply_hints(**hints)
+
+    resource.add_map(make_metadata_injector(str(binding.id), str(run.id)))
+
+    _assert_no_hard_delete(resource)
+
+
+def _normalize_write_disposition(declared, resource_name, primary_key):
+    """Name the merge strategy explicitly rather than relying on dlt's default.
+
+    ``upsert`` is unavailable on the sqlalchemy destination — the only route to
+    MySQL — and raises at extract time, so ``delete-insert`` is the only usable
+    strategy and is stated rather than inherited.
+    """
+    disposition = declared["disposition"] if isinstance(declared, dict) else declared
+    disposition = disposition or "merge"
+
+    if disposition != "merge":
+        return {"disposition": disposition}
+
+    if not primary_key:
+        raise SourceError(
+            f"resource {resource_name!r} uses merge disposition but declares no "
+            f"primary_key. Merge without a key cannot identify rows to replace; "
+            f"declare one, or use append/replace disposition."
+        )
+    return {"disposition": "merge", "strategy": "delete-insert"}
+
+
+def _build_incremental(source_definition, resource_name, binding):
+    """Construct the resource's Incremental, with the safe settings forced on.
+
+    The library builds this rather than the source, because neither setting can
+    be repaired afterwards: assigning to the resource's incremental wrapper
+    after the fact is silently ineffective (measured — the boundary record was
+    still dropped), and dlt strips the incremental from a *bound* resource's
+    signature, so a source that declares its own via a parameter default is
+    beyond reach entirely.
+    """
+    if source_definition is None:
+        return None
+    kwargs = source_definition.incremental_for(resource_name, binding)
+    if not kwargs:
+        return None
+
+    from dlt.extract.incremental import Incremental
+
+    forced = dict(kwargs)
+    # Empty deduplication key. dlt otherwise defaults it to the resource's
+    # primary key, and then drops a record updated at exactly the stored cursor
+    # value — the update is lost with no error.
+    forced["primary_key"] = ()
+    # Let a record with no cursor value through instead of raising
+    # IncrementalCursorPathMissing and failing the whole Run. Tombstones carry
+    # identity columns only and so have no cursor.
+    forced.setdefault("on_cursor_value_missing", "include")
+    return Incremental(**forced)
+
+
+def _assert_no_hard_delete(resource):
+    columns = resource._hints.get("columns") or {}
+    offending = sorted(
+        name
+        for name, hint in columns.items()
+        if isinstance(hint, dict) and hint.get("hard_delete")
+    )
+    if offending:
+        raise SourceError(
+            f"resource {resource.name!r} sets dlt's hard_delete hint on "
+            f"{offending}. That physically removes the row during merge, so "
+            f"Projection could never observe the deletion and target records "
+            f"would go stale forever. Emit {DELETED_COLUMN}=True instead."
+        )
+
+
+def _as_tuple(value):
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
