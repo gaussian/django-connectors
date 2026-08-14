@@ -66,18 +66,40 @@ def test_django_setup_does_not_import_dlt():
     assert result.returncode == 0, result.stderr
 
 
-def test_manage_check_opens_no_database_connection():
+def test_this_packages_checks_open_no_database_connection():
+    """Every check this library registers must run without the database.
+
+    Scoped to our own checks on purpose. A blanket "`manage.py check` opens no
+    connection" assertion is not achievable by any app: Django's own
+    ``JSONField._check_supported()`` reads ``connection.features
+    .supports_json_field``, which on sqlite requires a live connection. So the
+    meaningful, testable claim is about the checks we control.
+    """
     result = _run(
-        "import os\n"
-        "os.environ['DJANGO_SETTINGS_MODULE'] = 'tests.settings'\n"
         "import django\n"
+        "from django.conf import settings\n"
+        "settings.configure(\n"
+        "    SECRET_KEY='x',\n"
+        "    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3',\n"
+        "                           'NAME': '/nonexistent/must-not-be-opened.db'}},\n"
+        "    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth',\n"
+        "                    'django_connectors'],\n"
+        "    USE_TZ=True,\n"
+        ")\n"
         "django.setup()\n"
-        "from django.core.management import call_command\n"
+        "from django.core.checks.registry import registry\n"
         "from django.db import connections\n"
-        "call_command('check')\n"
-        "assert connections['default'].connection is None, 'check opened a DB connection'\n"
+        "ours = [check for check in registry.get_checks()\n"
+        "        if check.__module__.startswith('django_connectors')]\n"
+        "assert ours, 'no django_connectors checks are registered'\n"
+        "for check in ours:\n"
+        "    check(app_configs=None)\n"
+        "assert connections['default'].connection is None, (\n"
+        "    'a django_connectors check opened a DB connection')\n"
+        "print(len(ours))\n"
     )
     assert result.returncode == 0, result.stderr
+    assert int(result.stdout.strip()) >= 4
 
 
 def _module_level_imports(path: pathlib.Path) -> set[str]:
