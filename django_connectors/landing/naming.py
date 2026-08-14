@@ -24,9 +24,18 @@ from functools import lru_cache
 
 from django_connectors.exceptions import LandingSchemaError
 
-# MySQL's limit for both table and column identifiers, and the point at which
-# dlt starts injecting a hash rather than failing.
-MAX_IDENTIFIER_LENGTH = 64
+# The strictest identifier limit among the landing backends this library
+# supports, applied uniformly: PostgreSQL truncates at 63 bytes (NAMEDATALEN-1)
+# and MySQL at 64.
+#
+# Uniform rather than derived from the destination, because deriving it would
+# make development actively misleading: sqlite reports 9999, so a name valid in
+# tests would be silently truncated in production — and two Bindings whose names
+# differ only past the truncation point would collide onto one landing table,
+# which is precisely the failure per-Binding tables exist to prevent. dlt makes
+# it worse by not failing either: past the limit it injects a 6-character hash
+# mid-string, so the physical name becomes unpredictable rather than rejected.
+MAX_IDENTIFIER_LENGTH = 63
 
 # Injected onto every root landing record. `_dlt` is dlt's reserved prefix;
 # `_connector_` is ours and survives normalization unchanged.
@@ -83,7 +92,7 @@ def landing_table_name(source_key, resource, landing_key):
 
 
 def validate_identifier(name, *, kind="identifier"):
-    """Return `name`, or explain exactly why dlt/MySQL would not keep it."""
+    """Return `name`, or explain exactly why the backend would not keep it."""
     normalized = normalize_identifier(name)
     if normalized != name:
         raise LandingSchemaError(
@@ -94,9 +103,10 @@ def validate_identifier(name, *, kind="identifier"):
     if len(name) > MAX_IDENTIFIER_LENGTH:
         raise LandingSchemaError(
             f"{kind} {name!r} is {len(name)} characters; the limit is "
-            f"{MAX_IDENTIFIER_LENGTH}. dlt would silently inject a hash "
-            f"mid-string and MySQL would reject it. Shorten the source key or "
-            f"the resource name."
+            f"{MAX_IDENTIFIER_LENGTH} (PostgreSQL truncates at 63, MySQL at "
+            f"64). dlt would silently inject a hash mid-string rather than "
+            f"fail, so the physical name would become unpredictable. Shorten "
+            f"the source key or the resource name."
         )
     return name
 

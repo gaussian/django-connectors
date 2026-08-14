@@ -21,21 +21,29 @@ Three tiers, all gated behind the aggregate `ci` check:
 | --- | --- | --- |
 | default | `uv run --all-extras pytest` | everything; landing runs on sqlite, no docker needed |
 | minimal | `uv run pytest` | proves the package works with **no extras installed** |
-| mysql | `uv run --all-extras pytest -m mysql` | defects sqlite cannot express |
+| serverdb | `uv run --all-extras pytest -m serverdb` | defects sqlite cannot express, on MySQL **and** PostgreSQL |
 | example | `cd example && python manage.py demo` | the host-integration story end to end |
 
-`@pytest.mark.mysql` tests skip unless `DJANGO_CONNECTORS_TEST_MYSQL_URL` is
-set. They are not optional polish — three verified data-loss defects (silent
-load loss when pipelines share a landing table, unindexed merge cost, and
-`>64KB` `TEXT` values that wedge a pipeline permanently) are **invisible on
-sqlite**. Locally:
+`@pytest.mark.serverdb` tests are parameterized over every configured backend
+and skip the ones that are not; set `DJANGO_CONNECTORS_TEST_MYSQL_URL` and/or
+`DJANGO_CONNECTORS_TEST_POSTGRES_URL`. They are not optional polish. sqlite
+reports a 9999-character identifier limit where PostgreSQL truncates at **63**,
+has no meaningful server-side concurrency, and returns timestamps as strings —
+so silent load loss under concurrent pipelines, identifier truncation, unindexed
+merge cost and dialect type round-trips are all invisible without them.
+
+The landing layer must stay dialect-agnostic: PostgreSQL is a supported target,
+not a hypothetical one. Run both locally:
 
 ```bash
 docker run -d --name dc-mysql -e MYSQL_ROOT_PASSWORD=connectors \
   -e MYSQL_DATABASE=connectors_landing -p 33062:3306 mysql:8.4
+docker run -d --name dc-postgres -e POSTGRES_PASSWORD=connectors \
+  -e POSTGRES_DB=connectors_landing -p 55432:5432 postgres:16
 
 DJANGO_CONNECTORS_TEST_MYSQL_URL=mysql+pymysql://root:connectors@127.0.0.1:33062/connectors_landing \
-  uv run --all-extras pytest -m mysql
+DJANGO_CONNECTORS_TEST_POSTGRES_URL=postgresql+psycopg2://postgres:connectors@127.0.0.1:55432/connectors_landing \
+  uv run --all-extras pytest -m serverdb
 ```
 
 The `minimal` tier matters because `--all-extras` installs every extra, so it

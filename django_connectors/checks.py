@@ -50,7 +50,8 @@ def check_landing_url(app_configs, **kwargs):
                 f"{SETTING_NAME}['LANDING_URL'] is not set; no Binding can run.",
                 hint=(
                     "Set it to a SQLAlchemy DSN for the landing database, e.g. "
-                    "'mysql+pymysql://user:pw@host:3306/connectors_landing'. "
+                    "'mysql+pymysql://user:pw@host:3306/connectors_landing' or "
+                    "'postgresql+psycopg2://user:pw@host:5432/connectors_landing'. "
                     "It is not a Django DATABASES alias."
                 ),
                 id="django_connectors.W002",
@@ -78,7 +79,8 @@ def check_landing_url(app_configs, **kwargs):
             Error(
                 f"{SETTING_NAME}['LANDING_URL'] must be a SQLAlchemy DSN "
                 f"including a database name, e.g. "
-                f"'mysql+pymysql://user:pw@host:3306/connectors_landing'.",
+                f"'mysql+pymysql://user:pw@host:3306/connectors_landing' or "
+                f"'postgresql+psycopg2://user:pw@host:5432/connectors_landing'.",
                 id="django_connectors.E002",
             )
         ]

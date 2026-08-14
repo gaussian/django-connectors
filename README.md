@@ -43,13 +43,14 @@ INSTALLED_APPS = [
 DJANGO_CONNECTORS = {
     # A SQLAlchemy DSN, NOT a Django DATABASES alias — it is reached only
     # through dlt, which makes routing an ORM model there impossible.
-    "LANDING_URL": "mysql+pymysql://user:pw@host:3306/connectors_landing",
+    # MySQL and PostgreSQL are both supported and both covered by CI.
+    "LANDING_URL": "postgresql+psycopg2://user:pw@host:5432/connectors_landing",
     "SOURCES": {"rest": "django_connectors.sources.rest.RestSource"},
 }
 ```
 
-Extras: `mysql`, `drf`, `celery`, `allauth`, `secrets`, `sql`, `csv`, `parquet`,
-`s3`, `google`, `microsoft`. Installing one never enables behaviour by itself —
+Extras: `mysql`, `postgres`, `drf`, `celery`, `allauth`, `secrets`, `sql`, `csv`,
+`parquet`, `s3`, `google`, `microsoft`. Installing one never enables behaviour by itself —
 the corresponding source or backend must also be named in the setting.
 
 ## Declare a target
@@ -117,7 +118,7 @@ Writing your own means subclassing `SourceDefinition` and returning a dlt source
 
 - [docs/quickstart.md](docs/quickstart.md) — end to end in ten minutes
 - [docs/architecture.md](docs/architecture.md) — why the pieces are shaped as they are
-- [docs/operations.md](docs/operations.md) — deploying, MySQL, concurrency, retention
+- [docs/operations.md](docs/operations.md) — deploying on MySQL or PostgreSQL, concurrency, retention
 - [AGENTS.md](AGENTS.md) — development workflow and test tiers
 
 ## Development
@@ -125,13 +126,14 @@ Writing your own means subclassing `SourceDefinition` and returning a dlt source
 ```bash
 uv sync --all-extras
 uv run --all-extras pytest
-uv run --all-extras ruff check django_connectors/ tests/
-uv run --all-extras ruff format django_connectors/ tests/
+uv run --all-extras ruff check django_connectors/ tests/ example/
+uv run --all-extras ruff format django_connectors/ tests/ example/
 ```
 
-Three test tiers — default (sqlite, no docker), minimal (no extras installed),
-and MySQL-backed. See [AGENTS.md](AGENTS.md); the MySQL tier is not optional
-polish, it covers data-loss modes that are invisible on sqlite.
+Test tiers: default (sqlite, no docker), minimal (no extras installed),
+server-backed (MySQL **and** PostgreSQL), and an example-project smoke test. See
+[AGENTS.md](AGENTS.md); the server tier is not optional polish — it covers
+data-loss and portability failures that are invisible on sqlite.
 
 `develop` is the working branch; releases flow `develop` → `main` and publish to
 PyPI automatically.

@@ -2,13 +2,47 @@
 
 ## The landing database
 
-A separate database on the same server is the intended deployment:
+**MySQL and PostgreSQL are both supported**, and both are exercised by CI on
+every pull request. Nothing in the landing layer is dialect-specific; where the
+backends genuinely differ, the difference is normalised rather than assumed away.
+
+A separate database (MySQL) or schema (PostgreSQL) on the same server is the
+intended deployment:
 
 ```
-MySQL server
+database server
 ├── app                    Django models, incl. this library's control plane
 └── connectors_landing     dlt landing tables, schemas, state and load metadata
 ```
+
+```python
+"LANDING_URL": "mysql+pymysql://user:pw@host:3306/connectors_landing"
+"LANDING_URL": "postgresql+psycopg2://user:pw@host:5432/connectors_landing"
+```
+
+Install the matching driver extra: `django-connectors[mysql]` or
+`django-connectors[postgres]`.
+
+### Where the backends differ
+
+These are handled for you; they are listed because they explain why some code
+looks more careful than it needs to.
+
+| | MySQL 8.4 | PostgreSQL 16 |
+| --- | --- | --- |
+| identifier limit | 64 | **63** — the library uses 63 everywhere |
+| native boolean | no (`0`/`1`) | yes (`True`/`False`) |
+| JSON column reads back as | text | parsed |
+| `str` maps to | `TEXT`, capped at 65,535 bytes | `text`, unbounded |
+| dataset is a | database | schema |
+
+The identifier limit is the one that bites hardest: sqlite reports 9999, so a
+64-character table name passes in development and is **silently truncated** by
+PostgreSQL — and two Bindings differing only past that point would collide onto
+one landing table. The library rejects anything over 63 for every backend.
+
+The `TEXT` cap is MySQL-only: a >64KB string is a poison pill there (see below)
+and a non-event on PostgreSQL.
 
 It is **not** a Django `DATABASES` alias. A router's `allow_migrate=False` does
 not stop `.using("landing")`, `migrate --database=landing` would create
@@ -16,9 +50,10 @@ not stop `.using("landing")`, `migrate --database=landing` would create
 it. Keeping it out of `DATABASES` makes routing an ORM model there impossible
 rather than discouraged.
 
-The database must exist before first use; dlt creates the tables inside it, plus
-a `<dataset>_staging` database. The application user needs `CREATE`/`ALTER`/`DROP`
-on both — pre-provision them if that conflicts with least-privilege policy.
+The database (MySQL) or schema (PostgreSQL) must exist before first use; dlt
+creates the tables inside it, plus a `<dataset>_staging` sibling. The application
+user needs `CREATE`/`ALTER`/`DROP` on both — pre-provision them if that conflicts
+with least-privilege policy.
 
 ## Warm the dataset before running workers concurrently
 
@@ -80,10 +115,11 @@ retention.reset_binding_state(binding, backfill=True)
 ## A wedged pipeline
 
 dlt retries a failing load job indefinitely, so one un-loadable row leaves
-`has_pending_data` true and makes every later run raise. The commonest cause is a
-value too large for its column: dlt maps `str` to MySQL `TEXT` (65,535 bytes)
-while advertising a limit of 1 GB, so a >64KB string is accepted at normalize
-time and rejected at load time.
+`has_pending_data` true and makes every later run raise. On MySQL the commonest
+cause is a value too large for its column: dlt maps `str` to `TEXT`
+(65,535 bytes) while advertising a limit of 1 GB, so a >64KB string is accepted
+at normalize time and rejected at load time. PostgreSQL's `text` is unbounded and
+does not have this failure mode.
 
 The Run fails loudly rather than reporting success. Fix the source data or widen
 the column, then re-run; `reset_binding_state()` is the last resort.

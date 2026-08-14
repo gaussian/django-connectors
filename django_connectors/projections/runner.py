@@ -98,7 +98,7 @@ def _run(projection_run, projection):
 
     load_ids = _scope_for(projection_run)
     relation = access.binding_relation(binding, projection.resource, load_ids=load_ids)
-    rows = access.iter_rows(relation, order_by=ORDER_COLUMNS)
+    rows = access.iter_rows(relation, order_by=ORDER_COLUMNS, binding=binding)
 
     batch_size = conf.PROJECTION_BATCH_SIZE
     counts = {"seen": 0, "written": 0, "deleted": 0}

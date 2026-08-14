@@ -474,3 +474,69 @@ def test_json_columns_read_back_parsed_not_as_text(connectors_settings, make_bin
     relation = access.binding_relation(binding, "events")
     streamed = next(iter(access.iter_rows(relation)))
     assert streamed["meta"] == {"plan": "pro"}
+
+
+def test_a_credentials_error_raised_mid_extraction_blocks_the_connection(
+    connectors_settings, make_binding, monkeypatch
+):
+    """dlt wraps whatever a resource raises, so classification must unwrap.
+
+    Verified nesting: PipelineStepFailed -> ResourceExtractionError ->
+    CredentialsRevoked. Matching on the outer type would never see the revoked
+    credential, so the Connection would stay active and the Binding would be
+    retried against a dead credential indefinitely.
+    """
+    from django_connectors.enums import BindingStatus, ConnectionStatus
+    from django_connectors.exceptions import CredentialsRevoked
+    from django_connectors.sources.memory import MemorySource
+
+    binding = make_binding(config=memory_config(batches=[[{"id": "1"}]]))
+    original = MemorySource._build_resource
+
+    def exploding(self, dlt_module, name, spec, fail_on_batch):
+        resource = original(self, dlt_module, name, spec, fail_on_batch)
+
+        def raise_revoked(row):
+            raise CredentialsRevoked("provider returned 401 mid-run")
+
+        resource.add_map(raise_revoked)
+        return resource
+
+    monkeypatch.setattr(MemorySource, "_build_resource", exploding)
+
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.FAILED
+    # The stored type names the real cause, not dlt's wrapper — otherwise the
+    # field is useless for grouping or alerting.
+    assert run.error_type == "CredentialsRevoked"
+
+    binding.refresh_from_db()
+    binding.connection.refresh_from_db()
+    assert binding.connection.status == ConnectionStatus.REVOKED
+    assert binding.status == BindingStatus.BLOCKED
+
+    # And it must not be retried against the dead credential — the blocked
+    # Binding is refused before the source is even built.
+    follow_up = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert follow_up.status == RunStatus.FAILED
+    assert "not runnable" in follow_up.error_message
+    assert "blocked" in follow_up.error_message
+
+
+def test_unwrap_finds_the_innermost_cause():
+    from django_connectors.errors import find_cause, unwrap
+    from django_connectors.exceptions import CredentialsRevoked
+
+    root = CredentialsRevoked("401")
+    middle = RuntimeError("extraction failed")
+    middle.__cause__ = root
+    outer = RuntimeError("pipeline step failed")
+    outer.__cause__ = middle
+
+    assert unwrap(outer) is root
+    assert find_cause(outer, (CredentialsRevoked,)) is root
+    assert find_cause(outer, (KeyError,)) is None
+    # A self-referencing chain must not loop forever.
+    loop = RuntimeError("a")
+    loop.__cause__ = loop
+    assert unwrap(loop) is loop

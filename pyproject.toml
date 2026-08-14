@@ -23,7 +23,11 @@ dependencies = [
 [project.optional-dependencies]
 # Installing an extra never enables behaviour on its own — the corresponding
 # backend/source must also be named in the DJANGO_CONNECTORS setting.
+# Landing-database drivers. MySQL and PostgreSQL are both supported and both
+# covered by the `serverdb` CI tier; nothing in the landing layer is
+# dialect-specific.
 mysql = ["PyMySQL>=1.1"]
+postgres = ["psycopg2-binary>=2.9"]
 drf = ["djangorestframework>=3.15"]
 celery = ["celery>=5.4"]
 allauth = ["django-allauth>=65.0"]
@@ -61,11 +65,12 @@ testpaths = ["tests"]
 pythonpath = ["."]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 markers = [
-  # Three MySQL-only defects (silent load loss under concurrency, unindexed
-  # merge cost, >64KB TEXT poison pills) are invisible on sqlite. These tests
-  # skip unless DJANGO_CONNECTORS_TEST_MYSQL_URL is set; CI runs them against a
-  # service container. Everything unmarked must pass on sqlite with no docker.
-  "mysql: requires a MySQL server (set DJANGO_CONNECTORS_TEST_MYSQL_URL)",
+  # Landing defects that sqlite cannot express — silent load loss under
+  # concurrent pipelines, identifier truncation (PostgreSQL truncates at 63
+  # where sqlite reports 9999), unindexed merge cost, dialect-specific type
+  # round-trips. Parameterized over every configured backend; unconfigured ones
+  # skip. Everything unmarked must pass on sqlite with no docker.
+  "serverdb: requires a real database server (set DJANGO_CONNECTORS_TEST_MYSQL_URL and/or _POSTGRES_URL)",
 ]
 
 [tool.ruff]

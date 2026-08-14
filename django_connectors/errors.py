@@ -181,10 +181,69 @@ def _truncate(text: str) -> str:
     return text[: max(0, limit - len(suffix))] + suffix
 
 
+_MAX_UNWRAP_DEPTH = 10
+
+
+def unwrap(exc: BaseException) -> BaseException:
+    """Return the innermost cause of `exc`.
+
+    dlt raises ``PipelineStepFailed`` for everything, nesting the real error two
+    levels down: ``PipelineStepFailed -> ResourceExtractionError ->
+    CredentialsRevoked``. Verified against dlt 1.30.
+
+    Unwinding stops at the first :class:`ConnectorError`, because ours are
+    deliberate classifications rather than wrappers.
+
+    Without this, ``except CredentialsRevoked`` around ``pipeline.run()`` never
+    matches — so a provider returning 401 mid-run is recorded as a generic
+    failure, the Connection is never marked revoked, and the Binding is retried
+    against a dead credential indefinitely, burning provider quota. That applies
+    to every source, not only the ones that authenticate.
+    """
+    from django_connectors.exceptions import ConnectorError
+
+    current = exc
+    for _ in range(_MAX_UNWRAP_DEPTH):
+        # Stop at one of our own exceptions: those are deliberate
+        # classifications, not wrappers. Unwrapping TargetWriteError to the
+        # host writer's bare RuntimeError would discard the only part of the
+        # chain that says *which layer* failed.
+        if isinstance(current, ConnectorError):
+            return current
+        nested = getattr(current, "exception", None)
+        if not isinstance(nested, BaseException):
+            nested = current.__cause__
+        if not isinstance(nested, BaseException) or nested is current:
+            return current
+        current = nested
+    return current
+
+
+def find_cause(exc: BaseException, types: tuple[type[BaseException], ...]):
+    """Return the first exception in `exc`'s chain matching `types`, or None.
+
+    Classifies a failure by what actually happened rather than by whichever
+    wrapper dlt raised.
+    """
+    current = exc
+    for _ in range(_MAX_UNWRAP_DEPTH):
+        if isinstance(current, types):
+            return current
+        nested = getattr(current, "exception", None)
+        if not isinstance(nested, BaseException):
+            nested = current.__cause__
+        if not isinstance(nested, BaseException) or nested is current:
+            return None
+        current = nested
+    return None
+
+
 def describe(exc: BaseException) -> tuple[str, str]:
     """Return ``(error_type, scrubbed_message)`` for persistence.
 
-    ``error_type`` is the bare class name so it stays stable and greppable;
-    the module path would leak internal structure into stored data.
+    ``error_type`` names the *innermost* exception: storing "PipelineStepFailed"
+    for every dlt failure would make the field useless for grouping or alerting.
+    It is the bare class name so it stays stable and greppable; the module path
+    would leak internal structure into stored data.
     """
-    return type(exc).__name__, scrub(exc)
+    return type(unwrap(exc)).__name__, scrub(exc)

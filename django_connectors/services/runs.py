@@ -18,7 +18,7 @@ from django_connectors.enums import (
     RunStatus,
     RunTrigger,
 )
-from django_connectors.errors import describe, scrub
+from django_connectors.errors import describe, find_cause, scrub
 from django_connectors.exceptions import (
     ConnectorError,
     CredentialsExpired,
@@ -83,11 +83,14 @@ def run_binding(binding, *, trigger=RunTrigger.MANUAL, run=None, actor=None):
             source_definition=source_definition,
             credentials=credentials,
         )
-    except (CredentialsRevoked, CredentialsExpired) as exc:
-        _block_for_credentials(binding, exc)
-        _fail(binding, run, exc)
-        return run
     except Exception as exc:
+        # Classify on the innermost cause, not on what was raised: dlt wraps
+        # everything a resource raises in PipelineStepFailed, so matching on the
+        # outer type would never see a revoked credential and the Binding would
+        # be retried against it forever.
+        credentials_error = find_cause(exc, (CredentialsRevoked, CredentialsExpired))
+        if credentials_error is not None:
+            _block_for_credentials(binding, credentials_error)
         _fail(binding, run, exc)
         return run
     else:

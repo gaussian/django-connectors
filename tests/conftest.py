@@ -15,10 +15,21 @@ Two dlt behaviours drive almost everything here:
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
 MYSQL_URL_ENV = "DJANGO_CONNECTORS_TEST_MYSQL_URL"
+POSTGRES_URL_ENV = "DJANGO_CONNECTORS_TEST_POSTGRES_URL"
+
+# Real database servers the landing layer is asserted against. sqlite is the
+# default tier and covers logic; these cover everything that is dialect-shaped.
+SERVER_BACKENDS = {
+    "mysql": MYSQL_URL_ENV,
+    "postgres": POSTGRES_URL_ENV,
+}
+
+SERVER_DATASET = "connectors_landing"
 
 
 @pytest.fixture(autouse=True)
@@ -113,13 +124,47 @@ def memory_config(
 
 @pytest.fixture
 def mysql_url():
-    """A real MySQL landing DSN, or skip.
-
-    Guards the tier that covers defects sqlite cannot express: silent load loss
-    under concurrent pipelines, unindexed merge cost, and >64KB TEXT poison
-    pills.
-    """
+    """A real MySQL landing DSN, or skip."""
     url = os.environ.get(MYSQL_URL_ENV)
     if not url:
         pytest.skip(f"{MYSQL_URL_ENV} is not set")
     return url
+
+
+@pytest.fixture(params=sorted(SERVER_BACKENDS))
+def server_landing(request):
+    """A real database server to land into, one parameter per configured backend.
+
+    The landing layer must not be MySQL-shaped, and sqlite cannot prove that:
+    it reports a 9999-character identifier limit where PostgreSQL truncates at
+    63, has no server-side concurrency to speak of, and returns timestamps as
+    strings. Each backend diverges somewhere that matters — booleans, JSON
+    columns, timestamp awareness — so the invariants are asserted against every
+    one that is configured.
+    """
+    backend = request.param
+    env = SERVER_BACKENDS[backend]
+    url = os.environ.get(env)
+    if not url:
+        pytest.skip(f"{env} is not set")
+    return SimpleNamespace(backend=backend, url=url)
+
+
+@pytest.fixture
+def server_settings(server_landing, tmp_path, settings):
+    """Point django-connectors at a real server and warm the dataset.
+
+    Warming is not test scaffolding — the first *concurrent* loads into a fresh
+    dataset race on the shared `_dlt_version`/`_dlt_loads`/staging objects
+    whatever the table isolation, so production must warm serially too.
+    """
+    from django_connectors.landing.warm import warm_landing_dataset
+
+    settings.DJANGO_CONNECTORS = {
+        "LANDING_URL": server_landing.url,
+        "LANDING_DATASET": SERVER_DATASET,
+        "PIPELINES_DIR": str(tmp_path / "pipelines"),
+        "SOURCES": {"memory": MEMORY_SOURCE},
+    }
+    warm_landing_dataset()
+    return server_landing

@@ -63,12 +63,13 @@ jobs:
       - name: Run tests with no extras installed
         run: uv run pytest
 
-  # Three verified data-loss defects are MySQL-only and invisible on sqlite:
-  # silent load loss under concurrent pipelines, unindexed merge cost, and
-  # >64KB TEXT poison pills that wedge a pipeline permanently. Without this job
-  # they stay untested forever.
-  test-mysql:
-    name: test-mysql
+  # Landing defects that sqlite cannot express, against every backend the
+  # library supports. sqlite reports a 9999-character identifier limit where
+  # PostgreSQL truncates at 63, has no real concurrency, and returns timestamps
+  # as strings — so silent load loss under concurrent pipelines, identifier
+  # truncation and dialect type round-trips are all invisible without these.
+  test-databases:
+    name: test-databases
     runs-on: ubuntu-latest
     services:
       mysql:
@@ -83,6 +84,18 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: connectors
+          POSTGRES_DB: connectors_landing
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v9.0.0
@@ -90,10 +103,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
           python-version: '3.12'
-      - name: Run MySQL-backed tests
+      - name: Run server-backed tests
         env:
           DJANGO_CONNECTORS_TEST_MYSQL_URL: mysql+pymysql://root:connectors@127.0.0.1:3306/connectors_landing
-        run: uv run --all-extras pytest -m mysql
+          DJANGO_CONNECTORS_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:connectors@127.0.0.1:5432/connectors_landing
+        run: uv run --all-extras pytest -m serverdb
 
   # The example project is the only test of the integration story as a host
   # actually experiences it: autodiscovered connectors.py, a real target
@@ -122,7 +136,7 @@ jobs:
   # Add checks or matrix versions freely; the required-check name stays "ci".
   ci:
     name: ci
-    needs: [lint, test, test-minimal, test-mysql, example-smoke]
+    needs: [lint, test, test-minimal, test-databases, example-smoke]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -131,7 +145,7 @@ jobs:
           for r in "${{ needs.lint.result }}" \
                    "${{ needs.test.result }}" \
                    "${{ needs.test-minimal.result }}" \
-                   "${{ needs.test-mysql.result }}" \
+                   "${{ needs.test-databases.result }}" \
                    "${{ needs.example-smoke.result }}"; do
             [ "$r" = "success" ] || { echo "a required check did not succeed"; exit 1; }
           done

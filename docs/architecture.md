@@ -37,6 +37,18 @@ surface. It buys:
 - **Offline schema inspection.** The mapping UI needs columns, types and sample
   rows. Reading a snapshot beats calling the provider on every page load.
 
+## Backend portability
+
+MySQL and PostgreSQL are both supported and both run in CI. sqlite is the default
+test tier and covers logic only — it cannot cover portability, because it reports
+a 9999-character identifier limit (PostgreSQL truncates at 63), has no real
+server-side concurrency, and returns timestamps as strings.
+
+Every place the backends diverge is normalised rather than assumed: identifiers
+are capped at the strictest limit, JSON columns are decoded on read, and the
+field coercions accept native booleans and `0`/`1`, tz-aware and naive
+datetimes, and datetimes-as-strings alike.
+
 ## Landing topology: one table per Binding
 
 Bindings share one landing database but never a table.
@@ -70,6 +82,12 @@ Two details that look like fussiness and are not:
 - The columns are pinned to `varchar(36)`, not 32: a canonical UUID string
   includes four hyphens. MySQL rejects the overflow; sqlite accepts any width, so
   getting it wrong is invisible until production.
+- That `precision` hint has a cost worth knowing: dlt renders a `where()`
+  comparison as a cast to the column's declared type *including* precision, and
+  PostgreSQL rejects `CAST(x AS TEXT(36))`. So the tenant scope is not a WHERE
+  clause — it is structural (the table name is derived from the Binding) plus an
+  assertion on every row read, which raises on a foreign row instead of quietly
+  filtering it out.
 
 ## Nesting is off, with no opt-out
 

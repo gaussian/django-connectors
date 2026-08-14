@@ -32,7 +32,13 @@ def preview_projection(projection, *, limit=None):
     compiled = compile_mapping(projection.mapping, projection.filters)
 
     relation = access.binding_relation(projection.binding, projection.resource)
-    rows = list(access.iter_rows(relation.limit(limit), order_by=ORDER_COLUMNS))
+    rows = list(
+        access.iter_rows(
+            relation.limit(limit),
+            order_by=ORDER_COLUMNS,
+            binding=projection.binding,
+        )
+    )
 
     results = []
     budget = conf.PREVIEW_MAX_BYTES

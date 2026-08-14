@@ -22,10 +22,12 @@ SETTING_NAME = "DJANGO_CONNECTORS"
 
 DEFAULTS: dict[str, Any] = {
     # --- landing -----------------------------------------------------------
-    # SQLAlchemy DSN for the landing database, e.g.
-    # "mysql+pymysql://user:pw@host:3306/connectors_landing". Reached only
-    # through dlt; deliberately NOT a Django DATABASES alias, so that no ORM
-    # model can ever be routed there.
+    # SQLAlchemy DSN for the landing database. MySQL and PostgreSQL are both
+    # supported and both covered by the `serverdb` test tier:
+    #   "mysql+pymysql://user:pw@host:3306/connectors_landing"
+    #   "postgresql+psycopg2://user:pw@host:5432/connectors_landing"
+    # Reached only through dlt; deliberately NOT a Django DATABASES alias, so
+    # that no ORM model can ever be routed there.
     "LANDING_URL": None,
     "LANDING_DATASET": "connectors_landing",
     # Where dlt keeps pipeline working state. Must be durable across a Run for
