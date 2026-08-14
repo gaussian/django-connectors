@@ -38,13 +38,37 @@ testpaths = ["tests"]
 pythonpath = ["."]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 
+[tool.ruff]
+target-version = "py312"
+
 [tool.ruff.lint]
-# Pin to the classic real-errors rule set (pyflakes + core pycodestyle) rather
-# than ruff 0.16+'s newer, broader default which pulls in style/modernization
-# rules (UP/SIM/I/…). Two rules excluded:
-#   F401 (imported-but-unused): fires on side-effect imports and re-exports that
-#         are load-bearing despite looking unused. F821 (undefined name) still
-#         catches genuinely-missing imports, so correctness is unaffected.
-#   F841 (unused local): the codebase has intentional demo assignments.
-select = ["E4", "E7", "E9", "F"]
-ignore = ["F401", "F841"]
+# This repo started empty, so there is no legacy code to grandfather in — the
+# rule set is deliberately broader than a "real errors only" pin. Keep it that
+# way: it is far cheaper to hold the line from commit one than to adopt these
+# rules later across a grown codebase.
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # isort — import ordering
+  "UP",       # pyupgrade — modern syntax for the target-version
+  "B",        # flake8-bugbear — likely bugs and footguns
+  "C4",       # flake8-comprehensions
+  "SIM",      # flake8-simplify
+  "DJ",       # flake8-django — Django-specific correctness
+  "RUF",      # ruff-specific rules
+]
+ignore = [
+  # Line length is the formatter's job; `ruff format` wraps what it can and
+  # E501 would then only fire on things it cannot split (long URLs, strings).
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exports in package __init__ files are load-bearing despite looking unused.
+# F821 (undefined name) still catches genuinely-missing imports.
+"__init__.py" = ["F401"]
+# Test settings modules are flat namespaces of constants by design.
+"tests/settings.py" = ["F403", "F405"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["django_connectors"]
