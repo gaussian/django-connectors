@@ -1,0 +1,64 @@
+name: Release New Version
+
+# This workflow no longer bumps the version. The version is bumped separately on
+# develop by the "Bump Version" workflow; here we simply read whatever version is
+# in the files and cut a tag + release for it. Publishing to PyPI is handled by
+# publish.yml, which chains off this workflow completing.
+
+on:
+  pull_request:
+    types: [closed]         # fire when PRs are closed
+    branches: [main]        # only for PRs targeting main
+    paths:
+      - 'pyproject.toml'    # only if the version file changed in the PR
+
+permissions:
+  contents: write
+
+jobs:
+  make-release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0 # otherwise, there would be errors pushing refs to the destination repository.
+
+      - name: Read version
+        id: versioning
+        run: |
+          VERSION=$(grep '^version' pyproject.toml \
+                    | head -1 \
+                    | sed -E 's/version\s*=\s*"(.*)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if tag already exists
+        id: tagcheck
+        run: |
+          if git rev-parse -q --verify "refs/tags/v${{ steps.versioning.outputs.version }}" >/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag v${{ steps.versioning.outputs.version }} already exists. Skipping release."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create tag
+        if: steps.tagcheck.outputs.exists == 'false'
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git tag v${{ steps.versioning.outputs.version }}
+          git push origin v${{ steps.versioning.outputs.version }}
+
+      - name: Create GitHub Release
+        if: steps.tagcheck.outputs.exists == 'false'
+        run: |
+          gh release create \
+            "v${{ steps.versioning.outputs.version }}" \
+            --title "v${{ steps.versioning.outputs.version }}" \
+            --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
