@@ -136,22 +136,42 @@ def check_registry_extras_available(app_configs, **kwargs):
     from django_connectors.registry import auth_backends, sources
 
     warnings = []
+    candidates = []
+
     for registry in (sources, auth_backends):
         try:
             resolved = registry.all()
         except Exception:
             continue
         for key, obj in resolved.items():
-            for module_name, extra in getattr(obj, "required_extras", {}).items():
-                if not _module_available(module_name):
-                    warnings.append(
-                        Warning(
-                            f"{registry.label} {key!r} needs {module_name!r}, "
-                            f"which is not installed.",
-                            hint=f"pip install 'django-connectors[{extra}]'",
-                            id="django_connectors.W005",
-                        )
+            candidates.append((registry.label, key, obj))
+            # A source's webhook adapter carries its own dependencies and is
+            # reachable through no registry of its own.
+            adapter = getattr(obj, "webhook", None)
+            if adapter is not None:
+                candidates.append((f"{registry.label} webhook adapter", key, adapter))
+
+    # The secret store is configured by a single dotted path rather than a
+    # registry, so it would otherwise never be inspected — and it is the one
+    # component whose missing extra silently blocks every credential write.
+    try:
+        from django_connectors.secrets import get_secret_store
+
+        candidates.append(("secret store", conf.SECRET_STORE, get_secret_store()))
+    except Exception:
+        pass
+
+    for label, key, obj in candidates:
+        for module_name, extra in getattr(obj, "required_extras", {}).items():
+            if not _module_available(module_name):
+                warnings.append(
+                    Warning(
+                        f"{label} {key!r} needs {module_name!r}, "
+                        f"which is not installed.",
+                        hint=f"pip install 'django-connectors[{extra}]'",
+                        id="django_connectors.W005",
                     )
+                )
     return warnings
 
 

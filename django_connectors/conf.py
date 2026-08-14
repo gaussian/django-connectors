@@ -63,6 +63,11 @@ DEFAULTS: dict[str, Any] = {
     "WEBHOOK_DEDUPE_TTL": dt.timedelta(minutes=10),
     "WEBHOOK_DEBOUNCE": dt.timedelta(seconds=30),
     "WEBHOOK_RATE_LIMIT_PER_MINUTE": 120,
+    # --- sources -----------------------------------------------------------
+    # Lift the REST source's SSRF guard, which otherwise refuses any host
+    # resolving to a private, loopback, link-local or metadata address. Hosts
+    # with genuinely internal APIs need this; the default denies.
+    "REST_ALLOW_PRIVATE_ADDRESSES": False,
     # --- optional DRF API --------------------------------------------------
     # Dotted path to callable(request) -> the owning object, or
     # (content_type, object_id). Only the host knows what owns a Connection.

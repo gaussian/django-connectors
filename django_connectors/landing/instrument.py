@@ -170,20 +170,38 @@ def _normalize_write_disposition(declared, resource_name, primary_key):
     ``upsert`` is unavailable on the sqlalchemy destination — the only route to
     MySQL — and raises at extract time, so ``delete-insert`` is the only usable
     strategy and is stated rather than inherited.
+
+    There is no "unset means merge" fallback, because **there is no unset**:
+    ``dlt.resource()`` defaults the hint to ``"append"``, not to ``None``. A
+    source that simply omits the disposition therefore appends a fresh copy of
+    every re-fetched record on every run — with the merge key correctly
+    configured and no error raised. Since an explicit ``"append"`` is
+    indistinguishable from the default, a declared ``primary_key`` is used as
+    the signal: it means nothing under append disposition, so the combination is
+    a mistake rather than a preference, and is refused.
     """
     disposition = declared["disposition"] if isinstance(declared, dict) else declared
     disposition = disposition or "merge"
 
-    if disposition != "merge":
-        return {"disposition": disposition}
+    if disposition == "merge":
+        if not primary_key:
+            raise SourceError(
+                f"resource {resource_name!r} uses merge disposition but declares "
+                f"no primary_key. Merge without a key cannot identify rows to "
+                f"replace; declare one, or use append/replace disposition."
+            )
+        return {"disposition": "merge", "strategy": "delete-insert"}
 
-    if not primary_key:
+    if disposition == "append" and primary_key:
         raise SourceError(
-            f"resource {resource_name!r} uses merge disposition but declares no "
-            f"primary_key. Merge without a key cannot identify rows to replace; "
-            f"declare one, or use append/replace disposition."
+            f"resource {resource_name!r} declares primary_key {list(primary_key)} "
+            f"with append disposition, which dlt ignores — every run would append "
+            f"a second copy of every re-fetched record, silently. dlt defaults "
+            f"this hint to 'append', so this is most likely an omission: state "
+            f"write_disposition='merge' to keep records reconciled, or drop the "
+            f"primary_key if append-only really is intended."
         )
-    return {"disposition": "merge", "strategy": "delete-insert"}
+    return {"disposition": disposition}
 
 
 def _build_incremental(source_definition, resource_name, binding):

@@ -9,6 +9,12 @@ here pins one of those doors shut.
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.urls import include, path, reverse
+
+# The API is behind the `drf` extra, so the whole module skips without it.
+# The `test-minimal` CI tier runs with zero extras installed and would
+# otherwise fail at collection rather than skipping.
+pytest.importorskip("rest_framework")
+
 from rest_framework import viewsets
 from rest_framework.generics import GenericAPIView
 from rest_framework.test import APIClient

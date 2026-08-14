@@ -417,3 +417,37 @@ def test_no_module_scope_dlt_import_in_the_landing_layer():
                 assert not any(a.name.split(".")[0] == "dlt" for a in node.names), path
             elif isinstance(node, ast.ImportFrom) and node.module:
                 assert node.module.split(".")[0] != "dlt", path
+
+
+def test_append_disposition_with_a_primary_key_is_refused():
+    """dlt defaults this hint to "append", so omitting it duplicates silently.
+
+    A resource declaring a primary key it never merges on has almost certainly
+    just forgotten to state the disposition — and the symptom is a second copy
+    of every re-fetched record on every run, with no error at all. There is no
+    way to tell an explicit "append" from the default, so the meaningless
+    combination is what gets refused.
+    """
+    from django_connectors.landing.instrument import _normalize_write_disposition
+
+    with pytest.raises(SourceError, match="append"):
+        _normalize_write_disposition("append", "events", ("id",))
+
+    # Append with no key is a legitimate event-log source.
+    assert _normalize_write_disposition("append", "events", ()) == {
+        "disposition": "append"
+    }
+    # An explicit merge names its strategy: `upsert` is unavailable on the only
+    # MySQL-capable destination, so `delete-insert` is stated, not inherited.
+    assert _normalize_write_disposition("merge", "events", ("id",)) == {
+        "disposition": "merge",
+        "strategy": "delete-insert",
+    }
+
+
+def test_dlt_defaults_write_disposition_to_append_not_none():
+    """Pins the upstream behaviour the rule above exists for."""
+    import dlt
+
+    resource = dlt.resource([{"id": 1}], name="x", primary_key="id")
+    assert resource._hints.get("write_disposition") == "append"

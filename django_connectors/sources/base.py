@@ -28,6 +28,11 @@ class SourceDefinition:
     #: ``{module_name: extra_name}`` — surfaced by the W005 system check.
     required_extras: ClassVar[dict[str, str]] = {}
 
+    #: A WebhookAdapter instance, or None. Adapters hang off the source rather
+    #: than living in a registry of their own: an adapter is meaningless without
+    #: the source whose data it announces.
+    webhook = None
+
     #: Whether this source can detect remote deletions and emit tombstones.
     #: False for every cursor-based source (REST, warehouse): a remote deletion
     #: emits nothing at all, so deletion propagation is genuinely unsupported
