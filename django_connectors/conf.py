@@ -63,6 +63,15 @@ DEFAULTS: dict[str, Any] = {
     "WEBHOOK_DEDUPE_TTL": dt.timedelta(minutes=10),
     "WEBHOOK_DEBOUNCE": dt.timedelta(seconds=30),
     "WEBHOOK_RATE_LIMIT_PER_MINUTE": 120,
+    # --- optional DRF API --------------------------------------------------
+    # Dotted path to callable(request) -> the owning object, or
+    # (content_type, object_id). Only the host knows what owns a Connection.
+    # Unset means every API request is denied — the safe default.
+    "API_OWNER_RESOLVER": None,
+    # Dotted paths to DRF permission classes. Unset means DenyAll: DRF's own
+    # default is AllowAny, so a host following install instructions verbatim
+    # would otherwise publish connector data unauthenticated.
+    "API_PERMISSION_CLASSES": (),
     # --- admin -------------------------------------------------------------
     "ADMIN_ACTION_MAX_SELECTION": 50,
     # --- errors ------------------------------------------------------------

@@ -1,0 +1,310 @@
+"""API hardening.
+
+The API is the part of this library most likely to leak data, for reasons that
+are entirely mundane: DRF defaults to ``AllowAny``, the natural queryset is
+``Model.objects.all()``, and the natural route is a flat collection. Each test
+here pins one of those doors shut.
+"""
+
+import pytest
+from django.core.exceptions import ImproperlyConfigured
+from django.urls import include, path, reverse
+from rest_framework import viewsets
+from rest_framework.generics import GenericAPIView
+from rest_framework.test import APIClient
+
+from django_connectors.api import views as api_views
+from django_connectors.api.scoping import OwnerScopedQuerysetMixin
+from django_connectors.enums import RunTrigger
+from django_connectors.models import Binding, Run
+from django_connectors.services import runs as run_services
+from tests.conftest import memory_config
+
+pytestmark = pytest.mark.django_db
+
+urlpatterns = [path("api/connectors/", include("django_connectors.api.urls"))]
+
+
+@pytest.fixture
+def api_settings(connectors_settings, settings):
+    settings.ROOT_URLCONF = "tests.test_api"
+    settings.DJANGO_CONNECTORS = {
+        **connectors_settings,
+        "API_OWNER_RESOLVER": "tests.test_api.resolve_owner",
+        "API_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+    }
+    return settings
+
+
+#: Set by tests to control which owner the resolver reports.
+CURRENT_OWNER = {"object_id": "1"}
+
+
+def resolve_owner(request):
+    from django.contrib.contenttypes.models import ContentType
+
+    if CURRENT_OWNER.get("object_id") is None:
+        return None
+    return ContentType.objects.get_for_model(ContentType).id, CURRENT_OWNER["object_id"]
+
+
+@pytest.fixture(autouse=True)
+def reset_owner():
+    CURRENT_OWNER["object_id"] = "1"
+    yield
+    CURRENT_OWNER["object_id"] = "1"
+
+
+@pytest.fixture
+def client_for():
+    from django.contrib.auth.models import User
+
+    def factory(username=None):
+        username = username or f"apiuser{User.objects.count()}"
+        user = User.objects.create_user(username=username, password="x")
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    return factory
+
+
+# --- structural guarantees -------------------------------------------------
+
+
+def test_every_viewset_is_owner_scoped():
+    """Asserted by introspection so a viewset added later inherits the rule."""
+    unscoped = [
+        name
+        for name, obj in vars(api_views).items()
+        if isinstance(obj, type)
+        and issubclass(obj, GenericAPIView)
+        and obj.__module__ == api_views.__name__
+        and not getattr(obj, "abstract_scope", False)
+        and not issubclass(obj, OwnerScopedQuerysetMixin)
+    ]
+    assert unscoped == []
+
+
+def test_a_viewset_without_an_owner_lookup_fails_at_class_definition():
+    """The mistake must not be able to reach production behind an untested path."""
+    with pytest.raises(ImproperlyConfigured, match="owner_lookup"):
+
+        class Broken(OwnerScopedQuerysetMixin, viewsets.ModelViewSet):
+            queryset = Binding.objects.all()
+
+
+def test_there_are_no_flat_run_collections():
+    """A flat /runs/ has no owner in the path and no safe default queryset."""
+    from django_connectors.api.urls import router
+
+    registered = {prefix for prefix, _, _ in router.registry}
+    assert "runs" not in registered
+    assert "projection-runs" not in registered
+
+
+def test_default_permission_denies_everyone(connectors_settings, settings, client_for):
+    """DRF's own default is AllowAny; ours must not be."""
+    settings.ROOT_URLCONF = "tests.test_api"
+    settings.DJANGO_CONNECTORS = {
+        **connectors_settings,
+        "API_OWNER_RESOLVER": "tests.test_api.resolve_owner",
+    }
+    response = client_for().get(reverse("django_connectors:connection-list"))
+    assert response.status_code == 403
+
+
+def test_requests_are_denied_when_no_owner_resolver_is_configured(
+    connectors_settings, settings, client_for
+):
+    settings.ROOT_URLCONF = "tests.test_api"
+    settings.DJANGO_CONNECTORS = {
+        **connectors_settings,
+        "API_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+    }
+    with pytest.raises(ImproperlyConfigured, match="API_OWNER_RESOLVER"):
+        client_for().get(reverse("django_connectors:connection-list"))
+
+
+# --- tenant isolation ------------------------------------------------------
+
+
+def test_a_caller_sees_only_their_own_connections(
+    api_settings, make_connection, client_for
+):
+    make_connection(owner_id="1", provider="mine")
+    make_connection(owner_id="2", provider="theirs")
+
+    response = client_for().get(reverse("django_connectors:connection-list"))
+    assert response.status_code == 200
+    providers = {item["provider"] for item in response.json()}
+    assert providers == {"mine"}
+
+
+def test_another_tenants_binding_is_not_retrievable(
+    api_settings, make_binding, client_for
+):
+    other = make_binding(owner_id="2")
+    response = client_for().get(
+        reverse("django_connectors:binding-detail", args=[other.id])
+    )
+    assert response.status_code == 404
+
+
+def test_runs_are_scoped_through_their_binding(api_settings, make_binding, client_for):
+    mine = make_binding(owner_id="1")
+    theirs = make_binding(owner_id="2")
+    Run.objects.create(binding=mine, trigger=RunTrigger.MANUAL)
+    Run.objects.create(binding=theirs, trigger=RunTrigger.MANUAL)
+
+    response = client_for().get(
+        reverse("django_connectors:binding-runs", args=[mine.id])
+    )
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+
+    denied = client_for("other").get(
+        reverse("django_connectors:binding-runs", args=[theirs.id])
+    )
+    assert denied.status_code == 404
+
+
+def test_an_unresolvable_owner_sees_nothing(api_settings, make_connection, client_for):
+    """Fails closed: no owner means an empty queryset, not an unfiltered one."""
+    make_connection(owner_id="1")
+    CURRENT_OWNER["object_id"] = None
+    response = client_for().get(reverse("django_connectors:connection-list"))
+    assert response.json() == []
+
+
+# --- credential exposure ---------------------------------------------------
+
+
+def test_credentials_are_never_serialized(api_settings, make_connection, client_for):
+    connection = make_connection(owner_id="1")
+    connection.auth_reference = "vault://super-secret-handle"
+    connection.auth_metadata = {"scopes": ["mail.read"]}
+    connection.save()
+
+    payload = (
+        client_for()
+        .get(reverse("django_connectors:connection-detail", args=[connection.id]))
+        .json()
+    )
+
+    assert "auth_metadata" not in payload
+    assert "auth_reference" not in payload
+    assert "setup_token" not in payload
+    assert "super-secret-handle" not in str(payload)
+
+
+def test_error_messages_are_scrubbed_again_on_the_way_out(
+    api_settings, make_binding, client_for
+):
+    """Defence in depth: covers rows written before the scrubber existed."""
+    binding = make_binding(owner_id="1")
+    Run.objects.create(
+        binding=binding,
+        trigger=RunTrigger.MANUAL,
+        status="failed",
+        error_type="OperationalError",
+        # Simulates a row that bypassed scrub() at write time.
+        error_message=(
+            "could not connect using "
+            "mysql+pymysql://root:sup3rSekritPassw0rd@db.internal:3306/landing"
+        ),
+    )
+    payload = (
+        client_for()
+        .get(reverse("django_connectors:binding-runs", args=[binding.id]))
+        .json()
+    )
+    assert "sup3rSekritPassw0rd" not in str(payload)
+
+
+def test_webhook_public_id_and_secret_reference_are_not_exposed(
+    api_settings, make_binding, client_for
+):
+    from django_connectors.models import WebhookSubscription
+
+    binding = make_binding(owner_id="1")
+    subscription = WebhookSubscription.objects.create(
+        binding=binding, secret_reference="vault://hmac-key"
+    )
+    payload = (
+        client_for()
+        .get(
+            reverse(
+                "django_connectors:webhooksubscription-detail", args=[subscription.id]
+            )
+        )
+        .json()
+    )
+
+    assert "public_id" not in payload
+    assert "secret_reference" not in payload
+    assert str(subscription.public_id) not in str(payload)
+
+
+# --- behaviour -------------------------------------------------------------
+
+
+def test_landing_schema_and_sample_are_owner_scoped_and_bounded(
+    api_settings, make_binding, client_for
+):
+    binding = make_binding(
+        owner_id="1", config=memory_config(batches=[[{"id": "e1", "v": "a"}]])
+    )
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+
+    schema = (
+        client_for()
+        .get(reverse("django_connectors:binding-landing-schema", args=[binding.id]))
+        .json()
+    )
+    assert schema["status"] == "ready"
+
+    sample = (
+        client_for()
+        .get(f"/api/connectors/bindings/{binding.id}/resources/events/sample/")
+        .json()
+    )
+    assert sample["rows"]
+    assert not any(
+        key.startswith(("_connector_", "_dlt_")) for key in sample["rows"][0]
+    )
+
+
+def test_projection_version_cannot_be_set_by_a_client(
+    api_settings, make_binding, client_for
+):
+    """A client-chosen version would break the superseded-run check."""
+    from django_connectors.api.serializers import ProjectionSerializer
+
+    assert "version" in ProjectionSerializer.Meta.read_only_fields
+
+
+def test_targets_endpoint_exposes_shape_not_tenant_data(api_settings, client_for):
+    from django_connectors.projections.fields import StringField
+    from django_connectors.projections.targets import (
+        TargetDefinition,
+        register_target,
+        unregister_all,
+    )
+
+    unregister_all()
+    register_target(
+        TargetDefinition(
+            key="events",
+            fields={"external_id": StringField(required=True)},
+            identity_fields=("external_id",),
+            identity_scope="owner",
+            writer=lambda records, context: len(records),
+        )
+    )
+    try:
+        payload = client_for().get(reverse("django_connectors:target-list")).json()
+        assert payload[0]["key"] == "events"
+        assert payload[0]["fields"]["external_id"]["required"] is True
+    finally:
+        unregister_all()
