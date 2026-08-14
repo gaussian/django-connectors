@@ -197,7 +197,37 @@ def _succeed(binding, run, result):
             "landing_schema_at",
         ]
     binding.save(update_fields=updated)
+
+    _after_success(binding, run)
     return run
+
+
+def _after_success(binding, run):
+    """Re-grade projections against the new schema, then dispatch them.
+
+    Both are best-effort: the ingestion genuinely succeeded, and failing the Run
+    because a downstream projection could not be queued would misreport what
+    happened — and would make the next attempt re-fetch from the provider for
+    no reason. `dispatch_pending_projections` is the safety net for whatever is
+    dropped here.
+    """
+    from django_connectors.services import discovery, projections
+
+    try:
+        discovery.refresh_projection_drift(binding)
+    except Exception as exc:
+        logger.warning(
+            "could not refresh projection drift for binding %s: %s",
+            binding.id,
+            type(exc).__name__,
+        )
+
+    try:
+        projections.dispatch_after_run(run)
+    except Exception as exc:
+        logger.warning(
+            "could not dispatch projections for run %s: %s", run.id, type(exc).__name__
+        )
 
 
 def _fail(binding, run, exc):

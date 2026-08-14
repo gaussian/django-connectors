@@ -14,6 +14,10 @@ class DjangoConnectorsConfig(AppConfig):
         # Importing registers the check functions with Django's registry.
         from django_connectors import checks  # noqa: F401
 
+        # Connects the pre_delete guard that stops a Binding being deleted while
+        # its landing tables still hold customer rows.
+        from django_connectors.services import retention  # noqa: F401
+
         # Import each installed app's `connectors` module so that host calls to
         # register_target() have run before anything reads the target registry.
         # This is the contract django.contrib.admin uses for `admin.py`, and it
