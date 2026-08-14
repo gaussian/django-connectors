@@ -10,12 +10,6 @@ ingestion via [dlt](https://dlthub.com/).
 pip install django-connectors
 ```
 
-With dlt-backed ingestion:
-
-```bash
-pip install "django-connectors[dlt]"
-```
-
 Then add it to `INSTALLED_APPS`:
 
 ```python

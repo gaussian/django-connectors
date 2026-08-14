@@ -14,10 +14,8 @@ license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
   "Django>=5.0",
+  "dlt>=1.0",
 ]
-
-[project.optional-dependencies]
-dlt = ["dlt>=1.0"]
 
 [project.urls]
 Homepage = "https://github.com/gaussian/django-connectors"

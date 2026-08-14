@@ -198,10 +198,6 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "django" },
-]
-
-[package.optional-dependencies]
-dlt = [
     { name = "dlt" },
 ]
 
@@ -215,9 +211,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "django", specifier = ">=5.0" },
-    { name = "dlt", marker = "extra == 'dlt'", specifier = ">=1.0" },
+    { name = "dlt", specifier = ">=1.0" },
 ]
-provides-extras = ["dlt"]
 
 [package.metadata.requires-dev]
 dev = [
