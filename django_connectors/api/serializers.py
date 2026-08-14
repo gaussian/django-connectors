@@ -14,6 +14,7 @@ Defence in depth is worth it for the one field capable of carrying a landing DSN
 
 from rest_framework import serializers
 
+from django_connectors.api.scoping import resolve_owner
 from django_connectors.errors import scrub
 from django_connectors.models import (
     Binding,
@@ -23,6 +24,44 @@ from django_connectors.models import (
     Run,
     WebhookSubscription,
 )
+
+
+class OwnerScopedPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
+    """A writable foreign key that only accepts objects the caller owns.
+
+    Scoping a viewset's *queryset* protects reads only. DRF builds a writable
+    relation from the related model's unfiltered default manager, so a plain
+    ModelSerializer happily accepts another tenant's primary key — and for
+    ``Binding.connection`` that is a credential exfiltration primitive, not
+    merely a data-integrity problem: the attacker points the Binding at a server
+    they control and the runner sends the victim's provider token to it in an
+    Authorization header.
+
+    Fails closed: no request, or an owner that does not resolve, yields an empty
+    queryset rather than an unfiltered one.
+    """
+
+    def __init__(self, *, owner_lookup="", **kwargs):
+        #: ORM path from the related model to ``Connection.owner_*``.
+        self.owner_lookup = owner_lookup
+        super().__init__(**kwargs)
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        request = self.context.get("request")
+        if request is None:
+            return queryset.none()
+        owner = resolve_owner(request)
+        if owner is None:
+            return queryset.none()
+        content_type_id, object_id = owner
+        prefix = f"{self.owner_lookup}__" if self.owner_lookup else ""
+        return queryset.filter(
+            **{
+                f"{prefix}owner_content_type_id": content_type_id,
+                f"{prefix}owner_object_id": object_id,
+            }
+        )
 
 
 class ScrubbedCharField(serializers.CharField):
@@ -53,6 +92,9 @@ class ConnectionSerializer(serializers.ModelSerializer):
 
 class BindingSerializer(serializers.ModelSerializer):
     last_error = ScrubbedCharField(read_only=True, allow_blank=True)
+    connection = OwnerScopedPrimaryKeyRelatedField(
+        queryset=Connection.objects.all(), owner_lookup=""
+    )
 
     class Meta:
         model = Binding
@@ -113,6 +155,9 @@ class RunSerializer(serializers.ModelSerializer):
 
 class ProjectionSerializer(serializers.ModelSerializer):
     last_error = ScrubbedCharField(read_only=True, allow_blank=True)
+    binding = OwnerScopedPrimaryKeyRelatedField(
+        queryset=Binding.objects.all(), owner_lookup="connection"
+    )
 
     class Meta:
         model = Projection
@@ -202,3 +247,44 @@ class MappingUpdateSerializer(serializers.Serializer):
     mapping = serializers.JSONField(required=False)
     filters = serializers.JSONField(required=False)
     acknowledge_identity_change = serializers.BooleanField(default=False)
+
+
+def _assert_writable_relations_are_owner_scoped():
+    """Guard against a serializer exposing an unscoped writable FK.
+
+    Read scoping lives on the viewset; write scoping lives here, and the two are
+    easy to confuse. This asserts the second at import time so a serializer added
+    later cannot quietly accept another tenant's primary key.
+    """
+    from django.core.exceptions import ImproperlyConfigured
+
+    offenders = []
+    for name, obj in list(globals().items()):
+        if not isinstance(obj, type) or not issubclass(
+            obj, serializers.ModelSerializer
+        ):
+            continue
+        if obj.__module__ != __name__:
+            continue
+        model = getattr(getattr(obj, "Meta", None), "model", None)
+        if model is None:
+            continue
+        declared = obj().fields
+        for field_name, field in declared.items():
+            if field.read_only or not isinstance(
+                field, serializers.PrimaryKeyRelatedField
+            ):
+                continue
+            related = model._meta.get_field(field_name).related_model
+            if related._meta.app_label != "django_connectors":
+                continue
+            if not isinstance(field, OwnerScopedPrimaryKeyRelatedField):
+                offenders.append(f"{name}.{field_name}")
+    if offenders:
+        raise ImproperlyConfigured(
+            f"writable relations {offenders} are not owner-scoped, so a caller "
+            f"could attach their object to another tenant's record."
+        )
+
+
+_assert_writable_relations_are_owner_scoped()

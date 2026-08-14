@@ -314,3 +314,89 @@ def test_targets_endpoint_exposes_shape_not_tenant_data(api_settings, client_for
         assert payload[0]["fields"]["external_id"]["required"] is True
     finally:
         unregister_all()
+
+
+# --- cross-tenant writes ---------------------------------------------------
+
+
+def test_a_binding_cannot_be_attached_to_another_tenants_connection(
+    api_settings, make_connection, client_for
+):
+    """The attack this closes is credential exfiltration, not untidiness.
+
+    Scoping a viewset's queryset protects reads only. DRF builds a writable
+    relation from the related model's *unfiltered* manager, so a plain
+    ModelSerializer accepted another tenant's Connection id — and the attacker
+    then points the Binding at a server they control, whereupon the runner sends
+    the victim's provider token there in an Authorization header.
+    """
+    victim = make_connection(owner_id="2", provider="victim")
+    response = client_for().post(
+        reverse("django_connectors:binding-list"),
+        {"connection": str(victim.id), "source": "memory", "config": {}},
+        format="json",
+    )
+    assert response.status_code == 400
+    assert "connection" in response.json()
+    assert not Binding.objects.filter(connection=victim).exists()
+
+
+def test_a_binding_cannot_be_repointed_at_another_tenants_connection(
+    api_settings, make_binding, make_connection, client_for
+):
+    """PATCH is the same hole as POST and was equally open."""
+    mine = make_binding(owner_id="1")
+    victim = make_connection(owner_id="2", provider="victim")
+
+    response = client_for().patch(
+        reverse("django_connectors:binding-detail", args=[mine.id]),
+        {"connection": str(victim.id)},
+        format="json",
+    )
+    assert response.status_code == 400
+
+    mine.refresh_from_db()
+    assert mine.connection.owner_object_id == "1"
+
+
+def test_a_projection_cannot_be_attached_to_another_tenants_binding(
+    api_settings, make_binding, client_for
+):
+    from django_connectors.models import Projection
+
+    victim = make_binding(owner_id="2")
+    response = client_for().post(
+        reverse("django_connectors:projection-list"),
+        {
+            "binding": str(victim.id),
+            "resource": "events",
+            "target": "events",
+            "name": "stolen",
+            "mapping": {"external_id": {"source": "id"}},
+        },
+        format="json",
+    )
+    assert response.status_code == 400
+    assert not Projection.objects.filter(binding=victim).exists()
+
+
+def test_a_binding_can_still_be_created_against_your_own_connection(
+    api_settings, make_connection, client_for
+):
+    """The guard must not break the legitimate path."""
+    mine = make_connection(owner_id="1", provider="mine")
+    response = client_for().post(
+        reverse("django_connectors:binding-list"),
+        {"connection": str(mine.id), "source": "memory", "config": {}},
+        format="json",
+    )
+    assert response.status_code == 201, response.json()
+    assert Binding.objects.filter(connection=mine).count() == 1
+
+
+def test_every_writable_relation_is_owner_scoped():
+    """Asserted structurally so a serializer added later inherits the rule."""
+    from django_connectors.api import serializers as api_serializers
+
+    # Raises ImproperlyConfigured if any writable FK is unscoped.
+    api_serializers._assert_writable_relations_are_owner_scoped()
