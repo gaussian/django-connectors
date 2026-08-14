@@ -182,7 +182,21 @@ def _succeed(binding, run, result):
     binding.last_error = ""
     if binding.status in (BindingStatus.PENDING, BindingStatus.BLOCKED):
         binding.status = BindingStatus.ACTIVE
-    binding.save(update_fields=["last_success_at", "last_error", "status"])
+
+    updated = ["last_success_at", "last_error", "status"]
+    snapshot = result.get("schema")
+    if snapshot:
+        # Projection validation and the mapping UI read this instead of
+        # re-running extraction, and Projection activation is gated on it.
+        binding.landing_schema = snapshot
+        binding.landing_schema_version_hash = runner.schema_fingerprint(snapshot)
+        binding.landing_schema_at = now
+        updated += [
+            "landing_schema",
+            "landing_schema_version_hash",
+            "landing_schema_at",
+        ]
+    binding.save(update_fields=updated)
     return run
 
 

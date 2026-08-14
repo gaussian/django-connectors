@@ -36,6 +36,22 @@ _EXPORTS = {
     "SchemaDriftError": "django_connectors.exceptions",
     "TargetWriteError": "django_connectors.exceptions",
     "LockNotAcquired": "django_connectors.exceptions",
+    # Targets — what a host registers and what its writer receives
+    "TargetDefinition": "django_connectors.projections.targets",
+    "register_target": "django_connectors.projections.targets",
+    "ProjectedRecord": "django_connectors.projections.targets",
+    "WriterContext": "django_connectors.projections.targets",
+    # Target field types
+    "BooleanField": "django_connectors.projections.fields",
+    "DateField": "django_connectors.projections.fields",
+    "DateTimeField": "django_connectors.projections.fields",
+    "DecimalField": "django_connectors.projections.fields",
+    "FloatField": "django_connectors.projections.fields",
+    "IntegerField": "django_connectors.projections.fields",
+    "JSONField": "django_connectors.projections.fields",
+    "StringField": "django_connectors.projections.fields",
+    # Sources
+    "SourceDefinition": "django_connectors.sources.base",
 }
 
 __all__ = ["__version__", *sorted(_EXPORTS)]

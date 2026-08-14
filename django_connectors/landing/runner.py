@@ -95,7 +95,12 @@ def _verify(binding, run, pipeline, load_info):
     load_ids = [str(load_id) for load_id in (load_info.loads_ids or [])]
     if not load_ids:
         # Nothing landed. Legitimate when the source had no new records.
-        return {"load_ids": [], "metrics": _metrics(pipeline), "landed": False}
+        return {
+            "load_ids": [],
+            "metrics": _metrics(pipeline),
+            "landed": False,
+            "schema": schema_snapshot(pipeline, binding),
+        }
 
     # Load ids already attributed to an earlier Run mean dlt loaded a package
     # this Run did not extract.
@@ -112,7 +117,12 @@ def _verify(binding, run, pipeline, load_info):
             f"extracting new data."
         )
 
-    return {"load_ids": load_ids, "metrics": _metrics(pipeline), "landed": True}
+    return {
+        "load_ids": load_ids,
+        "metrics": _metrics(pipeline),
+        "landed": True,
+        "schema": schema_snapshot(pipeline, binding),
+    }
 
 
 def _metrics(pipeline):
@@ -149,3 +159,41 @@ def drain_pending(binding, run):
         return {"load_ids": [], "metrics": {}, "landed": False}
     load_info = pipeline.load()
     return _verify(binding, run, pipeline, load_info)
+
+
+def schema_snapshot(pipeline, binding):
+    """A plain-JSON view of the landed schema.
+
+    Reduced deliberately rather than storing dlt's own ``to_dict()``: that
+    carries a version hash and normalizer configuration that change for reasons
+    unrelated to the customer's mapping, which would make drift detection fire
+    constantly. Only what a mapping can actually depend on is kept.
+    """
+    tables = {}
+    try:
+        schema = pipeline.schemas.get(binding.schema_name)
+    except Exception:
+        schema = None
+    if schema is None:
+        return {"tables": tables}
+
+    for table_name, table in schema.tables.items():
+        if table_name.startswith("_dlt"):
+            continue
+        tables[table_name] = {
+            column_name: {
+                "data_type": column.get("data_type"),
+                "nullable": column.get("nullable", True),
+            }
+            for column_name, column in (table.get("columns") or {}).items()
+        }
+    return {"tables": tables}
+
+
+def schema_fingerprint(snapshot):
+    """A stable hash of a schema snapshot, for cheap drift detection."""
+    import hashlib
+    import json
+
+    payload = json.dumps(snapshot, sort_keys=True, default=str).encode()
+    return hashlib.sha256(payload).hexdigest()[:32]
