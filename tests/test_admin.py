@@ -304,21 +304,34 @@ def test_an_action_refuses_a_selection_over_the_configured_maximum(make_binding)
 
 
 @pytest.mark.django_db
-def test_the_renew_action_only_makes_active_subscriptions_due(make_binding):
-    """The sweep reads (status, renew_at); moving renew_at elsewhere is a no-op."""
+def test_the_renew_action_renews_now_rather_than_only_becoming_due(
+    make_binding, monkeypatch
+):
+    """It used to move ``renew_at`` and leave the work to the sweep.
+
+    An action labelled "renew" that in fact meant "become due" is a different
+    operation with a different failure mode: nothing happens at all if the
+    sweep is not scheduled, and the operator has no way to tell. It now calls
+    the same per-object service the sweep does.
+    """
     import datetime as dt
 
     from django.utils import timezone
 
     from django_connectors.enums import WebhookStatus
+    from django_connectors.webhooks import services as webhook_services
 
     binding = make_binding()
     later = timezone.now() + dt.timedelta(days=2)
-    active = WebhookSubscription.objects.create(
+    subscription = WebhookSubscription.objects.create(
         binding=binding, status=WebhookStatus.ACTIVE, renew_at=later
     )
-    pending = WebhookSubscription.objects.create(
-        binding=binding, status=WebhookStatus.PENDING, renew_at=later
+
+    renewed = []
+    monkeypatch.setattr(
+        webhook_services,
+        "renew_subscription",
+        lambda row, *, actor=None, now=None: renewed.append(row.id) or row,
     )
 
     hook_admin = admin.site._registry[WebhookSubscription]
@@ -326,10 +339,45 @@ def test_the_renew_action_only_makes_active_subscriptions_due(make_binding):
         _request_for(_staff_user()), WebhookSubscription.objects.all()
     )
 
-    active.refresh_from_db()
-    pending.refresh_from_db()
-    assert active.renew_at < later, "the active subscription was not made due"
-    assert pending.renew_at == later, "a pending subscription was touched"
+    assert renewed == [subscription.id], "the service was not called"
+    subscription.refresh_from_db()
+    assert subscription.renew_at == later, (
+        "renew_at was nudged, which is the old make-it-due behaviour"
+    )
+
+
+@pytest.mark.django_db
+def test_one_failed_renewal_does_not_abandon_the_rest_of_the_batch(
+    make_binding, monkeypatch
+):
+    from django_connectors.enums import WebhookStatus
+    from django_connectors.webhooks import services as webhook_services
+
+    binding = make_binding()
+    first, second = (
+        WebhookSubscription.objects.create(
+            binding=binding, status=WebhookStatus.ACTIVE, resource=name
+        )
+        for name in ("first", "second")
+    )
+
+    attempted = []
+
+    def renew(row, *, actor=None, now=None):
+        attempted.append(row.id)
+        if row.id == first.id:
+            raise RuntimeError("provider said no")
+        return row
+
+    monkeypatch.setattr(webhook_services, "renew_subscription", renew)
+
+    request = _request_for(_staff_user())
+    hook_admin = admin.site._registry[WebhookSubscription]
+    hook_admin.renew_webhooksubscription(request, WebhookSubscription.objects.all())
+
+    assert set(attempted) == {first.id, second.id}
+    reported = [str(message) for message in request._messages]
+    assert any("provider said no" in message for message in reported), reported
 
 
 # --- the Binding form validates the configuration -----------------------------

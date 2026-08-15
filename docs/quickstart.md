@@ -190,6 +190,20 @@ With the `celery` extra, `django_connectors.scheduler.celery` provides task
 wrappers and a beat schedule. A successful Run already dispatches its projections;
 the sweeper is the safety net.
 
+To renew one subscription out of band — an admin action, a support request —
+call the service the sweep is a loop over, rather than moving `renew_at`:
+
+```python
+from django_connectors.webhooks.services import renew_subscription
+
+renew_subscription(subscription, actor=request.user)
+```
+
+It renews with the provider immediately, records a failure with the same
+back-off the sweep uses (one transient error must not retire a subscription
+still hours from expiry), and then re-raises so the caller can report it. The
+admin action and `POST /webhook-subscriptions/<id>/renew/` both go through it.
+
 ## Where to go next
 
 - [architecture.md](architecture.md) — why the pieces are shaped this way

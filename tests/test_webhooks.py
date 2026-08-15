@@ -541,6 +541,90 @@ def test_a_source_without_an_adapter_cannot_subscribe(webhook_settings, make_bin
         )
 
 
+def test_renew_subscription_renews_one_row_on_demand(webhook_settings, binding):
+    """The per-object service the admin, the API and the sweep all call.
+
+    Without it the admin's "renew" could only move ``renew_at`` and hope a
+    sweep was scheduled — a different operation, with a different failure mode,
+    behind the same word.
+    """
+    now = timezone.now()
+    subscription = WebhookSubscription.objects.create(
+        binding=binding,
+        status=WebhookStatus.ACTIVE,
+        expires_at=now + dt.timedelta(days=2),
+        renew_at=now + dt.timedelta(days=1),
+    )
+    STATE["renewal"] = WebhookRegistration(expires_at=now + dt.timedelta(days=3))
+
+    returned = webhook_services.renew_subscription(subscription, now=now)
+
+    assert STATE["renewed"] == [subscription.id], "the adapter was not called"
+    assert returned.pk == subscription.pk
+    subscription.refresh_from_db()
+    assert subscription.expires_at > now + dt.timedelta(days=2)
+    assert subscription.renew_at < subscription.expires_at
+
+
+def test_renew_subscription_records_the_failure_before_it_raises(
+    webhook_settings, binding
+):
+    """The caller may swallow the exception; the row must still be correct."""
+    now = timezone.now()
+    subscription = WebhookSubscription.objects.create(
+        binding=binding,
+        status=WebhookStatus.ACTIVE,
+        expires_at=now + dt.timedelta(days=1),
+        renew_at=now - dt.timedelta(minutes=1),
+    )
+    STATE["renew_raises"] = True
+
+    with pytest.raises(SourceError):
+        webhook_services.renew_subscription(subscription, now=now)
+
+    subscription.refresh_from_db()
+    assert subscription.status == WebhookStatus.ACTIVE, "a transient error retired it"
+    assert now < subscription.renew_at <= now + dt.timedelta(minutes=5)
+    assert "provider refused" in subscription.metadata["last_error"]
+
+
+@pytest.mark.parametrize(
+    "status", [WebhookStatus.EXPIRED, WebhookStatus.FAILED, WebhookStatus.DELETED]
+)
+def test_renew_subscription_refuses_a_row_with_nothing_left_to_renew(
+    webhook_settings, binding, status
+):
+    """Writing a fresh expiry onto a dead row would fake a live subscription."""
+    subscription = WebhookSubscription.objects.create(binding=binding, status=status)
+
+    with pytest.raises(ConfigurationError, match="no live provider subscription"):
+        webhook_services.renew_subscription(subscription)
+
+    assert STATE["renewed"] == []
+
+
+def test_the_sweep_is_a_loop_over_the_per_object_service(
+    webhook_settings, binding, monkeypatch
+):
+    """One implementation of "renew", not two that can drift apart."""
+    now = timezone.now()
+    due = WebhookSubscription.objects.create(
+        binding=binding,
+        status=WebhookStatus.ACTIVE,
+        expires_at=now + dt.timedelta(hours=2),
+        renew_at=now - dt.timedelta(minutes=1),
+    )
+
+    seen = []
+    monkeypatch.setattr(
+        webhook_services,
+        "renew_subscription",
+        lambda row, *, actor=None, now=None: seen.append(row.id) or row,
+    )
+    webhook_services.renew_due_webhooks(now=now)
+    assert seen == [due.id]
+
+
 def test_renew_due_webhooks_touches_only_due_active_rows(webhook_settings, binding):
     now = timezone.now()
     due = WebhookSubscription.objects.create(

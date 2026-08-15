@@ -169,13 +169,60 @@ def create_subscription(
     return subscription
 
 
+def renew_subscription(subscription, *, actor=None, now=None):
+    """Renew one subscription with its provider, now. Returns the row.
+
+    The single implementation of what "renew" means: the sweep below is a loop
+    over this, and so are the admin action and the API endpoint. Two code paths
+    is how the admin's "renew" came to mean *make due* while the sweep meant
+    *actually renew* — one of which is not renewal at all.
+
+    **Raises on provider failure, after recording it.** The back-off in
+    :func:`_record_renew_failure` has already been applied by the time the
+    exception reaches the caller, so a caller that swallows it still leaves the
+    subscription in a correct state, and a caller that reports it (the admin,
+    the API) can say which subscription failed and why.
+    """
+    now = now or timezone.now()
+
+    if subscription.status not in LIVE_STATUSES:
+        # There is nothing on the provider's side left to extend: an expired,
+        # failed or deleted subscription has to be created again. Renewing one
+        # would write a fresh expiry onto a row no delivery will ever match.
+        raise ConfigurationError(
+            f"subscription {subscription.id} is {subscription.status}, so there "
+            f"is no live provider subscription to renew. Create a new one."
+        )
+
+    try:
+        adapter = adapter_for_binding(subscription.binding)
+        registration = adapter.renew(subscription)
+    except Exception as exc:
+        logger.warning(
+            "webhook renewal failed for subscription %s: %s",
+            subscription.id,
+            scrub(exc),
+        )
+        _record_renew_failure(subscription, exc, now=now)
+        raise
+
+    _apply_registration(
+        subscription, registration, status=WebhookStatus.ACTIVE, now=now
+    )
+    logger.info(
+        "webhook subscription %s renewed by %s", subscription.id, actor or "system"
+    )
+    return subscription
+
+
 def renew_due_webhooks(*, now=None, limit=None):
     """Renew every active subscription whose `renew_at` has arrived.
 
     Returns ``{"renewed": [...], "failed": [...]}``. A failure does not retire
     the subscription unless it has already expired — one transient provider
     error must not turn a subscription that is still hours from expiry into a
-    permanently dead one.
+    permanently dead one. That rule lives in :func:`renew_subscription`, which
+    this is a loop over.
     """
     now = now or timezone.now()
     due = WebhookSubscription.objects.filter(
@@ -189,21 +236,13 @@ def renew_due_webhooks(*, now=None, limit=None):
     renewed, failed = [], []
     for subscription in due:
         try:
-            adapter = adapter_for_binding(subscription.binding)
-            registration = adapter.renew(subscription)
-        except Exception as exc:
-            logger.warning(
-                "webhook renewal failed for subscription %s: %s",
-                subscription.id,
-                scrub(exc),
-            )
-            _record_renew_failure(subscription, exc, now=now)
+            renew_subscription(subscription, now=now)
+        except Exception:
+            # Already logged and backed off inside. One unreachable provider
+            # must not abandon the rest of the sweep.
             failed.append(subscription)
-            continue
-        _apply_registration(
-            subscription, registration, status=WebhookStatus.ACTIVE, now=now
-        )
-        renewed.append(subscription)
+        else:
+            renewed.append(subscription)
     return {"renewed": renewed, "failed": failed}
 
 
