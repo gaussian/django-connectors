@@ -124,6 +124,24 @@ run = runs.run_binding(binding, trigger="manual")
 print(run.status, run.dlt_load_ids)
 ```
 
+`Binding.objects.create()` does **not** validate the config — that is ordinary
+Django, and a Binding whose source key has stopped being registered has to stay
+savable so an operator can disable it. Validation runs in `full_clean()`, which
+the admin and every ModelForm call, and in the DRF serializer. Call it yourself
+if you are creating Bindings from code and want the same errors:
+
+```python
+binding.full_clean(exclude=["landing_key"])   # ValidationError, per field
+```
+
+or, if you want it to raise the library's own exception:
+
+```python
+from django_connectors.services.bindings import validate_binding
+
+validate_binding(binding)   # ConfigurationError, returns the SourceDefinition
+```
+
 ## 4. Let the customer map it
 
 ```python

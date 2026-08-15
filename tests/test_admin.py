@@ -330,3 +330,41 @@ def test_the_renew_action_only_makes_active_subscriptions_due(make_binding):
     pending.refresh_from_db()
     assert active.renew_at < later, "the active subscription was not made due"
     assert pending.renew_at == later, "a pending subscription was touched"
+
+
+# --- the Binding form validates the configuration -----------------------------
+
+
+@pytest.mark.django_db
+def test_the_binding_admin_form_reports_a_bad_config_next_to_the_field(
+    connectors_settings, make_connection
+):
+    """The whole point of `Binding.clean()`: a form error, not a failed Run.
+
+    Before it, a malformed config saved cleanly in the admin and only surfaced
+    as a PipelineStepFailed hours later, in front of the customer rather than
+    in front of the person who typed it.
+    """
+    binding_admin = admin.site._registry[Binding]
+    form_class = binding_admin.get_form(_request_for(_staff_user()))
+    connection = make_connection()
+
+    def form_for(config):
+        return form_class(
+            data={
+                "connection": str(connection.pk),
+                "source": "memory",
+                "resources": "[]",
+                "config": config,
+                "landing_retention": "current_state",
+                "status": "pending",
+                "enabled": "on",
+            }
+        )
+
+    bad = form_for("{}")
+    assert not bad.is_valid()
+    assert "config" in bad.errors, bad.errors
+
+    good = form_for('{"resources": {"events": {"primary_key": "id"}}}')
+    assert good.is_valid(), good.errors

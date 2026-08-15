@@ -383,11 +383,19 @@ def test_a_projection_cannot_be_attached_to_another_tenants_binding(
 def test_a_binding_can_still_be_created_against_your_own_connection(
     api_settings, make_connection, client_for
 ):
-    """The guard must not break the legitimate path."""
+    """The guard must not break the legitimate path.
+
+    The config has to be a real one: the serializer now runs the source's own
+    ``validate_config``, and the memory source refuses an empty mapping.
+    """
     mine = make_connection(owner_id="1", provider="mine")
     response = client_for().post(
         reverse("django_connectors:binding-list"),
-        {"connection": str(mine.id), "source": "memory", "config": {}},
+        {
+            "connection": str(mine.id),
+            "source": "memory",
+            "config": {"resources": {"events": {"primary_key": "id"}}},
+        },
         format="json",
     )
     assert response.status_code == 201, response.json()
@@ -400,3 +408,77 @@ def test_every_writable_relation_is_owner_scoped():
 
     # Raises ImproperlyConfigured if any writable FK is unscoped.
     api_serializers._assert_writable_relations_are_owner_scoped()
+
+
+# --- Binding configuration is validated here too ---------------------------
+#
+# DRF never calls `full_clean()`, so without a `validate()` of its own the API
+# is the one way into the database that accepts a Binding guaranteed to fail
+# its first Run.
+
+
+def test_the_api_refuses_a_malformed_binding_config(
+    api_settings, make_connection, client_for
+):
+    mine = make_connection(owner_id="1", provider="mine")
+    response = client_for().post(
+        reverse("django_connectors:binding-list"),
+        {"connection": str(mine.id), "source": "memory", "config": {}},
+        format="json",
+    )
+    assert response.status_code == 400, response.json()
+    assert "config" in response.json()
+    assert not Binding.objects.exists()
+
+
+def test_the_api_refuses_an_unregistered_source(
+    api_settings, make_connection, client_for
+):
+    mine = make_connection(owner_id="1", provider="mine")
+    response = client_for().post(
+        reverse("django_connectors:binding-list"),
+        {"connection": str(mine.id), "source": "not-registered", "config": {}},
+        format="json",
+    )
+    assert response.status_code == 400, response.json()
+    assert "source" in response.json()
+
+
+def test_the_api_refuses_a_landing_table_name_that_would_not_fit(
+    api_settings, make_connection, client_for
+):
+    """63 characters, checked before the row exists — it has no landing_key yet."""
+    mine = make_connection(owner_id="1", provider="mine")
+    response = client_for().post(
+        reverse("django_connectors:binding-list"),
+        {
+            "connection": str(mine.id),
+            "source": "memory",
+            "resources": ["r" * 60],
+            "config": {"resources": {"r" * 60: {"primary_key": "id"}}},
+        },
+        format="json",
+    )
+    assert response.status_code == 400, response.json()
+    assert "resources" in response.json()
+
+
+def test_a_patch_is_validated_against_the_source_already_on_the_row(
+    api_settings, make_binding, client_for
+):
+    """A PATCH carries only what changed.
+
+    Validating the payload alone would accept a config that is invalid for the
+    source already stored — which is the whole failure this closes.
+    """
+    binding = make_binding(owner_id="1", config=memory_config(batches=[[{"id": "1"}]]))
+    response = client_for().patch(
+        reverse("django_connectors:binding-detail", args=[binding.id]),
+        {"config": {"resources": {}}},
+        format="json",
+    )
+    assert response.status_code == 400, response.json()
+    assert "config" in response.json()
+
+    binding.refresh_from_db()
+    assert binding.config["resources"], "the invalid config was written anyway"
