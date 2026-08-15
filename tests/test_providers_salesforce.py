@@ -43,7 +43,11 @@ from django_connectors.exceptions import (
     SourceError,
 )
 from django_connectors.landing import access
-from django_connectors.landing.naming import DELETED_COLUMN, RUN_ID_COLUMN
+from django_connectors.landing.naming import (
+    BINDING_ID_COLUMN,
+    DELETED_COLUMN,
+    RUN_ID_COLUMN,
+)
 from django_connectors.providers.salesforce import auth as sf_auth
 from django_connectors.providers.salesforce import source as sf_source
 from django_connectors.providers.salesforce.auth import SalesforceBackend
@@ -1338,3 +1342,45 @@ def test_the_backend_and_the_source_compose_end_to_end(
     assert api.requests[1]["authorization"] == f"Bearer {api.token}"
     rows = access.sample_rows(binding, "Account", limit=20)
     assert landed_ids(rows) == ["001A", "001B", "001C"]
+
+
+# --- connector conformance ---------------------------------------------------
+#
+# The shared suite from `django_connectors.testing.conformance`, run against the
+# fake org above. `tests/test_source_conformance.py` holds the credential-free
+# half and asserts that `test_salesforce_conformance` here exists.
+
+
+def test_salesforce_conformance(salesforce_settings, make_sf_binding, org):
+    from django_connectors.models import Run
+    from django_connectors.registry import auth_backends
+    from django_connectors.registry import sources as source_registry
+    from django_connectors.testing import conformance
+
+    api = org()
+    binding = make_sf_binding(api, sf_config())
+
+    definition = source_registry.get("salesforce")
+    credentials = auth_backends.get(binding.connection.auth_backend).get_credentials(
+        binding.connection
+    )
+    built = conformance.check_built_source(
+        definition,
+        binding=binding,
+        credentials=credentials,
+        run=Run.objects.create(binding=binding),
+    )
+    assert built == [], "\n".join(built)
+
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    landed = conformance.check_landing_invariants(
+        binding, expected_resources=["Account"]
+    )
+    assert landed == [], "\n".join(landed)
+
+    rows = access.sample_rows(binding, "Account", limit=20)
+    assert rows
+    assert {row[BINDING_ID_COLUMN] for row in rows} == {str(binding.id)}
+    assert all(row[RUN_ID_COLUMN] for row in rows)

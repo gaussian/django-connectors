@@ -762,3 +762,65 @@ def test_filesystem_merge_without_a_key_is_refused():
         filesystem_source.FilesystemSource().validate_config(
             {"resources": {"events": {"path": os.sep + "tmp"}}}
         )
+
+
+# --- connector conformance ---------------------------------------------------
+#
+# The shared suite from `django_connectors.testing.conformance`, run against
+# these three sources with their own fakes. `tests/test_source_conformance.py`
+# holds the credential-free half and asserts that each `test_<key>_conformance`
+# below exists — a new connector cannot quietly skip the contract.
+
+
+def _assert_conformant(source_key, binding, resources):
+    from django_connectors.models import Run
+    from django_connectors.registry import sources as source_registry
+    from django_connectors.testing import conformance
+
+    definition = source_registry.get(source_key)
+    credentials = None
+    if binding.connection.auth_backend:
+        from django_connectors.registry import auth_backends
+
+        credentials = auth_backends.get(
+            binding.connection.auth_backend
+        ).get_credentials(binding.connection)
+
+    built = conformance.check_built_source(
+        definition,
+        binding=binding,
+        credentials=credentials,
+        run=Run.objects.create(binding=binding),
+    )
+    assert built == [], "\n".join(built)
+
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    landed = conformance.check_landing_invariants(binding, expected_resources=resources)
+    assert landed == [], "\n".join(landed)
+    return binding
+
+
+def test_rest_conformance(source_settings, make_binding, serve):
+    binding = make_binding(
+        source="rest", config=rest_config(serve(FakeApi(ROWS, page_size=2)))
+    )
+    _assert_conformant("rest", binding, ["items"])
+    rows = access.sample_rows(binding, "items", limit=10)
+    assert {row[BINDING_ID_COLUMN] for row in rows} == {str(binding.id)}
+
+
+def test_sql_conformance(source_settings, make_binding, tmp_path):
+    url = make_sqlite_database(tmp_path, SQLITE_ROWS)
+    binding = make_binding(source="sql", config=sql_config(url))
+    _assert_conformant("sql", binding, ["orders"])
+    assert access.sample_rows(binding, "orders", limit=10)
+
+
+def test_filesystem_conformance(source_settings, make_binding, tmp_path):
+    directory = tmp_path / "drop"
+    write_jsonl(directory / "a.jsonl", [{"id": "1", "v": "a"}, {"id": "2", "v": "b"}])
+    binding = make_binding(source="files", config=files_config(directory))
+    _assert_conformant("files", binding, ["events"])
+    assert len(access.sample_rows(binding, "events", limit=10)) == 2
