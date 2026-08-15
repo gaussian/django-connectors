@@ -30,6 +30,13 @@ DEFAULTS: dict[str, Any] = {
     # that no ORM model can ever be routed there.
     "LANDING_URL": None,
     "LANDING_DATASET": "connectors_landing",
+    # dlt creates no index on a landing table and merge is `DELETE ... WHERE
+    # EXISTS`, so merge cost is linear in table size without one — measured at
+    # 179s for 10,000 rows into a 60,000-row table on MySQL. The library issues
+    # the missing CREATE INDEX itself after a successful load. Set False only
+    # if the landing role has no DDL rights or the indexes are managed
+    # elsewhere; a Binding then stays fast only for as long as it stays small.
+    "PROVISION_LANDING_INDEXES": True,
     # Where dlt keeps pipeline working state. Must be durable across a Run for
     # pending-package recovery to work; an ephemeral worker filesystem loses
     # in-flight load packages (incremental cursors survive — they restore from

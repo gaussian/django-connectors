@@ -24,10 +24,16 @@ from sqlalchemy import create_engine, text
 
 from django_connectors.enums import RunStatus, RunTrigger
 from django_connectors.landing import access
+from django_connectors.landing.index import (
+    MERGE_INDEX_SUFFIX,
+    MYSQL_TEXT_PREFIX_LENGTH,
+    index_name,
+)
 from django_connectors.landing.instrument import instrument_source
 from django_connectors.landing.naming import (
     BINDING_ID_COLUMN,
     DELETED_COLUMN,
+    DLT_LOAD_ID_COLUMN,
     MAX_IDENTIFIER_LENGTH,
     RUN_ID_COLUMN,
     landing_table_name,
@@ -52,6 +58,33 @@ def _columns(url, table, schema=SERVER_DATASET):
             {"schema": schema, "table": table},
         ).fetchall()
     return {name: (data_type, length) for name, data_type, length in rows}
+
+
+def _indexes(url, table, schema=SERVER_DATASET):
+    """``{index name: [column names]}`` as the server actually holds them."""
+    from sqlalchemy import inspect as sqlalchemy_inspect
+
+    with create_engine(url).connect() as connection:
+        return {
+            found["name"]: list(found["column_names"])
+            for found in sqlalchemy_inspect(connection).get_indexes(
+                table, schema=schema
+            )
+        }
+
+
+def _mysql_prefix_lengths(url, table, index, schema=SERVER_DATASET):
+    """``{column: sub_part}`` — the prefix length MySQL recorded, or None."""
+    with create_engine(url).connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT column_name, sub_part FROM information_schema.statistics "
+                "WHERE table_schema = :schema AND table_name = :table "
+                "AND index_name = :index ORDER BY seq_in_index"
+            ),
+            {"schema": schema, "table": table, "index": index},
+        ).fetchall()
+    return dict(rows)
 
 
 def _count(url, table, schema=SERVER_DATASET):
@@ -151,6 +184,122 @@ def test_booleans_and_timestamps_coerce_on_every_backend(server_settings, make_b
     moment = DateTimeField().coerce(row["ts"], field_name="ts")
     assert moment.tzinfo is not None, "a naive datetime would shift by the offset"
     assert moment == dt.datetime(2024, 3, 1, 10, 30, tzinfo=dt.UTC)
+
+
+# --- merge indexes ---------------------------------------------------------
+
+
+def test_landing_indexes_are_created_on_every_backend(server_settings, make_binding):
+    """dlt creates none, and merge is ``DELETE ... WHERE EXISTS``.
+
+    Unindexed, merge cost is linear in table size: measured at 0.50s/1.41s/3.30s
+    for 200 rows into 5k/20k/50k on MySQL, and 179 seconds for 10,000 rows into
+    60,000. With these two indexes the same loads were flat at 0.13-0.17s across
+    50k/100k/200k.
+    """
+    binding = make_binding(config=memory_config(batches=[[{"id": "1"}]]))
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    table = landing_table_name("memory", "events", binding.landing_key)
+    indexes = _indexes(server_settings.url, table)
+
+    assert [BINDING_ID_COLUMN, "id"] in indexes.values(), indexes
+    assert [DLT_LOAD_ID_COLUMN, BINDING_ID_COLUMN] in indexes.values(), indexes
+
+
+def test_mysql_gets_a_prefix_length_and_postgresql_does_not(
+    server_settings, make_binding
+):
+    """The one rule that makes this dialect-aware rather than portable SQL.
+
+    dlt maps a ``str`` column with no precision hint to ``TEXT``, and MySQL
+    refuses to index one without a prefix — error 1170. PostgreSQL has no such
+    limit and rejects the prefix syntax outright, so the same statement cannot
+    be sent to both. The ``_connector_*`` columns are hinted ``precision=36``
+    precisely so they index whole on either.
+    """
+    binding = make_binding(config=memory_config(batches=[[{"id": "1"}]]))
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    table = landing_table_name("memory", "events", binding.landing_key)
+    merge_index = index_name(table, MERGE_INDEX_SUFFIX)
+    assert merge_index in _indexes(server_settings.url, table)
+
+    if server_settings.backend != "mysql":
+        # Nothing to assert positively: PostgreSQL records no prefix at all,
+        # and the index existing above is the whole proof.
+        pytest.skip("prefix lengths are a MySQL concept")
+
+    prefixes = _mysql_prefix_lengths(server_settings.url, table, merge_index)
+    assert prefixes[BINDING_ID_COLUMN] is None, "varchar(36) needs no prefix"
+    assert prefixes["id"] == MYSQL_TEXT_PREFIX_LENGTH, "TEXT key needs one"
+
+
+def test_mysql_really_does_refuse_the_unprefixed_index(server_settings, make_binding):
+    """Proves the prefix above is load-bearing rather than defensive habit.
+
+    Without this, a change that dropped the prefix would still pass every other
+    test in this file — the index would simply never be created on MySQL, and
+    merges would quietly go back to scanning.
+    """
+    if server_settings.backend != "mysql":
+        pytest.skip("only MySQL rejects an unprefixed TEXT key")
+
+    from django_connectors.landing.destination import build_pipeline
+
+    binding = make_binding(config=memory_config(batches=[[{"id": "1"}]]))
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    table = landing_table_name("memory", "events", binding.landing_key)
+
+    pipeline = build_pipeline(binding)
+    with pipeline.sql_client(schema_name=binding.schema_name) as client:
+        statement = (
+            f"CREATE INDEX naive_idx ON {SERVER_DATASET}.{table} "
+            f"({BINDING_ID_COLUMN}, id)"
+        )
+        with pytest.raises(Exception) as excinfo:
+            client.execute_sql(statement)
+    assert "1170" in str(excinfo.value)
+
+
+def test_the_indexes_survive_dlt_schema_evolution(server_settings, make_binding):
+    """A new source column means ``ALTER TABLE``, which must not drop them."""
+    binding = make_binding(
+        config=memory_config(
+            batches=[[{"id": "1"}], [{"id": "2", "brand_new_column": "x"}]]
+        )
+    )
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    table = landing_table_name("memory", "events", binding.landing_key)
+    before = _indexes(server_settings.url, table)
+    assert len(before) == 2
+
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == RunStatus.SUCCEEDED, second.error_message
+    assert "brand_new_column" in _columns(server_settings.url, table)
+    assert _indexes(server_settings.url, table) == before
+
+
+def test_provisioning_a_second_time_is_harmless_on_every_backend(
+    server_settings, make_binding
+):
+    """MySQL has no ``CREATE INDEX IF NOT EXISTS``; sqlite and PostgreSQL do.
+
+    So "idempotent" has to be established by reflection rather than by syntax,
+    and the backend that would break is exactly the one sqlite cannot stand in
+    for.
+    """
+    from django_connectors.landing.index import ensure_landing_indexes
+
+    binding = make_binding(config=memory_config(batches=[[{"id": "1"}]]))
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+
+    report = ensure_landing_indexes(binding)
+    assert report["failed"] == []
+    assert report["created"] == []
+    assert len(report["existing"]) == 2
 
 
 # --- multi-tenancy ---------------------------------------------------------
