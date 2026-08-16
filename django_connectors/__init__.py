@@ -15,7 +15,7 @@ Both properties are enforced by tests, not convention.
 
 from typing import Any
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # name -> module it lives in. Kept explicit so that `import django_connectors`
 # stays cheap and so that the public surface is a single readable list.

@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-connectors"
-version = "0.0.1"
+version = "0.0.2"
 description = "A Django framework for connecting applications to third-party systems, with support for authentication, polling, webhooks, incremental sync, and data ingestion via dlt."
 readme = "README.md"
 license = "MIT"
