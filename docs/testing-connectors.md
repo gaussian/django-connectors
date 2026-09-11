@@ -12,17 +12,18 @@ that Graph renamed a field, that Gmail's `historyId` expires sooner than
 documented, or that Salesforce returns a `SystemModstamp` with a different
 precision than the sandbox did last year.
 
-Three tiers, in descending order of value per unit of effort.
+Two tiers, both in the default test run, both free of credentials at test time.
 
 | Tier | Credentials | Runs | Catches |
 | --- | --- | --- | --- |
 | **A — conformance** | none | every PR | a connector breaking the library's own contract |
 | **B — recorded cassettes** | once, to record | every PR | our mock being wrong about the provider's response shape |
-| **C — live sandbox** | continuously | scheduled | the provider changing behaviour under us |
 
-**Tier A is built.** Tiers B and C are specified here and not built: both need
-credentials and a scheduling decision that has not been made. The rest of this
-document is what to build when it has been.
+A third tier — scheduled runs against live sandboxes, the only thing that
+catches a provider changing behaviour under us — is deliberately not built. It
+needs continuously available sandbox credentials and a scheduling decision; the
+recording procedure below is designed so that job can re-record Tier B's
+cassettes when it exists.
 
 ---
 
@@ -104,128 +105,103 @@ because silence is not conformance.
 
 ---
 
-## Tier B — recorded cassettes (not built)
+## Tier B — recorded cassettes (built)
 
-[VCR.py](https://vcrpy.readthedocs.io/) via
-[pytest-recording](https://github.com/kiwicom/pytest-recording): record against
-a real sandbox once, redact, commit the cassettes, replay offline in CI forever.
+`tests/test_recorded.py` records one real exchange per provider connector
+against a sandbox, commits it redacted under `tests/cassettes/test_recorded/`,
+and replays it on every pull request with [VCR.py](https://vcrpy.readthedocs.io/)
+via [pytest-recording](https://github.com/kiwicom/pytest-recording).
 
 This is the tier that catches *"our mock is wrong about the provider's actual
-response shape"*, which no hand-written mock ever can.
+response shape"*, which no hand-written fake ever can. Each replay does a first
+Run and an incremental second Run, then holds the result to the same landing
+invariants as Tier A and to a committed schema snapshot.
 
-### Non-negotiables
+### State of the cassettes
 
-**Redaction is a two-sided problem.** Filtering request headers is the obvious
-half and the easy one; the dangerous half is the response body. A token refresh
-response *is* a credential, and an error body routinely quotes the request that
-caused it — including its `Authorization` header.
+**No cassette is committed yet.** Recording needs a sandbox per provider and a
+person with its credentials in their shell; until then each replay test skips
+with the exact command and variables it needs. The machinery is proven without
+a credential: `test_the_recorder_round_trips_through_a_redacted_cassette`
+records against the in-process Salesforce fake with a made-up token, checks
+that neither the token nor the fake's address reached the cassette, then replays
+against a placeholder host that resolves to nothing and lands the same rows.
 
-```python
-# tests/conftest.py
-@pytest.fixture(scope="module")
-def vcr_config():
-    return {
-        "filter_headers": [("authorization", "REDACTED"), ("cookie", "REDACTED")],
-        "filter_query_parameters": ["access_token", "code", "client_secret"],
-        "filter_post_data_parameters": ["client_secret", "assertion", "code"],
-        "before_record_response": _scrub_response,
-        "record_mode": "none",          # replay only; recording is explicit
-        "decode_compressed_response": True,
-    }
+### Recording
+
+Once per connector, against a sandbox with synthetic data — the cassettes hold
+whatever the sandbox held, and they are committed:
+
+```bash
+export DJANGO_CONNECTORS_RECORD_GOOGLE_ACCESS_TOKEN=ya29....
+export DJANGO_CONNECTORS_RECORD_GOOGLE_SPREADSHEET_ID=1BxiM...
+uv run --all-extras pytest tests/test_recorded.py -k "gmail or sheets" --record-mode=rewrite
+
+uv run --all-extras pytest tests/test_recorded.py    # replays and scans what was written
+git add tests/cassettes/
 ```
 
-`_scrub_response` should run the body through the same patterns
-`django_connectors.errors.scrub` already uses. Reusing them rather than writing
-new ones means the redactor and the log scrubber cannot disagree about what a
-credential looks like.
-
-**A CI check must grep the committed cassettes.** Redaction that is only applied
-at record time fails open: a cassette recorded before a filter was added, or by
-someone who forgot the fixture, is committed plaintext and stays that way. Add a
-job that scans `tests/cassettes/**` for token-shaped strings using
-`errors.scrub`'s own patterns as the linter, and fails the build on a hit. This
-job is cheap and belongs in the required `ci` check.
-
-**Freeze the clock.** Every cursor in this library is time-derived — Gmail's
-`historyId` window, Graph's delta tokens, Salesforce's `SystemModstamp`
-predicate, and the webhook `renew_at` lead. A replay test that computes "now"
-from the wall clock passes on the day it is recorded and starts producing
-different requests afterwards, which VCR then reports as an unmatched request in
-a way that looks like a connector bug. Pin the clock (`time-machine` or
-`freezegun`) to the recording date, and record that date in the cassette
-directory so the pin and the cassette move together.
-
-**Snapshot the landed schema.** Cassettes prove the connector still parses what
-the provider *said last year*. Pair each replay test with a snapshot of the
-resulting `Binding.landing_schema` so a provider renaming a field shows up as a
-diff rather than as a column that silently lands NULL. The schema snapshot the
-library already writes after every successful Run is exactly the right artefact
-— it is deliberately reduced to what a mapping can depend on, so it does not
-churn on dlt version bumps.
-
-**Cassettes rot.** A cassette is a claim about a provider frozen at a moment.
-Pair Tier B with a scheduled re-record (Tier C's job can do it) and treat a
-re-record diff as a finding, not a chore.
-
-### What to record per connector
-
-Only the flows a mock cannot get right — the shape-sensitive ones:
-
-| Connector | Worth recording |
-| --- | --- |
-| Gmail | a full sync page, a `history.list` window, an expired `historyId` (404), a message with no headers |
-| Google Sheets | a ragged range, a range with a formula and a date cell, an empty range |
-| Entra files | a delta page with `@odata.nextLink`, a delta page with `@odata.deltaLink`, a deleted item, a 429 with `Retry-After` |
-| Entra Excel | one real `.xlsx` download, ideally saved by Excel rather than by openpyxl — the cached-formula-result difference is precisely what our fake cannot reproduce |
-| Salesforce | a paged `query` response, a `queryMore`, an `INVALID_SESSION_ID` error body, a `REQUEST_LIMIT_EXCEEDED` error body |
-
-### Sandbox availability
-
-This, not the tooling, is the real constraint.
-
-| Provider | Sandbox | Practical note |
+| Connector | Variables (`DJANGO_CONNECTORS_RECORD_…`) | Sandbox |
 | --- | --- | --- |
-| Salesforce | [Developer Edition](https://developer.salesforce.com/signup) — free, non-expiring with periodic login | Easiest of the five. JWT bearer needs a self-signed certificate on a Connected App, once. |
-| Microsoft | [M365 E5 developer sandbox](https://developer.microsoft.com/en-us/microsoft-365/dev-program) — free, 25 seats, **90-day renewal conditional on activity** | The scheduled job doubles as the keep-alive. App-only access needs one-time admin consent. |
-| Google (Gmail, Sheets) | an ordinary Google account plus a free GCP project | Fine for the OAuth-delegated paths, which is most of what these connectors do. |
-| Google (domain-wide delegation) | needs a real Workspace domain — only a **14-day trial** | The one path that cannot be continuously tested cheaply. Stated plainly rather than pretended otherwise: this path stays mock-tested. |
+| `gmail` | `GOOGLE_ACCESS_TOKEN` | any Google account with a few messages |
+| `google_sheets` | `GOOGLE_ACCESS_TOKEN`, `GOOGLE_SPREADSHEET_ID` | a sheet whose first tab has a header row and an `id` column |
+| `entra_files` | `MICROSOFT_ACCESS_TOKEN`, `MICROSOFT_DRIVE_ID` | an [M365 developer sandbox](https://developer.microsoft.com/en-us/microsoft-365/dev-program) drive with a few files |
+| `entra_excel` | the two above plus `MICROSOFT_WORKBOOK_ITEM_ID` | one `.xlsx` in that drive, ideally saved by Excel rather than by a library — the cached-formula-result difference is precisely what the fake cannot reproduce |
+| `salesforce` | `SALESFORCE_ACCESS_TOKEN`, `SALESFORCE_INSTANCE_URL` | a [Developer Edition](https://developer.salesforce.com/signup) org |
 
----
+Use a bare access token, not a refreshable credential: a refresh is a
+token-endpoint exchange, and this tier records the data API only. A recording
+with a variable missing **fails** rather than skips. `rewrite`, not `once`: a
+stale cassette is replaced whole, never appended to.
 
-## Tier C — live sandbox runs (not built)
+Google domain-wide delegation needs a real Workspace domain and cannot be
+recorded from an ordinary account; that path stays fake-tested.
 
-Nightly or weekly runs against the real sandboxes above. This is the only tier
-that catches a provider changing behaviour under us, and the only one that
-notices a sandbox has lapsed.
+### What keeps a cassette safe
 
-Four rules, each of which exists because the obvious version of this job becomes
-a nuisance and then gets disabled:
+Redaction is a two-sided problem: filtering request headers is the easy half,
+and the dangerous half is the response body, where a token refresh *is* a
+credential and an error body routinely quotes the request that caused it. So:
 
-1. **Never on pull requests from forks.** A fork PR would otherwise get the
-   secrets. `pull_request_target` is not a fix; gate on
-   `github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`.
-2. **Keep it out of the required `ci` check.** A provider outage must not block
-   merges. Report it separately — a failing scheduled job that opens an issue is
-   useful; a red required check nobody can fix is how a suite gets bypassed.
-3. **Small and idempotent.** Read a handful of records, write nothing that
-   accumulates. Quotas are the limiting resource, and the M365 sandbox in
-   particular is renewed on the basis of activity, not volume.
-4. **Secrets from a secret manager, not from repository variables.** Rotation is
-   the whole point: these credentials are long-lived by construction, so the
-   place they live has to support rotating them without a commit.
+- Every value from a recording variable becomes a fixed placeholder before it
+  is written — in the URI, in headers, in request and response bodies. That is
+  also what makes replay deterministic: the placeholders are used *as* the
+  values on replay, so the URIs the connector builds match the cassette.
+- Everything is then run through `errors.redact_secrets`, the same
+  credential-shaped rules the scrubber applies to error messages (JWTs,
+  `Bearer …`, `key: value` pairs whose key names a secret, including
+  `tempauth` on a SharePoint download URL). Reusing them means the recorder and
+  the log scrubber cannot disagree about what a credential looks like.
+- Response headers are allow-listed to the five a connector reads. Request ids,
+  cookies, tracing headers and the `x-ms-*` / `x-goog-*` families are dropped.
+- `test_committed_cassettes_carry_no_credentials` reads every committed
+  cassette back and refuses one where those rules would still change anything,
+  where an `Authorization` header is not masked, or where a header survived
+  that should not have. Redaction at record time is a fixture someone can
+  forget; the scanner runs in the required `ci` check.
 
-The natural shape is one scheduled workflow that runs Tier C *and* re-records
-Tier B's cassettes, so a provider change surfaces both as a failing live run and
-as a reviewable cassette diff.
+Anything *named* like a credential is masked even when it is a cursor —
+Graph's `token=` delta parameter, say — but consistently on both sides, so the
+request built from a response still matches the recording.
 
----
+### The schema snapshot
 
-## What is deliberately not proposed
+A provider renaming a field does not fail a replay: the connector lands a NULL
+where a value used to be. So each recording also writes `<key>.schema.json`,
+the reduced landing schema the library already stores on the Binding after a
+Run, and the replay compares. A rename shows up as a diff in code review rather
+than as a column nobody notices is empty.
 
-- **Contract tests generated from provider OpenAPI documents.** Microsoft and
-  Salesforce publish them; they describe what the API is documented to return,
-  which is the same thing our mocks encode. Generating from them would automate
-  the belief, not check it.
-- **A shared fake-provider service.** The in-process WSGI fakes are per-provider
-  and live beside the tests that use them, on purpose. A shared one is a second
-  place for a belief about the provider to live, and it drifts.
+### Two sources replay with their address guard lifted
+
+`SalesforceSource` (and `RestSource`) resolve the host by DNS before every
+request and pin each socket to the address it resolved. A replay against a
+placeholder host can satisfy neither, and neither is what a cassette verifies,
+so the recorded tier registers a subclass with `allow_private_addresses = True`
+— exactly as the loopback tests do. The guard has its own tests.
+
+### Cassettes rot
+
+A cassette is a claim about a provider frozen at a moment. Re-record when a
+replay starts failing for a reason that is the provider's, and treat the diff
+as a finding: it is the provider change this tier exists to surface.
