@@ -119,7 +119,7 @@ Writing your own means subclassing `SourceDefinition` and returning a dlt source
 - [docs/quickstart.md](docs/quickstart.md) — end to end in ten minutes
 - [docs/architecture.md](docs/architecture.md) — why the pieces are shaped as they are
 - [docs/operations.md](docs/operations.md) — deploying on MySQL or PostgreSQL, concurrency, retention
-- [docs/testing-connectors.md](docs/testing-connectors.md) — the conformance suite every source must pass, and how to test a connector against the real thing
+- [docs/TESTING.md](docs/TESTING.md) — the conformance suite every source must pass, and how to test a connector against the real thing
 - [AGENTS.md](AGENTS.md) — development workflow and test tiers
 
 ## Development

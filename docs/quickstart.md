@@ -208,5 +208,5 @@ admin action and `POST /webhook-subscriptions/<id>/renew/` both go through it.
 
 - [architecture.md](architecture.md) — why the pieces are shaped this way
 - [operations.md](operations.md) — MySQL, concurrency, retention, deployment
-- [testing-connectors.md](testing-connectors.md) — the conformance suite your own
+- [TESTING.md](TESTING.md) — the conformance suite your own
   `SourceDefinition` must pass

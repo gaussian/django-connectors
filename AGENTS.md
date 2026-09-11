@@ -52,7 +52,7 @@ a new source, or that test fails). `tests/test_recorded.py` replays recorded
 provider exchanges from `tests/cassettes/`; with no cassette it skips and prints
 the recording command. Record with `--record-mode=rewrite` and the
 `DJANGO_CONNECTORS_RECORD_*` variables, then run the module again so the
-credential scanner checks what was written. See `docs/testing-connectors.md`.
+credential scanner checks what was written. See `docs/TESTING.md`.
 
 The `minimal` tier matters because `--all-extras` installs every extra, so it
 never exercises the "this extra is absent" path that the whole optional

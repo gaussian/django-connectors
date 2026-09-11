@@ -20,10 +20,10 @@ Two tiers, both in the default test run, both free of credentials at test time.
 | **B — recorded cassettes** | once, to record | every PR | our mock being wrong about the provider's response shape |
 
 A third tier — scheduled runs against live sandboxes, the only thing that
-catches a provider changing behaviour under us — is deliberately not built. It
-needs continuously available sandbox credentials and a scheduling decision; the
-recording procedure below is designed so that job can re-record Tier B's
-cassettes when it exists.
+catches a provider changing behaviour under us — is not built. It needs
+continuously available sandbox credentials and a scheduling decision. What it
+should look like when that decision is made is at the [end of this
+document](#tier-c--live-sandbox-runs-not-built).
 
 ---
 
@@ -205,3 +205,53 @@ so the recorded tier registers a subclass with `allow_private_addresses = True`
 A cassette is a claim about a provider frozen at a moment. Re-record when a
 replay starts failing for a reason that is the provider's, and treat the diff
 as a finding: it is the provider change this tier exists to surface.
+
+---
+
+## Tier C — live sandbox runs (not built)
+
+Nightly or weekly runs against real sandboxes. This is the only tier that
+catches a provider changing behaviour under us, and the only one that notices
+a sandbox has lapsed.
+
+The natural shape is one scheduled workflow that runs `tests/test_recorded.py`
+in `--record-mode=rewrite` against the sandboxes and opens a pull request with
+the cassette diff. A provider change then surfaces twice: as a failing live
+run, and as a reviewable diff of what the provider now returns.
+
+Four rules, each because the obvious version of this job becomes a nuisance
+and then gets disabled:
+
+1. **Never on pull requests from forks.** A fork PR would otherwise get the
+   secrets. `pull_request_target` is not a fix; gate on
+   `github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`.
+2. **Keep it out of the required `ci` check.** A provider outage must not
+   block merges. A failing scheduled job that opens an issue is useful; a red
+   required check nobody can fix is how a suite gets bypassed.
+3. **Small and idempotent.** Read a handful of records, write nothing that
+   accumulates. Quotas are the limiting resource, and the M365 sandbox is
+   renewed on the basis of activity, not volume.
+4. **Secrets from a secret manager, not from repository variables.** These
+   credentials are long-lived by construction, so the place they live has to
+   support rotating them without a commit.
+
+### Sandbox availability
+
+This, not the tooling, is the real constraint.
+
+| Provider | Sandbox | Practical note |
+| --- | --- | --- |
+| Salesforce | [Developer Edition](https://developer.salesforce.com/signup) — free, non-expiring with periodic login | Easiest of the five. JWT bearer needs a self-signed certificate on a Connected App, once. |
+| Microsoft | [M365 E5 developer sandbox](https://developer.microsoft.com/en-us/microsoft-365/dev-program) — free, 25 seats, **90-day renewal conditional on activity** | The scheduled job doubles as the keep-alive. App-only access needs one-time admin consent. |
+| Google (Gmail, Sheets) | an ordinary Google account plus a free GCP project | Fine for the OAuth-delegated paths, which is most of what these connectors do. |
+| Google (domain-wide delegation) | needs a real Workspace domain — only a **14-day trial** | The one path that cannot be continuously tested cheaply. Stated plainly rather than pretended otherwise: this path stays fake-tested. |
+
+### What is deliberately not proposed
+
+- **Contract tests generated from provider OpenAPI documents.** Microsoft and
+  Salesforce publish them; they describe what the API is documented to return,
+  which is the same thing the fakes encode. Generating from them would automate
+  the belief, not check it.
+- **A shared fake-provider service.** The in-process WSGI fakes are
+  per-provider and live beside the tests that use them, on purpose. A shared
+  one is a second place for a belief about the provider to live, and it drifts.
