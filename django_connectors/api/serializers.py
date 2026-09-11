@@ -130,6 +130,35 @@ class BindingSerializer(serializers.ModelSerializer):
             "updated_at",
         )
 
+    def validate(self, attrs):
+        """Run the same checks ``Binding.clean()`` runs, on the merged result.
+
+        DRF does not call ``full_clean()``, so without this the API is the one
+        way into the database that accepts a Binding guaranteed to fail its
+        first Run. Merged with ``self.instance`` because a PATCH carries only
+        the fields it changes, and validating those alone would pass a config
+        that is invalid *for the source already stored on the row*.
+
+        A throwaway unsaved ``Binding`` is used as the subject rather than a
+        dict: the service takes a Binding, and building one here keeps a single
+        implementation of what "valid" means. It is never saved.
+        """
+        from django_connectors.services.bindings import binding_field_errors
+
+        instance = self.instance
+        probe = Binding(
+            source=attrs.get("source", getattr(instance, "source", "")),
+            config=attrs.get("config", getattr(instance, "config", None) or {}),
+            resources=attrs.get(
+                "resources", getattr(instance, "resources", None) or []
+            ),
+            landing_key=getattr(instance, "landing_key", ""),
+        )
+        errors = binding_field_errors(probe)
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
 
 class RunSerializer(serializers.ModelSerializer):
     error_message = ScrubbedCharField(read_only=True, allow_blank=True)

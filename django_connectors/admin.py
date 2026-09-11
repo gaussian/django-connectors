@@ -27,10 +27,9 @@ the actions that need them.
 """
 
 from django.contrib import admin, messages
-from django.utils import timezone
 
 from django_connectors.conf import conf
-from django_connectors.enums import RunTrigger, WebhookStatus
+from django_connectors.enums import RunTrigger
 from django_connectors.models import (
     Binding,
     BindingLock,
@@ -340,37 +339,38 @@ class WebhookSubscriptionAdmin(admin.ModelAdmin):
 
     @admin.action(
         permissions=["renew_webhooksubscription"],
-        description="Renew at the next sweep",
+        description="Renew each subscription with its provider",
     )
     def renew_webhooksubscription(self, request, queryset):
-        """Bring each subscription's ``renew_at`` forward to now.
+        """Renew each selection now, through the service layer.
 
-        The renewal itself stays in ``webhooks.services.renew_due_webhooks``,
-        which is the only code that knows how to record a failed renewal
-        without retiring a subscription that is still hours from expiring.
-        Calling a provider's renew directly from here would be a second,
-        divergent copy of that rule — so this action only makes a subscription
-        due, and the sweep does the work.
+        This used to only move ``renew_at`` forward and leave the work to the
+        sweep, because the sweep was the only code that knew how to record a
+        failed renewal without retiring a subscription still hours from expiry.
+        An action labelled "renew" that in fact meant "become due" is a
+        different operation with a different failure mode — nothing happens at
+        all if the sweep is not scheduled — so the per-row body of the sweep is
+        now ``webhooks.services.renew_subscription`` and both call it.
         """
         if not _selection_is_within_limit(self, request, queryset):
             return
-        # Only ACTIVE rows are picked up by the sweep; moving renew_at on any
-        # other status would silently do nothing at all.
-        renewable = queryset.filter(status=WebhookStatus.ACTIVE)
-        updated = renewable.update(renew_at=timezone.now())
-        skipped = queryset.count() - updated
-        if updated:
+        from django_connectors.webhooks.services import renew_subscription
+
+        renewed = 0
+        for subscription in queryset.select_related("binding"):
+            try:
+                renew_subscription(subscription, actor=request.user)
+            except Exception as exc:
+                # Includes the refusal to renew a non-live subscription, which
+                # names the status and says to create a new one.
+                _report_failure(self, request, subscription, exc)
+            else:
+                renewed += 1
+        if renewed:
             self.message_user(
                 request,
-                f"{updated} subscription(s) will be renewed on the next webhook sweep.",
+                f"Renewed {renewed} subscription(s) with their provider.",
                 level=messages.SUCCESS,
-            )
-        if skipped:
-            self.message_user(
-                request,
-                f"{skipped} subscription(s) are not active, so they are not "
-                f"renewable; recreate them instead.",
-                level=messages.WARNING,
             )
 
 

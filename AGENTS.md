@@ -46,6 +46,14 @@ DJANGO_CONNECTORS_TEST_POSTGRES_URL=postgresql+psycopg2://postgres:connectors@12
   uv run --all-extras pytest -m serverdb
 ```
 
+Two connector suites ride inside the default tier. `tests/test_source_conformance.py`
+holds every shipped `SourceDefinition` to the connector contract (add a case for
+a new source, or that test fails). `tests/test_recorded.py` replays recorded
+provider exchanges from `tests/cassettes/`; with no cassette it skips and prints
+the recording command. Record with `--record-mode=rewrite` and the
+`DJANGO_CONNECTORS_RECORD_*` variables, then run the module again so the
+credential scanner checks what was written. See `docs/TESTING.md`.
+
 The `minimal` tier matters because `--all-extras` installs every extra, so it
 never exercises the "this extra is absent" path that the whole optional
 dependency design depends on. **Locally it is vacuous by default**: `uv run`

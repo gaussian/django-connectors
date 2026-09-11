@@ -73,13 +73,17 @@ _AUTH_SCHEME_RE = re.compile(
 )
 
 # key=value / "key": "value" / key: value, for credential-shaped key names.
+# Horizontal whitespace only around the separator: a value never starts on the
+# next line, and letting `\s*` cross one made `authorization:\n  - Bearer x`
+# (a YAML list, which is what a recorded cassette is) lose its list marker.
 _SECRET_KEY_NAMES = (
     r"(?:access|refresh|id|bearer|session|sas)?[_-]?token|secret|password|passwd|pwd"
     r"|api[_-]?key|apikey|client[_-]?secret|private[_-]?key|credential|assertion"
-    r"|authorization|auth|signature|sig|passphrase|connection[_-]?string|dsn"
+    r"|authorization|auth|tempauth|signature|sig|passphrase|connection[_-]?string|dsn"
 )
 _SECRET_PAIR_RE = re.compile(
-    rf"(?i)(['\"]?\b(?:{_SECRET_KEY_NAMES})\b['\"]?\s*[=:]\s*)(['\"]?)([^\s,;&)\]}}'\"]+)\2"
+    rf"(?i)(['\"]?\b(?:{_SECRET_KEY_NAMES})\b['\"]?[ \t]*[=:][ \t]*)"
+    rf"(['\"]?)([^\s,;&)\]}}'\"]+)\2"
 )
 
 # A long run of token characters containing both a digit and a letter. This is
@@ -247,3 +251,26 @@ def describe(exc: BaseException) -> tuple[str, str]:
     would leak internal structure into stored data.
     """
     return type(unwrap(exc)).__name__, scrub(exc)
+
+
+def redact_secrets(text: str) -> str:
+    """Mask credential-shaped values only, leaving everything else intact.
+
+    The subset of :func:`scrub` that recognises a credential by its *shape*:
+    JWTs, ``Bearer …`` and friends, and ``key: value`` pairs whose key names a
+    secret. Deliberately **not** the URL rule and **not** the high-entropy rule,
+    which are right for an error message and wrong for a recorded provider
+    exchange: a query string there carries pagination cursors and delta tokens
+    that a replay must reproduce byte-for-byte, and a 32-character run of token
+    characters is what a Graph item id looks like.
+
+    Used by the cassette recorder to redact what it writes and by the cassette
+    scanner to reject what slipped through, so the two cannot disagree about
+    what a credential looks like. Unlike :func:`scrub`, this raises on failure —
+    a redactor that silently returned its input would be worse than none.
+    """
+    result = _JWT_RE.sub(MASK, text)
+    result = _AUTH_SCHEME_RE.sub(lambda m: f"{m.group(1)} {MASK}", result)
+    return _SECRET_PAIR_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{MASK}{m.group(2)}", result
+    )

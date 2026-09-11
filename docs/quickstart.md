@@ -124,6 +124,24 @@ run = runs.run_binding(binding, trigger="manual")
 print(run.status, run.dlt_load_ids)
 ```
 
+`Binding.objects.create()` does **not** validate the config — that is ordinary
+Django, and a Binding whose source key has stopped being registered has to stay
+savable so an operator can disable it. Validation runs in `full_clean()`, which
+the admin and every ModelForm call, and in the DRF serializer. Call it yourself
+if you are creating Bindings from code and want the same errors:
+
+```python
+binding.full_clean(exclude=["landing_key"])   # ValidationError, per field
+```
+
+or, if you want it to raise the library's own exception:
+
+```python
+from django_connectors.services.bindings import validate_binding
+
+validate_binding(binding)   # ConfigurationError, returns the SourceDefinition
+```
+
 ## 4. Let the customer map it
 
 ```python
@@ -172,7 +190,23 @@ With the `celery` extra, `django_connectors.scheduler.celery` provides task
 wrappers and a beat schedule. A successful Run already dispatches its projections;
 the sweeper is the safety net.
 
+To renew one subscription out of band — an admin action, a support request —
+call the service the sweep is a loop over, rather than moving `renew_at`:
+
+```python
+from django_connectors.webhooks.services import renew_subscription
+
+renew_subscription(subscription, actor=request.user)
+```
+
+It renews with the provider immediately, records a failure with the same
+back-off the sweep uses (one transient error must not retire a subscription
+still hours from expiry), and then re-raises so the caller can report it. The
+admin action and `POST /webhook-subscriptions/<id>/renew/` both go through it.
+
 ## Where to go next
 
 - [architecture.md](architecture.md) — why the pieces are shaped this way
 - [operations.md](operations.md) — MySQL, concurrency, retention, deployment
+- [TESTING.md](TESTING.md) — the conformance suite your own
+  `SourceDefinition` must pass

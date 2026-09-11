@@ -25,6 +25,7 @@ import logging
 
 from django_connectors.exceptions import LandingWedgedError, SourceError
 from django_connectors.landing.destination import build_pipeline
+from django_connectors.landing.index import ensure_landing_indexes
 from django_connectors.landing.instrument import instrument_source
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,10 @@ def _verify(binding, run, pipeline, load_info):
         "metrics": _metrics(pipeline),
         "landed": True,
         "schema": schema_snapshot(pipeline, binding),
+        # After the load, not before: the table has to exist. Never raises —
+        # a missing index makes the *next* load slow, not this one wrong, so
+        # the caller records it as needs_review instead of failing the Run.
+        "indexes": ensure_landing_indexes(binding, pipeline=pipeline),
     }
 
 

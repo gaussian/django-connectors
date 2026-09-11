@@ -47,6 +47,12 @@ def dlt_env(tmp_path, monkeypatch):
     project_dir = tmp_path / "dlt_project"
     project_dir.mkdir()
     monkeypatch.setenv("DLT_PROJECT_DIR", str(project_dir))
+    # dlt's anonymous telemetry is on by default and posts from a background
+    # thread over `requests`. In the recorded tier that post is an unmatched
+    # request VCR refuses, and during a recording it would land in the
+    # cassette. Off everywhere: no test here has any business on the network
+    # except through a fake it owns or a cassette it replays.
+    monkeypatch.setenv("RUNTIME__DLTHUB_TELEMETRY", "false")
     return data_dir
 
 

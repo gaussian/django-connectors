@@ -383,11 +383,19 @@ def test_a_projection_cannot_be_attached_to_another_tenants_binding(
 def test_a_binding_can_still_be_created_against_your_own_connection(
     api_settings, make_connection, client_for
 ):
-    """The guard must not break the legitimate path."""
+    """The guard must not break the legitimate path.
+
+    The config has to be a real one: the serializer now runs the source's own
+    ``validate_config``, and the memory source refuses an empty mapping.
+    """
     mine = make_connection(owner_id="1", provider="mine")
     response = client_for().post(
         reverse("django_connectors:binding-list"),
-        {"connection": str(mine.id), "source": "memory", "config": {}},
+        {
+            "connection": str(mine.id),
+            "source": "memory",
+            "config": {"resources": {"events": {"primary_key": "id"}}},
+        },
         format="json",
     )
     assert response.status_code == 201, response.json()
@@ -400,3 +408,160 @@ def test_every_writable_relation_is_owner_scoped():
 
     # Raises ImproperlyConfigured if any writable FK is unscoped.
     api_serializers._assert_writable_relations_are_owner_scoped()
+
+
+# --- Binding configuration is validated here too ---------------------------
+#
+# DRF never calls `full_clean()`, so without a `validate()` of its own the API
+# is the one way into the database that accepts a Binding guaranteed to fail
+# its first Run.
+
+
+def test_the_api_refuses_a_malformed_binding_config(
+    api_settings, make_connection, client_for
+):
+    mine = make_connection(owner_id="1", provider="mine")
+    response = client_for().post(
+        reverse("django_connectors:binding-list"),
+        {"connection": str(mine.id), "source": "memory", "config": {}},
+        format="json",
+    )
+    assert response.status_code == 400, response.json()
+    assert "config" in response.json()
+    assert not Binding.objects.exists()
+
+
+def test_the_api_refuses_an_unregistered_source(
+    api_settings, make_connection, client_for
+):
+    mine = make_connection(owner_id="1", provider="mine")
+    response = client_for().post(
+        reverse("django_connectors:binding-list"),
+        {"connection": str(mine.id), "source": "not-registered", "config": {}},
+        format="json",
+    )
+    assert response.status_code == 400, response.json()
+    assert "source" in response.json()
+
+
+def test_the_api_refuses_a_landing_table_name_that_would_not_fit(
+    api_settings, make_connection, client_for
+):
+    """63 characters, checked before the row exists — it has no landing_key yet."""
+    mine = make_connection(owner_id="1", provider="mine")
+    response = client_for().post(
+        reverse("django_connectors:binding-list"),
+        {
+            "connection": str(mine.id),
+            "source": "memory",
+            "resources": ["r" * 60],
+            "config": {"resources": {"r" * 60: {"primary_key": "id"}}},
+        },
+        format="json",
+    )
+    assert response.status_code == 400, response.json()
+    assert "resources" in response.json()
+
+
+def test_a_patch_is_validated_against_the_source_already_on_the_row(
+    api_settings, make_binding, client_for
+):
+    """A PATCH carries only what changed.
+
+    Validating the payload alone would accept a config that is invalid for the
+    source already stored — which is the whole failure this closes.
+    """
+    binding = make_binding(owner_id="1", config=memory_config(batches=[[{"id": "1"}]]))
+    response = client_for().patch(
+        reverse("django_connectors:binding-detail", args=[binding.id]),
+        {"config": {"resources": {}}},
+        format="json",
+    )
+    assert response.status_code == 400, response.json()
+    assert "config" in response.json()
+
+    binding.refresh_from_db()
+    assert binding.config["resources"], "the invalid config was written anyway"
+
+
+# --- webhook subscriptions -------------------------------------------------
+
+
+def _subscription_for(binding, **kwargs):
+    from django_connectors.enums import WebhookStatus
+    from django_connectors.models import WebhookSubscription
+
+    return WebhookSubscription.objects.create(
+        binding=binding, status=kwargs.pop("status", WebhookStatus.ACTIVE), **kwargs
+    )
+
+
+def test_the_api_can_renew_a_subscription(api_settings, make_binding, client_for):
+    """The API used to have no renewal at all, so the only way to renew one
+    subscription was to wait for the sweep — or to move ``renew_at`` by hand and
+    hope the sweep was scheduled."""
+    from django_connectors.webhooks import services as webhook_services
+
+    subscription = _subscription_for(make_binding(owner_id="1"))
+
+    renewed = []
+    original = webhook_services.renew_subscription
+    webhook_services.renew_subscription = lambda row, *, actor=None, now=None: (
+        renewed.append(row.id) or row
+    )
+    try:
+        response = client_for().post(
+            reverse(
+                "django_connectors:webhooksubscription-renew", args=[subscription.id]
+            )
+        )
+    finally:
+        webhook_services.renew_subscription = original
+
+    assert response.status_code == 200, response.json()
+    assert renewed == [subscription.id]
+
+
+def test_renewing_reports_a_provider_refusal_as_a_conflict(
+    api_settings, make_binding, client_for
+):
+    """The memory source declares no webhook adapter, which is the fail-closed
+    case: there is nothing to renew, and that is a 409 rather than a 500."""
+    subscription = _subscription_for(make_binding(owner_id="1"))
+
+    response = client_for().post(
+        reverse("django_connectors:webhooksubscription-renew", args=[subscription.id])
+    )
+
+    assert response.status_code == 409, response.json()
+    assert "webhook adapter" in response.json()["detail"]
+
+
+def test_renewing_another_tenants_subscription_is_a_404(
+    api_settings, make_binding, client_for
+):
+    victim = _subscription_for(make_binding(owner_id="2"))
+
+    response = client_for().post(
+        reverse("django_connectors:webhooksubscription-renew", args=[victim.id])
+    )
+
+    assert response.status_code == 404
+
+
+def test_subscriptions_still_cannot_be_created_through_the_api(
+    api_settings, make_binding, client_for
+):
+    """POST had to be allowed for `renew`; `create` must stay closed.
+
+    Creating one needs a callback origin the host supplies — deriving it from
+    ``request.get_host()`` would let a spoofed Host header hand the provider
+    someone else's callback URL.
+    """
+    binding = make_binding(owner_id="1")
+    response = client_for().post(
+        reverse("django_connectors:webhooksubscription-list"),
+        {"binding": str(binding.id)},
+        format="json",
+    )
+    assert response.status_code == 405, response.json()

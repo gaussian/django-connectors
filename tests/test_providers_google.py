@@ -1791,3 +1791,68 @@ def test_workspace_backend_refuses_an_empty_scope_list(
     )
     with pytest.raises(ConfigurationError, match="empty"):
         auth_backends.get("google_workspace").scopes_for(connection)
+
+
+# --- connector conformance ---------------------------------------------------
+#
+# The shared suite from `django_connectors.testing.conformance`, run against the
+# fakes above. `tests/test_source_conformance.py` holds the credential-free half
+# and asserts that each `test_<key>_conformance` here exists.
+
+
+def _assert_conformant(source_key, binding, resources):
+    from django_connectors.models import Run
+    from django_connectors.registry import auth_backends
+    from django_connectors.registry import sources as source_registry
+    from django_connectors.testing import conformance
+
+    definition = source_registry.get(source_key)
+    credentials = auth_backends.get(binding.connection.auth_backend).get_credentials(
+        binding.connection
+    )
+
+    built = conformance.check_built_source(
+        definition,
+        binding=binding,
+        credentials=credentials,
+        run=Run.objects.create(binding=binding),
+    )
+    assert built == [], "\n".join(built)
+
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    landed = conformance.check_landing_invariants(binding, expected_resources=resources)
+    assert landed == [], "\n".join(landed)
+
+
+def test_gmail_conformance(gmail_server, gmail_binding):
+    """Canned payloads, real instrumentation, sqlite — and the same invariants.
+
+    Gmail is the connector where nesting matters most: a message is headers,
+    payload parts and label ids, and dlt would spread all of it into child
+    tables that carry no tenant scope and no run filter.
+    """
+    gmail_server(FakeGmail(messages=[gmail_message("m1"), gmail_message("m2")]))
+    binding = gmail_binding(resources=("messages", "labels"))
+    _assert_conformant("gmail", binding, ["messages", "labels"])
+
+    rows = access.sample_rows(binding, "messages", limit=10)
+    assert sorted(row["id"] for row in rows) == ["m1", "m2"]
+    assert {row[BINDING_ID_COLUMN] for row in rows} == {str(binding.id)}
+    assert all(row[RUN_ID_COLUMN] for row in rows)
+
+
+def test_google_sheets_conformance(sheets_server, sheets_binding):
+    sheets_server(
+        FakeSheets(
+            {ORDERS_RANGE: [["Order ID", "Customer"], ["o1", "Acme"], ["o2", "Zeta"]]}
+        )
+    )
+    binding = sheets_binding(
+        ranges={"orders": {"range": ORDERS_RANGE, "key_column": "order_id"}}
+    )
+    _assert_conformant("google_sheets", binding, ["orders"])
+
+    rows = access.sample_rows(binding, "orders", limit=10)
+    assert sorted(row["order_id"] for row in rows) == ["o1", "o2"]

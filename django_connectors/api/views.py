@@ -179,7 +179,42 @@ class WebhookSubscriptionViewSet(BaseViewSet):
     owner_lookup = "binding__connection"
     queryset = WebhookSubscription.objects.select_related("binding__connection")
     serializer_class = WebhookSubscriptionSerializer
-    http_method_names = ("get", "delete", "head", "options")
+    # POST is allowed only for the `renew` detail route below; `create` is
+    # overridden to refuse. Creating a subscription needs a callback origin the
+    # host supplies (`request.get_host()` is attacker-influenced), so it stays
+    # in the service layer rather than being derivable from a request.
+    http_method_names = ("get", "post", "delete", "head", "options")
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {
+                "detail": "subscriptions are created by "
+                "django_connectors.webhooks.services.create_subscription, which "
+                "needs an explicit callback origin."
+            },
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    @action(detail=True, methods=["post"])
+    def renew(self, request, pk=None):
+        """Renew this subscription with its provider, now.
+
+        The same service call the admin action and the sweep make. Renewal is
+        not a schedule nudge: a subscription whose provider-side expiry passes
+        stops delivering silently, with no error and no final delivery.
+        """
+        from django_connectors.webhooks.services import renew_subscription
+
+        subscription = self.get_object()
+        try:
+            renew_subscription(subscription, actor=request.user)
+        except Exception as exc:
+            # Broader than the other endpoints here, deliberately: a webhook
+            # adapter is host-written and may raise a bare `requests` error, and
+            # the failure is already logged and backed off on the row by the
+            # time it arrives. A 500 would add a traceback and no information.
+            return _error(exc, status.HTTP_409_CONFLICT)
+        return Response(WebhookSubscriptionSerializer(subscription).data)
 
 
 class TargetViewSet(viewsets.ViewSet):

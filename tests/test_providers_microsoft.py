@@ -60,6 +60,7 @@ from django_connectors.exceptions import (  # noqa: E402
 )
 from django_connectors.landing import access  # noqa: E402
 from django_connectors.landing.naming import (  # noqa: E402
+    BINDING_ID_COLUMN,
     DELETED_COLUMN,
     RUN_ID_COLUMN,
     is_internal_column,
@@ -1791,3 +1792,61 @@ def test_the_registry_can_resolve_every_shipped_microsoft_class(microsoft_settin
     else:  # pragma: no cover - guards the assertion above from being vacuous
         raise AssertionError("import_string did not fail for a missing name")
     assert ImproperlyConfigured  # imported for the registry contract above
+
+
+# --- connector conformance ---------------------------------------------------
+#
+# The shared suite from `django_connectors.testing.conformance`, run against the
+# FakeGraph above. `tests/test_source_conformance.py` holds the credential-free
+# half and asserts that each `test_<key>_conformance` here exists.
+
+
+def _assert_conformant(source_key, binding, resources):
+    from django_connectors.models import Run
+    from django_connectors.registry import auth_backends
+    from django_connectors.registry import sources as source_registry
+    from django_connectors.testing import conformance
+
+    definition = source_registry.get(source_key)
+    credentials = auth_backends.get(binding.connection.auth_backend).get_credentials(
+        binding.connection
+    )
+
+    built = conformance.check_built_source(
+        definition,
+        binding=binding,
+        credentials=credentials,
+        run=Run.objects.create(binding=binding),
+    )
+    assert built == [], "\n".join(built)
+
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    landed = conformance.check_landing_invariants(binding, expected_resources=resources)
+    assert landed == [], "\n".join(landed)
+
+
+def test_entra_files_conformance(microsoft_settings, make_graph_binding, graph):
+    """A driveItem is deeply nested — identitySets, parentReference, file facets.
+
+    Which makes it the connector most likely to spread into child tables that
+    carry no tenant scope and no run filter.
+    """
+    graph.seed(ROOT_ITEM, drive_item("F1", "budget.xlsx"))
+    binding = make_graph_binding()
+    _assert_conformant("entra_files", binding, ["drive_items"])
+
+    rows = access.sample_rows(binding, "drive_items", limit=10)
+    assert [row["id"] for row in rows] == ["F1"]
+    assert {row[BINDING_ID_COLUMN] for row in rows} == {str(binding.id)}
+
+
+def test_entra_excel_conformance(microsoft_settings, make_graph_binding, graph):
+    graph.seed(ROOT_ITEM, drive_item("X1", "data.xlsx"))
+    graph.files["X1"] = simple_workbook([["a", 1], ["b", 2]])
+    binding = make_graph_binding(source="entra_excel", key_columns=["id"])
+    _assert_conformant("entra_excel", binding, ["worksheet_rows"])
+
+    rows = access.sample_rows(binding, "worksheet_rows", limit=10)
+    assert sorted(row["id"] for row in rows) == ["a", "b"]
