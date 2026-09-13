@@ -16,10 +16,18 @@ bounded, and no filter column carries an index anyway.
 Grammar::
 
     node   := {"source": <column>, ["json_path": <a.b.c>], ["cast": <cast>],
-               ["default": <literal>]}
+               [<cast option>: <literal> ...], ["default": <literal>]}
             | {"constant": <literal>}
             | {"object": {<key>: node, ...}}
-            | {"function": <name>, "args": [node, ...], ["cast": <cast>]}
+            | {"function": <name>, "args": [node, ...], ["cast": <cast>],
+               [<cast option>: <literal> ...]}
+
+Cast options ride on the node beside ``cast`` and are validated at compile
+time against the type: ``format`` and ``timezone`` for ``datetime``, ``format``
+for ``date``, ``strip`` and ``decimal_separator`` for ``integer``/``decimal``/
+``float``. So a spreadsheet's ``03/04/2024`` maps with
+``{"source": "order_date", "cast": "datetime", "format": "%d/%m/%Y"}`` and its
+``"£1,234.56"`` with ``{"source": "amount", "cast": "decimal", "strip": "£,"}``.
 
     filter := {"field": <column>, "op": <op>, ["value": <literal>]}
 """
@@ -27,7 +35,7 @@ Grammar::
 import json
 
 from django_connectors.exceptions import CastError, MappingValidationError
-from django_connectors.projections.fields import CASTS
+from django_connectors.projections.fields import CAST_TYPES, make_cast
 
 FUNCTIONS = ("coalesce", "concat", "lower", "upper")
 
@@ -105,7 +113,7 @@ class SourceRef(Node):
         if value is None and self.default is not MISSING:
             return self.default
         if self.cast is not None and value is not None:
-            value = CASTS[self.cast].coerce(value, field_name=self.column)
+            value = self.cast.coerce(value, field_name=self.column)
         return value
 
 
@@ -158,7 +166,7 @@ class FunctionCall(Node):
             raise MappingValidationError(f"unknown function {self.name!r}")
 
         if self.cast is not None and value is not None:
-            value = CASTS[self.cast].coerce(value, field_name=self.name)
+            value = self.cast.coerce(value, field_name=self.name)
         return value
 
 
@@ -277,15 +285,7 @@ def _compile_node(spec, depth=0):
         )
     form = forms[0]
 
-    cast = spec.get("cast")
-    # The type check is not redundant: `cast not in CASTS` hashes `cast`, so a
-    # list or dict arriving through the API's bare JSONField raises TypeError
-    # rather than MappingValidationError, and a TypeError escapes both the
-    # validator and the view as a 500.
-    if cast is not None and (not isinstance(cast, str) or cast not in CASTS):
-        raise MappingValidationError(
-            f"unknown cast {cast!r}; available: {', '.join(sorted(CASTS))}"
-        )
+    cast = _compile_cast(spec)
 
     if form == "constant":
         value = spec["constant"]
@@ -333,6 +333,34 @@ def _compile_node(spec, depth=0):
     return FunctionCall(
         name, [_compile_node(arg, depth + 1) for arg in args], cast=cast
     )
+
+
+#: Every option any cast accepts. Present without a cast, or on a cast that
+#: does not take it, is a mapping error rather than a silently ignored key.
+CAST_OPTION_KEYS = frozenset().union(*(cls.cast_options for cls in CAST_TYPES.values()))
+
+
+def _compile_cast(spec):
+    """The Field instance for a node's ``cast`` and its options, or None."""
+    name = spec.get("cast")
+    options = {key: spec[key] for key in CAST_OPTION_KEYS if key in spec}
+    if name is None:
+        if options:
+            raise MappingValidationError(
+                f"option(s) {sorted(options)} need a 'cast' to apply to"
+            )
+        return None
+    for value in options.values():
+        _assert_json_literal(value)
+    try:
+        # `make_cast` raises ValueError for an unknown cast, an option the cast
+        # does not take, and an option value the type rejects. The name is
+        # checked there as a string first: a list or dict arriving through the
+        # API's bare JSONField must become a MappingValidationError, not the
+        # TypeError a dict lookup would raise — which escapes as a 500.
+        return make_cast(name, options)
+    except ValueError as exc:
+        raise MappingValidationError(str(exc)) from exc
 
 
 def compile_filters(filters):

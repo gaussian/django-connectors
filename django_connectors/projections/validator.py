@@ -20,7 +20,7 @@ from django_connectors.landing.naming import (
     is_internal_column,
 )
 from django_connectors.projections.compiler import ObjectNode, compile_mapping
-from django_connectors.projections.fields import UNMAPPABLE_DLT_TYPES
+from django_connectors.projections.fields import UNMAPPABLE_DLT_TYPES, JSONField
 from django_connectors.projections.targets import get_target
 
 
@@ -188,7 +188,7 @@ def _check_identity_is_scalar(result, target, compiled):
                 f"identity field {field_name!r} is mapped to an object; "
                 f"identity is the host's join key and must be a scalar"
             )
-        elif getattr(node, "cast", None) == "json":
+        elif isinstance(getattr(node, "cast", None), JSONField):
             result.error(
                 f"identity field {field_name!r} casts to json; identity is the "
                 f"host's join key and must be a scalar"

@@ -149,7 +149,22 @@ projection = Projection.objects.create(
     },
     filters=[{"field": "environment", "op": "eq", "value": "production"}],
 )
+```
 
+A cast takes options when the source writes values the way people do rather
+than the way databases do — a spreadsheet's `03/04/2024`, a CSV's `£1,234.56`:
+
+```python
+"occurred_at": {"source": "order_date", "cast": "datetime",
+                "format": "%d/%m/%Y", "timezone": "Europe/London"},
+"amount":      {"source": "total", "cast": "decimal", "strip": "£,"},
+```
+
+`format` and `timezone` apply to `datetime` (`format` alone to `date`);
+`strip` and `decimal_separator` to `integer`, `decimal` and `float`. A bad
+option is a validation error naming the field, not a failed run.
+
+```python
 projections.validate_projection(projection)   # errors and warnings, by field
 projections.preview_projection(projection)    # real rows, writer never called
 projections.activate_projection(projection)
