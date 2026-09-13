@@ -2261,12 +2261,12 @@ def test_drive_changes_feed_updates_adds_and_deletes_within_scope(
     api.change("z")  # new, outside the scope
     api.change("b", removed=True)
     api.files["l"]["trashed"] = True
-    api.change("l")  # trashed outside the scope: tombstone is emitted anyway
+    api.change("l")  # trashed outside the scope: never landed, so no dead row
 
     second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
     assert second.status == RunStatus.SUCCEEDED, second.error_message
     landed = dict(_ids(binding))
-    assert landed == {"a": False, "b": True, "c": False, "l": True}
+    assert landed == {"a": False, "b": True, "c": False}
     rows = {
         r["id"]: r
         for r in access.iter_rows(
@@ -2407,3 +2407,112 @@ def test_google_drive_conformance(drive_server, drive_binding):
     rows = access.sample_rows(binding, "drive_files", limit=10)
     assert sorted(row["id"] for row in rows) == ["a", "b"]
     assert {row[BINDING_ID_COLUMN] for row in rows} == {str(binding.id)}
+
+
+def test_drive_a_file_moved_out_of_scope_is_a_deletion(drive_server, drive_binding):
+    """The feed exists so a document that is no longer there stops being live."""
+    api = drive_server(_tree())
+    binding = drive_binding(folder_id="R")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.add("E", "Elsewhere", mimeType=FOLDER)
+    api.files["a"]["parents"] = ["E"]
+    api.change("a")
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert dict(_ids(binding))["a"] is True
+
+
+def test_drive_a_file_renamed_out_of_the_glob_is_a_deletion(
+    drive_server, drive_binding
+):
+    api = drive_server(_tree())
+    binding = drive_binding(folder_id="R", name_glob="*.pdf")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.files["a"]["name"] = "a.docx"
+    api.change("a")
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert dict(_ids(binding))["a"] is True
+
+
+def test_drive_a_trashed_folder_takes_its_subtree_and_leaves_no_folder_row(
+    drive_server, drive_binding
+):
+    api = drive_server(_tree())
+    binding = drive_binding(folder_id="R")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.files["Y"]["trashed"] = True
+    api.change("Y")  # Drive reports the folder only; children inherit silently
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    landed = dict(_ids(binding))
+    assert landed == {"a": False, "b": True}
+    assert "Y" not in landed
+
+
+def test_drive_a_folder_moved_out_of_scope_takes_its_subtree(
+    drive_server, drive_binding
+):
+    api = drive_server(_tree())
+    binding = drive_binding(folder_id="R")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.add("E", "Elsewhere", mimeType=FOLDER)
+    api.files["Y"]["parents"] = ["E"]
+    api.change("Y")
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert dict(_ids(binding)) == {"a": False, "b": True}
+
+
+def test_drive_a_repointed_binding_re_enumerates(drive_server, drive_binding):
+    """State is keyed by scope: the old folder's feed must not filter the new one."""
+    api = drive_server(_tree())
+    binding = drive_binding(folder_id="R")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.add("O", "Other", mimeType=FOLDER)
+    api.add("o", "o.pdf", parents=["O"])
+    binding.config = {**binding.config, "folder_id": "O"}
+    binding.save(update_fields=["config"])
+    run = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+    assert ("o", False) in _ids(binding)
+
+
+def test_drive_a_repointed_single_file_binding_does_not_inherit_seen(
+    drive_server, drive_binding
+):
+    drive_server(_tree())
+    binding = drive_binding(file_id="l")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    binding.config = {**binding.config, "file_id": "typo"}
+    binding.save(update_fields=["config"])
+    run = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert run.status == RunStatus.FAILED  # a wrong id, not a deletion
+
+
+def test_drive_a_400_invalid_page_token_also_re_enumerates(drive_server, drive_binding):
+    api = drive_server(_tree())
+    binding = drive_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.add("n", "new.pdf")
+    api.force(
+        "400 Bad Request",
+        {
+            "error": {
+                "code": 400,
+                "message": "Invalid Value",
+                "errors": [
+                    {
+                        "reason": "invalid",
+                        "location": "pageToken",
+                        "locationType": "parameter",
+                    }
+                ],
+            }
+        },
+    )
+    run = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+    assert ("n", False) in _ids(binding)
+
+
+def test_default_google_scopes_can_download_drive_content():
+    from django_connectors.providers.google.auth import DEFAULT_SCOPES
+
+    assert "https://www.googleapis.com/auth/drive.readonly" in DEFAULT_SCOPES

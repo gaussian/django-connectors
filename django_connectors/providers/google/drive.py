@@ -50,7 +50,7 @@ from django_connectors.providers.google.auth import (
     google_request,
     raise_for_google_error,
 )
-from django_connectors.sources.base import SourceDefinition, as_config
+from django_connectors.sources.base import SourceDefinition, as_config, read_capped
 from django_connectors.sources.memory import tombstone
 
 logger = logging.getLogger(__name__)
@@ -68,12 +68,14 @@ DEFAULT_RESOURCE = "drive_files"
 DEFAULT_PAGE_SIZE = 200
 MAX_PAGE_SIZE = 1000
 
-#: Resource-state keys. The page token is the feed's position; the folder set
-#: is the Binding's scope; the seen flag makes a single file's 404 a deletion
-#: rather than a misconfiguration.
-PAGE_TOKEN_STATE_KEY = "drive_page_token"
-SCOPE_FOLDERS_STATE_KEY = "drive_scope_folders"
-SINGLE_FILE_SEEN_KEY = "drive_file_seen"
+#: Everything this source keeps in dlt's resource state lives under one key,
+#: with the Binding's *scope* recorded beside it: a Binding repointed from one
+#: folder to another must re-enumerate, not replay the old folder's feed. The
+#: entry holds the feed position (``token``), the folder ids under the root
+#: and the files landed, each mapped to its parent (``folders``, ``files``) —
+#: so a folder leaving the scope, or being trashed, can name the rows that
+#: leave with it — and, for a single file, whether it was ever ``seen``.
+STATE_KEY = "google_drive"
 
 FILE_FIELDS = (
     "id,name,mimeType,size,md5Checksum,parents,trashed,version,"
@@ -97,7 +99,47 @@ DEFAULT_EXPORTS = {
 
 
 class _TokenExpired(Exception):
-    """Drive returned 404 for a changes token: a long gap, or a migration."""
+    """Drive rejected the changes token: a long gap, or a migration."""
+
+
+def _token_rejected(response):
+    """Drive answers a dead page token with 404, or with 400 ``invalid`` on
+    ``pageToken``; both mean "start again", and neither is a credential problem."""
+    if response.status_code == 404:
+        return True
+    if response.status_code != 400:
+        return False
+    try:
+        errors = ((response.json() or {}).get("error") or {}).get("errors") or []
+    except ValueError:
+        return False
+    return any(
+        (error or {}).get("reason") == "invalid"
+        and "pagetoken" in str((error or {}).get("location") or "").lower()
+        for error in errors
+    )
+
+
+def _scope_key(config):
+    return "|".join(
+        f"{key}={config.get(key) or ''}" for key in ("file_id", "folder_id", "drive_id")
+    )
+
+
+def _state_for(state, config):
+    """This scope's entry, replacing another scope's if the Binding was repointed."""
+    entry = state.get(STATE_KEY)
+    scope = _scope_key(config)
+    if not isinstance(entry, dict) or entry.get("scope") != scope:
+        entry = {
+            "scope": scope,
+            "token": None,
+            "folders": {},
+            "files": {},
+            "seen": False,
+        }
+        state[STATE_KEY] = entry
+    return entry
 
 
 class GoogleDriveSource(SourceDefinition):
@@ -186,15 +228,14 @@ class GoogleDriveSource(SourceDefinition):
         import dlt
 
         client = google_client(base_url=self.api_base_url, credentials=credentials)
-        state = dlt.current.resource_state()
+        entry = _state_for(dlt.current.resource_state(), config)
         if config.get("file_id"):
-            yield from self._single_file(client, config, state)
+            yield from self._single_file(client, config, entry)
             return
 
-        token = state.get(PAGE_TOKEN_STATE_KEY)
-        if token:
+        if entry["token"]:
             try:
-                yield from self._changes(client, config, state, token)
+                yield from self._changes(client, config, entry)
                 return
             except _TokenExpired:
                 # Resource state persists only on a successful load, so
@@ -211,22 +252,22 @@ class GoogleDriveSource(SourceDefinition):
         # Token first, walk second: a change during the walk is replayed by
         # the first warm run instead of falling between the two.
         token = self._start_page_token(client, config)
-        yield from self._cold_walk(client, config, state)
-        state[PAGE_TOKEN_STATE_KEY] = token
+        yield from self._cold_walk(client, config, entry)
+        entry["token"] = token
 
-    def _single_file(self, client, config, state):
+    def _single_file(self, client, config, entry):
         response = google_request(
             client,
             f"files/{config['file_id']}",
             params={"fields": FILE_FIELDS, "supportsAllDrives": "true"},
         )
-        if response.status_code == 404 and state.get(SINGLE_FILE_SEEN_KEY):
+        if response.status_code == 404 and entry["seen"]:
             yield tombstone({"id": config["file_id"]})
             return
         raise_for_google_error(response, what=f"reading file {config['file_id']!r}")
         payload = response.json()
         if payload.get("trashed"):
-            if state.get(SINGLE_FILE_SEEN_KEY):
+            if entry["seen"]:
                 yield tombstone({"id": config["file_id"]})
             return
         if payload.get("mimeType") == FOLDER_MIME:
@@ -234,7 +275,7 @@ class GoogleDriveSource(SourceDefinition):
                 f"file {config['file_id']!r} is a folder; use 'folder_id' to "
                 f"sync its contents."
             )
-        state[SINGLE_FILE_SEEN_KEY] = True
+        entry["seen"] = True
         yield file_record(payload)
 
     def _start_page_token(self, client, config):
@@ -252,17 +293,23 @@ class GoogleDriveSource(SourceDefinition):
             raise SourceError("Drive returned no startPageToken")
         return token
 
-    def _cold_walk(self, client, config, state):
-        """Every in-scope file now, by listing; folders recorded as scope."""
+    def _cold_walk(self, client, config, entry):
+        """Every in-scope file now, by listing; folders and files recorded."""
         folder_id = config.get("folder_id")
+        glob = config.get("name_glob")
+        entry["folders"], entry["files"] = {}, {}
         if not folder_id:
-            state[SCOPE_FOLDERS_STATE_KEY] = None  # whole drive: no scope set
             for record in self._list(client, config, query="trashed = false"):
-                if not record["is_folder"]:
-                    yield record
+                if record["is_folder"] or (
+                    glob and not name_matches(record["name"], glob)
+                ):
+                    continue
+                if glob:
+                    entry["files"][record["id"]] = record["parent_id"]
+                yield record
             return
         assert_drive_id(folder_id)
-        seen = {folder_id}
+        entry["folders"][folder_id] = None
         pending = [folder_id]
         while pending:
             parent = pending.pop()
@@ -270,12 +317,14 @@ class GoogleDriveSource(SourceDefinition):
                 client, config, query=f"'{parent}' in parents and trashed = false"
             ):
                 if record["is_folder"]:
-                    if record["id"] not in seen:
-                        seen.add(record["id"])
+                    if record["id"] not in entry["folders"]:
+                        entry["folders"][record["id"]] = parent
                         pending.append(record["id"])
                     continue
+                if glob and not name_matches(record["name"], glob):
+                    continue
+                entry["files"][record["id"]] = parent
                 yield record
-        state[SCOPE_FOLDERS_STATE_KEY] = sorted(seen)
 
     def _list(self, client, config, *, query):
         """``files.list`` over `query`, paged, as records; folders included."""
@@ -288,31 +337,34 @@ class GoogleDriveSource(SourceDefinition):
         }
         if config.get("drive_id"):
             params.update({"corpora": "drive", "driveId": config["drive_id"]})
-        glob = config.get("name_glob")
         while True:
             payload = google_json(
                 client, "files", params=params, what="listing Drive files"
             )
-            for entry in payload.get("files") or []:
-                record = file_record(entry)
-                if (
-                    record["is_folder"]
-                    or not glob
-                    or name_matches(record["name"], glob)
-                ):
-                    yield record
+            for item in payload.get("files") or []:
+                yield file_record(item)
             token = payload.get("nextPageToken")
             if not token:
                 return
             params["pageToken"] = token
 
-    def _changes(self, client, config, state, token):
-        """Replay the feed from `token`; scope by the folder set; store the new token."""
-        scope = state.get(SCOPE_FOLDERS_STATE_KEY)
-        scope_set = set(scope) if scope else None
+    def _changes(self, client, config, entry):
+        """Replay the feed from the stored token, scoped, and store the new one.
+
+        Scope is a set of folders. A change is in scope when its parent is one
+        of them (or the Binding is drive-wide). A file that leaves the scope —
+        moved out, renamed out of the glob, trashed, or under a folder that
+        was — is a deletion of a row this Binding landed, and is tombstoned
+        because the entry remembers landing it. A folder that leaves takes its
+        subtree with it. Children of a folder *moved in* are not replayed by
+        the feed; ``reset_binding_state`` re-enumerates.
+        """
+        folder_scoped = bool(config.get("folder_id"))
         glob = config.get("name_glob")
+        tracking = folder_scoped or bool(glob)
+        folders, files = entry["folders"], entry["files"]
         params = {
-            "pageToken": token,
+            "pageToken": entry["token"],
             "fields": CHANGES_FIELDS,
             "pageSize": int(config.get("page_size", DEFAULT_PAGE_SIZE)),
             "includeRemoved": "true",
@@ -321,9 +373,27 @@ class GoogleDriveSource(SourceDefinition):
         }
         if config.get("drive_id"):
             params["driveId"] = config["drive_id"]
+
+        def drop_subtree(folder_id):
+            """Tombstone every landed file under `folder_id`, and forget the tree."""
+            gone = {folder_id}
+            grew = True
+            while grew:
+                grew = False
+                for child, parent in list(folders.items()):
+                    if parent in gone and child not in gone:
+                        gone.add(child)
+                        grew = True
+            for child in gone:
+                folders.pop(child, None)
+            for file_id, parent in list(files.items()):
+                if parent in gone:
+                    del files[file_id]
+                    yield tombstone({"id": file_id})
+
         while True:
             response = google_request(client, "changes", params=params)
-            if response.status_code == 404:
+            if _token_rejected(response):
                 raise _TokenExpired
             raise_for_google_error(response, what="reading the Drive changes feed")
             payload = response.json()
@@ -331,25 +401,45 @@ class GoogleDriveSource(SourceDefinition):
                 file_id = change.get("fileId")
                 if not file_id:
                     continue
-                entry = change.get("file") or {}
-                if change.get("removed") or entry.get("trashed"):
-                    yield tombstone({"id": file_id})
+                item = change.get("file") or {}
+                gone = change.get("removed") or item.get("trashed")
+                if file_id in folders:
+                    if gone or (
+                        folder_scoped
+                        and item.get("parents")
+                        and (item.get("parents") or [None])[0] not in folders
+                    ):
+                        yield from drop_subtree(file_id)
                     continue
-                record = file_record(entry)
+                if gone:
+                    if tracking:
+                        if files.pop(file_id, None) is not None:
+                            yield tombstone({"id": file_id})
+                    elif item.get("mimeType") != FOLDER_MIME:
+                        # Drive-wide and unfiltered: nothing is tracked, and a
+                        # spurious tombstone for a file never landed inserts
+                        # one dead row, while a dropped one leaves a deleted
+                        # document live forever.
+                        yield tombstone({"id": file_id})
+                    continue
+                record = file_record(item)
                 if record["is_folder"]:
-                    if scope_set is not None and record["parent_id"] in scope_set:
-                        scope_set.add(record["id"])
+                    if folder_scoped and record["parent_id"] in folders:
+                        folders[file_id] = record["parent_id"]
                     continue
-                if scope_set is not None and record["parent_id"] not in scope_set:
-                    continue
-                if glob and not name_matches(record["name"], glob):
-                    continue
-                yield record
+                in_scope = (not folder_scoped or record["parent_id"] in folders) and (
+                    not glob or name_matches(record["name"], glob)
+                )
+                if in_scope:
+                    if tracking:
+                        files[file_id] = record["parent_id"]
+                    yield record
+                elif tracking and files.pop(file_id, None) is not None:
+                    yield tombstone({"id": file_id})
+
             new_token = payload.get("newStartPageToken")
             if new_token:
-                if scope_set is not None:
-                    state[SCOPE_FOLDERS_STATE_KEY] = sorted(scope_set)
-                state[PAGE_TOKEN_STATE_KEY] = new_token
+                entry["token"] = new_token
                 return
             params["pageToken"] = payload.get("nextPageToken") or ""
             if not params["pageToken"]:
@@ -548,19 +638,6 @@ def _stream(client, path, params, *, max_bytes, what):
     )
     try:
         raise_for_google_error(response, what=f"downloading {what}")
-        declared = response.headers.get("Content-Length")
-        if declared and declared.isdigit() and int(declared) > max_bytes:
-            raise SourceError(
-                f"{what} is {declared} bytes, over the {max_bytes}-byte limit."
-            )
-        chunks, total = [], 0
-        for chunk in response.iter_content(1 << 16):
-            total += len(chunk)
-            if total > max_bytes:
-                raise SourceError(
-                    f"{what} exceeded the {max_bytes}-byte limit while downloading."
-                )
-            chunks.append(chunk)
-        return b"".join(chunks), response.headers.get("Content-Type")
+        return read_capped(response, max_bytes=max_bytes, what=what)
     finally:
         response.close()

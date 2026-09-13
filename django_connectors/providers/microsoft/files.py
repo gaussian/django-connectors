@@ -65,6 +65,7 @@ from django_connectors.exceptions import (
 from django_connectors.sources.base import (
     SourceDefinition,
     as_config,
+    read_capped,
     sign_cursor,
     unsign_cursor,
 )
@@ -758,7 +759,6 @@ def download_item_content(
     drive_id,
     item_id,
     max_bytes,
-    chunk_size=1 << 16,
     limit_hint="",
 ):
     """The bytes of one ``driveItem``; see :func:`download_item`."""
@@ -768,7 +768,6 @@ def download_item_content(
         drive_id=drive_id,
         item_id=item_id,
         max_bytes=max_bytes,
-        chunk_size=chunk_size,
         limit_hint=limit_hint,
     )
     return data
@@ -781,7 +780,6 @@ def download_item(
     drive_id,
     item_id,
     max_bytes,
-    chunk_size=1 << 16,
     limit_hint="",
 ):
     """Return ``(bytes, content_type)`` of one ``driveItem``. The content hook.
@@ -801,25 +799,12 @@ def download_item(
     response = graph_request(session, "GET", url, stream=True)
     try:
         raise_for_graph_error(response, what=f"content of item {item_id!r}")
-
-        declared = response.headers.get("Content-Length")
-        if declared and declared.isdigit() and int(declared) > max_bytes:
-            raise SourceError(
-                f"driveItem {item_id!r} is {declared} bytes, over the "
-                f"{max_bytes}-byte limit this call was given. {limit_hint}".rstrip()
-            )
-
-        chunks = []
-        total = 0
-        for chunk in response.iter_content(chunk_size):
-            total += len(chunk)
-            if total > max_bytes:
-                raise SourceError(
-                    f"driveItem {item_id!r} exceeded the {max_bytes}-byte limit "
-                    f"while downloading; the transfer was abandoned."
-                )
-            chunks.append(chunk)
-        return b"".join(chunks), response.headers.get("Content-Type")
+        return read_capped(
+            response,
+            max_bytes=max_bytes,
+            what=f"driveItem {item_id!r}",
+            limit_hint=limit_hint,
+        )
     finally:
         response.close()
 

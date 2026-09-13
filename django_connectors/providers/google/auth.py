@@ -59,7 +59,11 @@ GOOGLE_EXTRA = "google"
 DEFAULT_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
+    # drive.readonly, not drive.metadata.readonly: listing and the changes feed
+    # work with metadata alone, but fetch_content (download, export) does not,
+    # and a Connection that lists fine and then 403s on the first download is a
+    # worse experience than one broad read-only scope.
+    "https://www.googleapis.com/auth/drive.readonly",
 )
 
 # OAuth 2 error codes that mean "this grant is gone". `invalid_grant` covers the

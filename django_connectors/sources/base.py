@@ -234,3 +234,29 @@ def unsign_cursor(cursor, *, scope):
         raise ConfigurationError(
             "discovery cursor was not issued by this source for this connection"
         ) from None
+
+
+def read_capped(response, *, max_bytes, what, limit_hint=""):
+    """``(bytes, content_type)`` from a streamed response, under `max_bytes`.
+
+    The size is checked twice: from ``Content-Length`` when present (cheap,
+    refuses before the transfer) and while streaming (authoritative — the
+    header is optional, and absent after a redirect). Every source that
+    fetches content goes through this, so the ceiling rule lives once.
+    """
+    declared = response.headers.get("Content-Length")
+    if declared and declared.isdigit() and int(declared) > max_bytes:
+        raise SourceError(
+            f"{what} is {declared} bytes, over the {max_bytes}-byte limit this "
+            f"call was given. {limit_hint}".rstrip()
+        )
+    chunks, total = [], 0
+    for chunk in response.iter_content(1 << 16):
+        total += len(chunk)
+        if total > max_bytes:
+            raise SourceError(
+                f"{what} exceeded the {max_bytes}-byte limit while downloading; "
+                f"the transfer was abandoned."
+            )
+        chunks.append(chunk)
+    return b"".join(chunks), response.headers.get("Content-Type")
