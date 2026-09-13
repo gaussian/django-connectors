@@ -78,7 +78,8 @@ register_target(TargetDefinition(
 ```
 
 A target that stores files gets the bytes on request — landed rows carry
-file *metadata*, never content:
+file *metadata*, never content. The Google Drive and Microsoft file sources
+provide it; a native Google Doc arrives exported (text by default):
 
 ```python
 from django_connectors.services import content

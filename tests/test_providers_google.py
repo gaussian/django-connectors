@@ -49,6 +49,7 @@ from django_connectors.landing.naming import (
     is_internal_column,
 )
 from django_connectors.providers.google import auth as google_auth
+from django_connectors.providers.google.drive import GoogleDriveSource
 from django_connectors.providers.google.gmail import GmailSource, message_record
 from django_connectors.providers.google.sheets import (
     GoogleSheetsSource,
@@ -93,6 +94,12 @@ class LoopbackSheetsSource(GoogleSheetsSource):
         return LOOPBACK["sheets"]
 
 
+class LoopbackDriveSource(GoogleDriveSource):
+    @property
+    def api_base_url(self):
+        return LOOPBACK["drive"]
+
+
 class TokenAuthBackend:
     """Returns a bare access-token string, which is one of the three shapes.
 
@@ -131,6 +138,7 @@ class RevokedTokenBackend:
 SOURCE_PATHS = {
     "gmail": "tests.test_providers_google.LoopbackGmailSource",
     "google_sheets": "tests.test_providers_google.LoopbackSheetsSource",
+    "google_drive": "tests.test_providers_google.LoopbackDriveSource",
 }
 AUTH_PATHS = {
     "token": "tests.test_providers_google.TokenAuthBackend",
@@ -448,6 +456,137 @@ class FakeSheets(_FakeApi):
         return _json(start_response, {"properties": {"title": self.title}})
 
 
+class FakeDrive(_FakeApi):
+    """``files.list``/``get``/``export``, ``alt=media`` and the ``changes`` feed.
+
+    Files are ``id -> {name, mimeType, parents, trashed, ...}``; ``content`` is
+    ``id -> bytes``; ``changes`` is the feed as a list of ``(file_id, removed)``
+    appended by tests, with ``start_token`` its cursor.
+    """
+
+    def __init__(self, files=(), *, page_size=2):
+        super().__init__()
+        self.files = {}
+        for entry in files:
+            self.add(**entry)
+        self.content = {}
+        self.changes = []
+        self.page_size = page_size
+
+    def add(
+        self, id, name, mimeType="application/pdf", parents=(), trashed=False, size=None
+    ):
+        self.files[id] = {
+            "id": id,
+            "name": name,
+            "mimeType": mimeType,
+            "parents": list(parents),
+            "trashed": trashed,
+            "modifiedTime": "2024-01-02T00:00:00Z",
+            "createdTime": "2024-01-01T00:00:00Z",
+            "webViewLink": f"https://drive.example/{id}",
+            "version": "1",
+            **({"size": str(size)} if size is not None else {}),
+        }
+        return self.files[id]
+
+    def change(self, file_id, *, removed=False):
+        self.changes.append((file_id, removed))
+
+    def __call__(self, environ, start_response):
+        self.record(environ)
+        path = environ["PATH_INFO"]
+        query = parse_qs(environ.get("QUERY_STRING", ""))
+        if self.always is not None:
+            status, payload = self.always
+            return _json(start_response, payload, status=status)
+        if self.forced:
+            status, payload, headers = self.forced.pop(0)
+            return _json(start_response, payload, status=status, headers=headers)
+
+        if path == "/about":
+            return _json(start_response, {"user": {"emailAddress": "ada@example.test"}})
+        if path == "/changes/startPageToken":
+            return _json(start_response, {"startPageToken": str(len(self.changes))})
+        if path == "/changes":
+            return self._changes(start_response, query)
+        if path == "/files":
+            return self._list(start_response, query)
+        if path.startswith("/files/"):
+            file_id = path[len("/files/") :].split("/")[0]
+            entry = self.files.get(file_id)
+            if entry is None:
+                return _json(
+                    start_response,
+                    google_error(404, "not found"),
+                    status="404 Not Found",
+                )
+            if path.endswith("/export"):
+                data = f"EXPORT:{query['mimeType'][0]}:{entry['name']}".encode()
+                return self._bytes(start_response, data, query["mimeType"][0])
+            if query.get("alt") == ["media"]:
+                return self._bytes(
+                    start_response, self.content.get(file_id, b""), "application/pdf"
+                )
+            return _json(start_response, entry)
+        return _json(
+            start_response,
+            google_error(404, f"no such path {path}"),
+            status="404 Not Found",
+        )
+
+    def _bytes(self, start_response, data, content_type):
+        start_response(
+            "200 OK",
+            [("Content-Type", content_type), ("Content-Length", str(len(data)))],
+        )
+        return [data]
+
+    def _list(self, start_response, query):
+        q = query.get("q", [""])[0]
+        parent = re.search(r"'([^']+)' in parents", q)
+        parent = parent.group(1) if parent else None
+        needle = re.search(r"name contains '([^']*)'", q)
+        needle = needle.group(1).lower() if needle else None
+        types = set(re.findall(r"mimeType = '([^']+)'", q))
+        rows = [
+            e
+            for e in self.files.values()
+            if not e["trashed"]
+            and (parent is None or parent in e["parents"])
+            and (not types or e["mimeType"] in types)
+            and (needle is None or needle in e["name"].lower())
+        ]
+        start = int(query.get("pageToken", ["0"])[0])
+        page = rows[start : start + self.page_size]
+        payload = {"files": page}
+        if start + self.page_size < len(rows):
+            payload["nextPageToken"] = str(start + self.page_size)
+        return _json(start_response, payload)
+
+    def _changes(self, start_response, query):
+        token = query.get("pageToken", ["0"])[0]
+        if token == "expired":
+            return _json(
+                start_response,
+                google_error(404, "token expired"),
+                status="404 Not Found",
+            )
+        start = int(token)
+        window = self.changes[start : start + self.page_size]
+        payload = {"changes": []}
+        for file_id, removed in window:
+            change = {"fileId": file_id, "removed": removed}
+            if not removed and file_id in self.files:
+                change["file"] = self.files[file_id]
+            payload["changes"].append(change)
+        if start + self.page_size < len(self.changes):
+            payload["nextPageToken"] = str(start + self.page_size)
+        else:
+            payload["newStartPageToken"] = str(len(self.changes))
+        return _json(start_response, payload)
+
+
 @pytest.fixture
 def gmail_server(serve, google_settings):
     def start(api):
@@ -464,6 +603,27 @@ def sheets_server(serve, google_settings):
         return api
 
     return start
+
+
+@pytest.fixture
+def drive_server(serve, google_settings):
+    def start(api):
+        LOOPBACK["drive"] = serve(api)
+        return api
+
+    return start
+
+
+@pytest.fixture
+def drive_binding(make_binding, google_connection):
+    def factory(*, connection=None, **config):
+        return make_binding(
+            source="google_drive",
+            connection=connection or google_connection(),
+            config=config,
+        )
+
+    return factory
 
 
 @pytest.fixture
@@ -2034,3 +2194,216 @@ def test_google_sheets_conformance(sheets_server, sheets_binding):
 
     rows = access.sample_rows(binding, "orders", limit=10)
     assert sorted(row["order_id"] for row in rows) == ["o1", "o2"]
+
+
+# --- drive: three addressing modes, the changes feed, content ------------------
+
+FOLDER = "application/vnd.google-apps.folder"
+DOC = "application/vnd.google-apps.document"
+
+
+def _tree():
+    """root → Reports/ (a.pdf, 2024/ (b.pdf)), loose.pdf, memo (a Google Doc)."""
+    return FakeDrive(
+        [
+            {"id": "R", "name": "Reports", "mimeType": FOLDER},
+            {"id": "Y", "name": "2024", "mimeType": FOLDER, "parents": ["R"]},
+            {"id": "a", "name": "a.pdf", "parents": ["R"], "size": 10},
+            {"id": "b", "name": "b.pdf", "parents": ["Y"], "size": 20},
+            {"id": "l", "name": "loose.pdf", "size": 30},
+            {"id": "m", "name": "memo", "mimeType": DOC},
+        ]
+    )
+
+
+def _ids(binding):
+    rows = access.iter_rows(
+        access.binding_relation(binding, "drive_files"), binding=binding
+    )
+    return sorted((r["id"], bool(r[DELETED_COLUMN])) for r in rows)
+
+
+def test_drive_whole_drive_lands_every_file_and_no_folder(drive_server, drive_binding):
+    drive_server(_tree())
+    binding = drive_binding()
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+    assert _ids(binding) == [("a", False), ("b", False), ("l", False), ("m", False)]
+
+
+def test_drive_folder_is_recursive_and_scoped(drive_server, drive_binding):
+    drive_server(_tree())
+    binding = drive_binding(folder_id="R")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert _ids(binding) == [("a", False), ("b", False)]
+
+
+def test_drive_single_file(drive_server, drive_binding):
+    drive_server(_tree())
+    binding = drive_binding(file_id="l")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert _ids(binding) == [("l", False)]
+
+
+def test_drive_changes_feed_updates_adds_and_deletes_within_scope(
+    drive_server, drive_binding
+):
+    """The cold walk takes the token first; the warm run replays the feed."""
+    api = drive_server(_tree())
+    binding = drive_binding(folder_id="R")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+
+    api.files["a"]["name"] = "a-renamed.pdf"
+    api.change("a")
+    api.add("c", "c.pdf", parents=["Y"])
+    api.change("c")  # new, inside the scope
+    api.add("z", "z.pdf")
+    api.change("z")  # new, outside the scope
+    api.change("b", removed=True)
+    api.files["l"]["trashed"] = True
+    api.change("l")  # trashed outside the scope: tombstone is emitted anyway
+
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == RunStatus.SUCCEEDED, second.error_message
+    landed = dict(_ids(binding))
+    assert landed == {"a": False, "b": True, "c": False, "l": True}
+    rows = {
+        r["id"]: r
+        for r in access.iter_rows(
+            access.binding_relation(binding, "drive_files"), binding=binding
+        )
+    }
+    assert rows["a"]["name"] == "a-renamed.pdf"
+    assert "z" not in landed
+
+
+def test_drive_a_new_subfolder_joins_the_scope(drive_server, drive_binding):
+    api = drive_server(_tree())
+    binding = drive_binding(folder_id="R")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.add("Q", "Q3", mimeType=FOLDER, parents=["Y"])
+    api.change("Q")
+    api.add("q", "q.pdf", parents=["Q"])
+    api.change("q")
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert ("q", False) in _ids(binding)
+
+
+def test_drive_an_expired_token_re_enumerates_in_the_same_run(
+    drive_server, drive_binding, caplog
+):
+    """State persists only on success, so a dead token must be replaced now."""
+    api = drive_server(_tree())
+    binding = drive_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.add("n", "new.pdf")  # no change entry: only a re-enumeration finds it
+    api.force("404 Not Found", google_error(404, "token expired"))
+
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == RunStatus.SUCCEEDED, second.error_message
+    assert ("n", False) in _ids(binding)
+    assert "re-enumerating" in caplog.text
+
+    api.add("p", "post.pdf")
+    api.change("p")
+    third = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert third.status == RunStatus.SUCCEEDED, third.error_message
+    assert ("p", False) in _ids(binding)
+
+
+def test_drive_single_file_404_is_a_deletion_only_after_it_was_seen(
+    drive_server, drive_binding
+):
+    api = drive_server(_tree())
+    missing = drive_binding(file_id="nope")
+    assert (
+        run_services.run_binding(missing, trigger=RunTrigger.INITIAL).status
+        == RunStatus.FAILED
+    )
+
+    binding = drive_binding(file_id="l")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    del api.files["l"]
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert _ids(binding) == [("l", True)]
+
+
+def test_drive_name_glob_filters_files_not_folders(drive_server, drive_binding):
+    api = drive_server(_tree())
+    api.add("t", "notes.TXT", parents=["Y"])
+    binding = drive_binding(folder_id="R", name_glob="*.txt")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert _ids(binding) == [("t", False)]
+
+
+def test_drive_content_downloads_a_file_and_exports_a_native_doc(
+    drive_server, drive_binding
+):
+    from django_connectors.services.content import fetch_record_content
+
+    api = drive_server(_tree())
+    api.content["l"] = b"%PDF-loose"
+    binding = drive_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+
+    pdf = fetch_record_content(binding, "drive_files", {"id": "l"})
+    assert pdf.data == b"%PDF-loose"
+    doc = fetch_record_content(binding, "drive_files", {"id": "m", "mime_type": DOC})
+    assert doc.data == b"EXPORT:text/plain:memo"
+    assert doc.content_type == "text/plain"
+    csv = fetch_record_content(
+        binding,
+        "drive_files",
+        {"id": "m", "mime_type": DOC, "export_mime_type": "text/csv"},
+    )
+    assert csv.data.startswith(b"EXPORT:text/csv")
+
+
+def test_drive_content_holds_the_ceiling(drive_server, drive_binding, settings):
+    from django_connectors.services.content import fetch_record_content
+
+    api = drive_server(_tree())
+    api.content["l"] = b"x" * 100
+    settings.DJANGO_CONNECTORS = {**settings.DJANGO_CONNECTORS, "CONTENT_MAX_BYTES": 50}
+    binding = drive_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    with pytest.raises(SourceError, match="limit"):
+        fetch_record_content(binding, "drive_files", {"id": "l"})
+
+
+def test_drive_discover_browses_folders_and_files(drive_server, google_connection):
+    drive_server(_tree())
+    source = LoopbackDriveSource()
+    top = source.discover(connection=google_connection(), credentials="ya29.test")
+    assert [(i["name"], i["kind"]) for i in top["items"]][:2] == [
+        ("Reports", "folder"),
+        ("2024", "folder"),
+    ]
+    below = source.discover(
+        connection=google_connection(), credentials="ya29.test", path="folder/R"
+    )
+    assert [(i["name"], i["kind"], i["path"]) for i in below["items"]] == [
+        ("2024", "folder", "folder/Y"),
+        ("a.pdf", "file", None),
+    ]
+    assert below["items"][1]["file_id"] == "a"
+    assert below["items"][0]["folder_id"] == "Y"
+
+
+def test_drive_check_connection(drive_server, google_connection):
+    drive_server(_tree())
+    assert (
+        LoopbackDriveSource().check_connection(
+            connection=google_connection(), credentials="ya29.test"
+        )
+        == "ok (ada@example.test)"
+    )
+
+
+def test_google_drive_conformance(drive_server, drive_binding):
+    drive_server(_tree())
+    binding = drive_binding(folder_id="R")
+    _assert_conformant("google_drive", binding, ["drive_files"])
+    rows = access.sample_rows(binding, "drive_files", limit=10)
+    assert sorted(row["id"] for row in rows) == ["a", "b"]
+    assert {row[BINDING_ID_COLUMN] for row in rows} == {str(binding.id)}

@@ -109,7 +109,7 @@ Built in: `memory` (a test driver with injectable failure modes), `rest`
 (config-driven, over `dlt.sources.rest_api`), `sql` (warehouses and databases),
 `filesystem` (JSONL/CSV/Parquet on local disk, S3, GCS or Azure — one file, a
 prefix, or a recursive glob). Provider connectors for Gmail, Google Sheets,
-Microsoft/Entra files and Excel, and Salesforce ship under
+Google Drive, Microsoft/Entra files and Excel, and Salesforce ship under
 `django_connectors.providers` — see their module docstrings for what is and is
 not verified against a live provider.
 

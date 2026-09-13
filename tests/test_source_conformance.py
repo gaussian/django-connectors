@@ -34,6 +34,7 @@ import pytest
 from django_connectors.enums import RunStatus, RunTrigger
 from django_connectors.exceptions import ConfigurationError
 from django_connectors.landing.naming import DELETED_COLUMN
+from django_connectors.providers.google.drive import GoogleDriveSource
 from django_connectors.providers.google.gmail import GmailSource
 from django_connectors.providers.google.sheets import GoogleSheetsSource
 from django_connectors.providers.microsoft.excel import EntraExcelSource
@@ -88,6 +89,10 @@ CASES = [
         ],
     ),
     Case(GoogleSheetsSource(), invalid_configs=[{}, {"spreadsheet_id": "s"}]),
+    Case(
+        GoogleDriveSource(),
+        invalid_configs=[{"file_id": "a", "folder_id": "b"}, {"page_size": 0}],
+    ),
     Case(EntraFilesSource(), invalid_configs=[{}, {"drive_id": ""}]),
     Case(EntraExcelSource(), invalid_configs=[{}, {"drive_id": ""}]),
     Case(SalesforceSource(), invalid_configs=[{}, {"objects": {}}]),
@@ -105,6 +110,7 @@ LANDING_SUITES = {
     "filesystem": "tests/test_sources.py",
     "gmail": "tests/test_providers_google.py",
     "google_sheets": "tests/test_providers_google.py",
+    "google_drive": "tests/test_providers_google.py",
     "entra_files": "tests/test_providers_microsoft.py",
     "entra_excel": "tests/test_providers_microsoft.py",
     "salesforce": "tests/test_providers_salesforce.py",
