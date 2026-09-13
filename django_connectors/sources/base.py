@@ -73,6 +73,15 @@ class SourceDefinition:
         """
         return None
 
+    @staticmethod
+    def resource_spec(binding, resource_name):
+        """One entry of ``Binding.config["resources"]``, or ``{}``.
+
+        For sources whose config is ``{"resources": {name: spec}}`` — memory,
+        rest, filesystem — which is where their cursor and unpivot live.
+        """
+        return ((binding.config or {}).get("resources") or {}).get(resource_name) or {}
+
     def reshape_for(self, resource_name, binding):
         """An ``unpivot`` spec for a resource, or None to land rows as they are.
 

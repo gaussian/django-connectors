@@ -279,12 +279,12 @@ class RestSource(SourceDefinition):
     # --- extraction --------------------------------------------------------
 
     def reshape_for(self, resource_name, binding):
-        spec = ((binding.config or {}).get("resources") or {}).get(resource_name) or {}
+        spec = self.resource_spec(binding, resource_name)
         return spec.get("unpivot")
 
     def incremental_for(self, resource_name, binding):
         """Cursor kwargs only. See ``SourceDefinition.incremental_for``."""
-        spec = ((binding.config or {}).get("resources") or {}).get(resource_name) or {}
+        spec = self.resource_spec(binding, resource_name)
         incremental = spec.get("incremental")
         return _incremental_kwargs(incremental) if incremental else None
 

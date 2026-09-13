@@ -207,7 +207,11 @@ class GoogleSheetsSource(SourceDefinition):
             ):
                 raise ConfigurationError(f"ranges.{name}.key_column must be a string")
             if spec["unpivot"] is not None:
-                validate_unpivot(spec["unpivot"], where=f"ranges.{name}.unpivot")
+                validate_unpivot(
+                    spec["unpivot"],
+                    where=f"ranges.{name}.unpivot",
+                    primary_key=spec["key_column"] or (),
+                )
             # Without a header row the columns are named column_1..N, which a
             # key_column could legitimately name — but a customer who wrote a
             # business name here has made a mistake worth catching at save time.

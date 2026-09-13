@@ -241,7 +241,7 @@ class EntraExcelSource(EntraFilesSource):
         if glob is not None and not isinstance(glob, str):
             raise ConfigurationError("'name_glob' must be a string like '*.xlsx'.")
         if "unpivot" in config:
-            validate_unpivot(config["unpivot"])
+            validate_unpivot(config["unpivot"], primary_key=self.key_columns(config))
         return None
 
     def reshape_for(self, resource_name, binding):

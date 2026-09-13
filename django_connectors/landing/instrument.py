@@ -49,13 +49,14 @@ In-package dedup
 
 import inspect
 
-from django_connectors.exceptions import SourceError
+from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.landing.naming import (
     BINDING_ID_COLUMN,
     DELETED_COLUMN,
     RUN_ID_COLUMN,
     landing_table_name,
 )
+from django_connectors.sources.reshape import survives, unpivot, validate_unpivot
 
 # Pinned types for the injected columns. `precision` matters: without it dlt
 # maps str to MySQL TEXT, which cannot be indexed without a prefix length
@@ -153,10 +154,8 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
         resource._hints.get("write_disposition"), resource.name, declared_primary_key
     )
 
-    reshape = (
-        source_definition.reshape_for(resource.name, binding)
-        if source_definition is not None
-        else None
+    reshape = _reshape_for(
+        source_definition, resource.name, binding, declared_primary_key
     )
 
     hints = {
@@ -165,23 +164,26 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
         "columns": dict(METADATA_COLUMN_HINTS),
     }
     if write_disposition["disposition"] == "merge":
-        # Unconditional: the binding id always leads the merge identity. An
-        # unpivot adds its name column too — one wide row is now several landed
-        # rows, and without the stage in the key they would merge into one.
-        hints["primary_key"] = (
-            BINDING_ID_COLUMN,
-            *declared_primary_key,
-            *((reshape["name_to"],) if reshape else ()),
-        )
+        # Unconditional: the binding id always leads the merge identity.
+        case_key = (BINDING_ID_COLUMN, *declared_primary_key)
+        hints["primary_key"] = case_key
+        if reshape:
+            # One wide row is now several landed rows: the stage joins the
+            # primary key so they do not merge into one, and the *case* alone
+            # becomes dlt's merge_key so a re-emitted case replaces every
+            # stage row it landed before — a cleared cell must not linger.
+            hints["primary_key"] = (*case_key, reshape["name_to"])
+            hints["merge_key"] = case_key
 
     incremental = _build_incremental(source_definition, resource.name, binding)
     if incremental is not None:
-        if reshape and _consumes_cursor(reshape, incremental):
+        cursor = str(getattr(incremental, "cursor_path", "") or "")
+        if reshape and cursor and not survives(reshape, cursor):
             raise SourceError(
                 f"resource {resource.name!r}: the incremental cursor "
-                f"{incremental.cursor_path!r} is one of the unpivoted columns, "
-                f"so it would not survive to the landed row. Keep it, or "
-                f"choose a cursor the unpivot does not consume."
+                f"{cursor!r} does not survive the unpivot (it is consumed, or "
+                f"not in 'keep'), so it would be NULL on every landed row. Keep "
+                f"it, or choose a cursor the unpivot leaves alone."
             )
         hints["incremental"] = incremental
         dedup_column = _dedup_sort_column(resource, incremental, write_disposition)
@@ -192,19 +194,38 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
 
     # Reshape first, then stamp: the injector must see every row that lands.
     if reshape:
-        from django_connectors.sources.reshape import unpivot, validate_unpivot
-
-        resource.add_yield_map(unpivot(validate_unpivot(reshape)))
+        resource.add_yield_map(unpivot(reshape))
     resource.add_map(make_metadata_injector(str(binding.id), str(run.id)))
 
     _assert_no_hard_delete(resource)
 
 
-def _consumes_cursor(reshape, incremental):
-    from django_connectors.sources.reshape import unpivoted_columns
+def _reshape_for(source_definition, resource_name, binding, primary_key):
+    """The validated unpivot for a resource, or None.
 
-    cursor = str(getattr(incremental, "cursor_path", "") or "")
-    return bool(cursor) and cursor in unpivoted_columns(reshape, [cursor])
+    Validated *here* as well as at save time: a Binding written through the
+    ORM or a fixture never met `validate_binding`, and a bare KeyError from
+    the middle of a Run names neither the field nor the cause.
+    """
+    if source_definition is None:
+        return None
+    spec = source_definition.reshape_for(resource_name, binding)
+    if not spec:
+        return None
+    if getattr(source_definition, "emits_tombstones", False):
+        raise SourceError(
+            f"resource {resource_name!r}: source {source_definition.key!r} "
+            f"emits tombstones, which cannot be unpivoted — a tombstone carries "
+            f"the case identity only, and one case-level deletion cannot become "
+            f"the per-stage deletes the landed rows would need. Deletions would "
+            f"be lost silently, so the combination is refused."
+        )
+    try:
+        return validate_unpivot(
+            spec, where=f"{resource_name}.unpivot", primary_key=primary_key
+        )
+    except ConfigurationError as exc:
+        raise SourceError(str(exc)) from exc
 
 
 def _normalize_write_disposition(declared, resource_name, primary_key):

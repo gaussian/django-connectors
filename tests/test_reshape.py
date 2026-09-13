@@ -15,10 +15,33 @@ from django_connectors.landing import access
 from django_connectors.landing.naming import BINDING_ID_COLUMN, landing_table_name
 from django_connectors.services import bindings as binding_services
 from django_connectors.services import runs as run_services
+from django_connectors.sources.memory import MemorySource
 from django_connectors.sources.reshape import unpivot, validate_unpivot
 from tests.conftest import memory_config
 
 pytestmark = pytest.mark.django_db
+
+
+class WideMemorySource(MemorySource):
+    """The memory driver as a wide-row source: no deletion detection, like
+    every real spreadsheet, file, SQL or REST source. The shipped memory
+    source emits tombstones, and an unpivot on such a source is refused."""
+
+    key = "wide"
+    emits_tombstones = False
+
+
+@pytest.fixture(autouse=True)
+def wide_settings(connectors_settings, settings):
+    settings.DJANGO_CONNECTORS = {
+        **connectors_settings,
+        "SOURCES": {
+            **connectors_settings["SOURCES"],
+            "wide": "tests.test_reshape.WideMemorySource",
+        },
+    }
+    return settings.DJANGO_CONNECTORS
+
 
 WIDE = {
     "case": "C1",
@@ -112,7 +135,7 @@ def _landed(binding):
 def test_wide_rows_land_long_with_the_stage_in_the_merge_key(
     connectors_settings, make_binding
 ):
-    binding = make_binding(config=_wide_config())
+    binding = make_binding(source="wide", config=_wide_config())
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     assert run.status == "succeeded", run.error_message
 
@@ -122,7 +145,7 @@ def test_wide_rows_land_long_with_the_stage_in_the_merge_key(
         ("C2", "approved_at", "d2"),
         ("C2", "received_at", "d1"),
     ]
-    table = landing_table_name("memory", "events", binding.landing_key)
+    table = landing_table_name("wide", "events", binding.landing_key)
     schema = access.binding_dataset(binding).schema
     merge_key = {
         name
@@ -137,9 +160,10 @@ def test_a_second_run_updates_the_stage_rows_instead_of_stacking_them(
 ):
     later = {**WIDE, "approved_at": "d2-fixed", "shipped_at": "d3"}
     binding = make_binding(
+        source="wide",
         config=memory_config(
             batches=[[WIDE], [later]], primary_key="case", unpivot=SPEC
-        )
+        ),
     )
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
@@ -154,7 +178,7 @@ def test_every_landed_row_carries_tenant_metadata_after_the_reshape(
     connectors_settings, make_binding
 ):
     """The injector runs after the reshape, so it stamps what actually lands."""
-    binding = make_binding(config=_wide_config())
+    binding = make_binding(source="wide", config=_wide_config())
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     rows = list(
         access.iter_rows(access.binding_relation(binding, "events"), binding=binding)
@@ -167,22 +191,24 @@ def test_a_cursor_that_the_unpivot_consumes_is_refused(
     connectors_settings, make_binding
 ):
     binding = make_binding(
+        source="wide",
         config=memory_config(
             batches=[[WIDE]], primary_key="case", cursor="received_at", unpivot=SPEC
-        )
+        ),
     )
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     assert run.status == "failed"
-    assert "unpivoted columns" in run.error_message
+    assert "does not survive" in run.error_message
 
 
 def test_a_bad_unpivot_is_refused_when_the_binding_is_saved(
     connectors_settings, make_binding
 ):
     binding = make_binding(
+        source="wide",
         config=memory_config(
             batches=[[WIDE]], primary_key="case", unpivot={"name_to": "s"}
-        )
+        ),
     )
     with pytest.raises(ConfigurationError, match="unpivot"):
         binding_services.validate_binding(binding)
@@ -195,7 +221,7 @@ def test_the_projection_can_identify_by_case_and_stage(
     from django_connectors.services import projections as projection_services
     from tests.conftest import make_projection
 
-    binding = make_binding(config=_wide_config())
+    binding = make_binding(source="wide", config=_wide_config())
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     projection = make_projection(
         binding,
@@ -218,3 +244,115 @@ def test_the_projection_can_identify_by_case_and_stage(
         "C2:approved_at",
         "C2:received_at",
     ]
+
+
+# --- what the review found -----------------------------------------------------
+
+
+def test_a_source_that_emits_tombstones_cannot_be_unpivoted(
+    connectors_settings, make_binding
+):
+    """A case-level tombstone cannot become per-stage deletes; refuse, do not lose."""
+    binding = make_binding(source="memory", config=_wide_config())
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "failed"
+    assert "emits tombstones" in run.error_message
+
+
+def test_a_cleared_stage_cell_removes_its_landed_row(connectors_settings, make_binding):
+    """merge_key on the case: a re-emitted case replaces every stage row it had."""
+    cleared = {**WIDE, "approved_at": ""}
+    binding = make_binding(
+        source="wide",
+        config=memory_config(
+            batches=[[WIDE], [cleared]], primary_key="case", unpivot=SPEC
+        ),
+    )
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert _landed(binding) == [("C1", "received_at", "d1")]
+
+
+def test_a_row_with_none_of_the_stage_columns_is_a_header_mismatch(
+    connectors_settings, make_binding
+):
+    """Yielding nothing would land zero rows and report success."""
+    renamed = {"case": "C1", "Received At": "d1"}
+    binding = make_binding(
+        source="wide",
+        config=memory_config(batches=[[renamed]], primary_key="case", unpivot=SPEC),
+    )
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "failed"
+    assert "found none of" in run.error_message
+
+
+def test_keep_that_drops_the_cursor_is_refused(connectors_settings, make_binding):
+    binding = make_binding(
+        source="wide",
+        config=memory_config(
+            batches=[[{**WIDE, "updated_at": "t1"}]],
+            primary_key="case",
+            cursor="updated_at",
+            unpivot={**SPEC, "keep": ["case"]},
+        ),
+    )
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "failed"
+    assert "does not survive" in run.error_message
+
+
+def test_a_key_the_unpivot_consumes_is_refused_at_save_and_at_run(
+    connectors_settings, make_binding
+):
+    binding = make_binding(
+        source="wide",
+        config=memory_config(
+            batches=[[WIDE]], primary_key="case", unpivot={**SPEC, "keep": ["owner"]}
+        ),
+    )
+    with pytest.raises(ConfigurationError, match="key column"):
+        validate_unpivot(
+            binding.config["resources"]["events"]["unpivot"], primary_key="case"
+        )
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "failed"
+    assert "key column" in run.error_message
+
+
+def test_an_unvalidated_spec_fails_the_run_with_a_named_cause(
+    connectors_settings, make_binding
+):
+    """A Binding written through the ORM never met validate_binding."""
+    binding = make_binding(
+        source="wide",
+        config=memory_config(
+            batches=[[WIDE]], primary_key="case", unpivot={"columns": ["received_at"]}
+        ),
+    )
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "failed"
+    assert "name_to" in run.error_message
+    assert "KeyError" not in run.error_message
+
+
+def test_sheets_refuses_an_unpivot_that_consumes_the_key_column_at_save_time():
+    from django_connectors.providers.google.sheets import GoogleSheetsSource
+
+    with pytest.raises(ConfigurationError, match="key column"):
+        GoogleSheetsSource().validate_config(
+            {
+                "spreadsheet_id": "s",
+                "ranges": {
+                    "orders": {
+                        "range": "A:F",
+                        "key_column": "order_id",
+                        "unpivot": {
+                            "columns": ["order_id"],
+                            "name_to": "s",
+                            "value_to": "v",
+                        },
+                    }
+                },
+            }
+        )

@@ -146,14 +146,14 @@ class FilesystemSource(SourceDefinition):
         return None
 
     def reshape_for(self, resource_name, binding):
-        spec = ((binding.config or {}).get("resources") or {}).get(resource_name) or {}
+        spec = self.resource_spec(binding, resource_name)
         return spec.get("unpivot")
 
     # --- extraction --------------------------------------------------------
 
     def incremental_for(self, resource_name, binding):
         """Cursor kwargs only. See ``SourceDefinition.incremental_for``."""
-        spec = ((binding.config or {}).get("resources") or {}).get(resource_name) or {}
+        spec = self.resource_spec(binding, resource_name)
         cursor = spec.get("cursor")
         return {"cursor_path": cursor} if cursor else None
 
