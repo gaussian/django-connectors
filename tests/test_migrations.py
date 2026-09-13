@@ -24,13 +24,17 @@ def test_no_missing_migrations():
     assert "No changes detected" in out.getvalue()
 
 
-@pytest.mark.django_db
-def test_only_one_migration_ships():
-    """The whole persistent schema is frozen in 0001.
+#: Every migration that ships, in order. A migration is a promise to every
+#: installed host, so a new one is added here deliberately — never generated
+#: as a side effect of a model edit and noticed in review.
+SHIPPED_MIGRATIONS = [
+    "0001_initial",
+    "0002_projection_invalid_record_policy",
+]
 
-    Nothing after the schema-freeze phase may add a field, so a second
-    migration appearing is a design regression, not a routine change.
-    """
+
+@pytest.mark.django_db
+def test_only_the_listed_migrations_ship():
     from django.db.migrations.loader import MigrationLoader
 
     loader = MigrationLoader(None, ignore_no_migrations=True)
@@ -39,7 +43,7 @@ def test_only_one_migration_ships():
         for app_label, name in loader.disk_migrations
         if app_label == "django_connectors"
     )
-    assert names == ["0001_initial"]
+    assert names == SHIPPED_MIGRATIONS
 
 
 @pytest.mark.django_db

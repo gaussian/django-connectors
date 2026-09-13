@@ -41,6 +41,7 @@ _EXPORTS = {
     "register_target": "django_connectors.projections.targets",
     "ProjectedRecord": "django_connectors.projections.targets",
     "WriterContext": "django_connectors.projections.targets",
+    "WriterResult": "django_connectors.projections.targets",
     # Target field types
     "BooleanField": "django_connectors.projections.fields",
     "DateField": "django_connectors.projections.fields",

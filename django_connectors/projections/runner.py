@@ -20,6 +20,14 @@ The contract handed to a host writer, and the reasons for it:
 * **A raised writer means the batch was not applied.** There is no mid-run
   checkpoint: the whole ProjectionRun is retried from the start, so writers
   must be idempotent per identity.
+* **Under ``on_invalid_record="skip"``, a row that cannot become a record is
+  counted and explained, never guessed at.** Three rules make that safe. A row
+  whose identity is None is skipped — there is nothing to match it to, so it
+  is neither written nor used to delete. A skipped row therefore never
+  produces a delete, even when its landed ``_connector_deleted`` is true. And
+  a full replay reads every landed row again, so a row skipped for a mapping
+  mistake is projected once the mapping is fixed. The count is exact; the
+  reasons are capped at ``PROJECTION_MAX_WARNINGS``.
 """
 
 import json
@@ -29,12 +37,13 @@ from django.utils import timezone
 
 from django_connectors.conf import conf
 from django_connectors.enums import (
+    InvalidRecordPolicy,
     ProjectionRunMode,
     ProjectionRunStatus,
     ProjectionStatus,
 )
 from django_connectors.errors import describe
-from django_connectors.exceptions import ProjectionError, TargetWriteError
+from django_connectors.exceptions import CastError, ProjectionError, TargetWriteError
 from django_connectors.landing import access
 from django_connectors.landing.naming import (
     DELETED_COLUMN,
@@ -46,6 +55,7 @@ from django_connectors.projections.compiler import compile_mapping
 from django_connectors.projections.targets import (
     ProjectedRecord,
     WriterContext,
+    WriterResult,
     get_target,
 )
 
@@ -102,6 +112,8 @@ def execute(projection_run):
     projection_run.records_seen = counts["seen"]
     projection_run.records_written = counts["written"]
     projection_run.records_deleted = counts["deleted"]
+    projection_run.records_skipped = counts["skipped"]
+    projection_run.warnings = counts["warnings"]
     _finish(projection_run, ProjectionRunStatus.SUCCEEDED)
 
     projection.last_success_at = timezone.now()
@@ -120,7 +132,8 @@ def _run(projection_run, projection):
     rows = access.iter_rows(relation, order_by=ORDER_COLUMNS, binding=binding)
 
     batch_size = conf.PROJECTION_BATCH_SIZE
-    counts = {"seen": 0, "written": 0, "deleted": 0}
+    counts = {"seen": 0, "written": 0, "deleted": 0, "skipped": 0, "warnings": []}
+    skip_invalid = projection.on_invalid_record == InvalidRecordPolicy.SKIP
     batch = []
     batch_index = 0
     # Run-scoped, not batch-scoped: see the module docstring. Holds identity
@@ -132,7 +145,13 @@ def _run(projection_run, projection):
         counts["seen"] += 1
         if not compiled.matches(row):
             continue
-        batch.append(_project(row, compiled, target))
+        try:
+            batch.append(_project(row, compiled, target))
+        except (ProjectionError, CastError) as exc:
+            if not skip_invalid:
+                raise
+            _skip(counts, str(exc), row=row.get(DLT_ID_COLUMN))
+            continue
         if len(batch) >= batch_size:
             _write(
                 batch,
@@ -226,14 +245,35 @@ def _write(
     )
 
     try:
-        target.writer(records, context)
+        result = target.writer(records, context)
     except Exception as exc:
         raise TargetWriteError(
             f"target {target.key!r} writer failed on batch {batch_index}: {exc}"
         ) from exc
 
-    counts["written"] += sum(1 for r in records if r.operation == "upsert")
-    counts["deleted"] += sum(1 for r in records if r.operation == "delete")
+    upserts = sum(1 for r in records if r.operation == "upsert")
+    deletes = sum(1 for r in records if r.operation == "delete")
+    if isinstance(result, WriterResult):
+        counts["written"] += upserts if result.written is None else result.written
+        counts["deleted"] += deletes if result.deleted is None else result.deleted
+        counts["skipped"] += result.skipped
+        for warning in result.warnings:
+            _skip(counts, str(warning), count=False)
+    else:
+        # An int, or nothing: the batch was applied as handed over.
+        counts["written"] += upserts
+        counts["deleted"] += deletes
+
+
+def _skip(counts, reason, *, row=None, count=True):
+    """Record one skipped row or writer warning, keeping the list bounded."""
+    if count:
+        counts["skipped"] += 1
+    if len(counts["warnings"]) < conf.PROJECTION_MAX_WARNINGS:
+        entry = {"reason": reason}
+        if row is not None:
+            entry["row"] = row
+        counts["warnings"].append(entry)
 
 
 def _collapse(batch, target, deleted_identities=None):
@@ -290,6 +330,8 @@ def _finish(projection_run, status, *, note=""):
             "records_seen",
             "records_written",
             "records_deleted",
+            "records_skipped",
+            "warnings",
             "error_type",
             "error_message",
         ]

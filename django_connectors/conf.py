@@ -57,6 +57,9 @@ DEFAULTS: dict[str, Any] = {
     # the auto-heal horizon: a ProjectionRun that fails and is never retried
     # within this window is never picked up again.
     "PROJECTION_SWEEP_LOOKBACK": dt.timedelta(days=7),
+    # How many per-row reasons a ProjectionRun keeps in `warnings`. The count
+    # in `records_skipped` is always exact; only the explanations are capped.
+    "PROJECTION_MAX_WARNINGS": 100,
     "PREVIEW_MAX_ROWS": 50,
     "SAMPLE_MAX_ROWS": 100,
     "PREVIEW_MAX_BYTES": 1024 * 1024,

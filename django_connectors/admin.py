@@ -310,6 +310,7 @@ class ProjectionRunAdmin(admin.ModelAdmin):
         "status",
         "projection_version",
         "records_written",
+        "records_skipped",
         "started_at",
     )
     list_filter = ("status", "mode")
