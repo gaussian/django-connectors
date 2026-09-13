@@ -1045,3 +1045,11 @@ def test_a_writer_raising_a_base_exception_does_not_leave_the_run_running(
     )
     retry = projection_services.retry_projection_run(projection_run)
     assert retry.status == ProjectionRunStatus.SUCCEEDED
+
+
+def test_the_writer_is_told_the_targets_identity_scope(
+    connectors_settings, make_binding, events_target, writer
+):
+    binding, run = land_memory(make_binding, [[RECORD]])
+    projection_services.run_projection(make_projection(binding), source_run=run)
+    assert writer.contexts[0].identity_scope == "owner"

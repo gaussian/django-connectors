@@ -98,7 +98,13 @@ Three rules the runner relies on:
 - **Use `context.owner_object_id`.** Ignoring it discards the multi-tenant
   guarantee at the last step.
 - **`identity_scope` has no default.** It decides whether two owners may share
-  an identity value; guessing wrong is a cross-tenant collision.
+  an identity value; guessing wrong is a cross-tenant collision. It is handed
+  back on `context.identity_scope`, so a writer can assert it.
+- **Identity stays one-to-one.** A writer may create satellite records — a
+  membership, a tag, a parent that must exist first — but one record's
+  identity must map to one host record, because a delete of that identity
+  says nothing about the satellites. Many-to-one or one-to-many shaping
+  belongs at the source (see `unpivot`), never in the writer.
 
 ## 3. Connect a customer's system
 

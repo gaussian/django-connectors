@@ -62,6 +62,11 @@ class WriterContext:
 
     owner_content_type_id: int | None
     owner_object_id: str
+    #: The target's declared scope, so a writer can assert what it was
+    #: written against: a writer that scopes its lookup by owner under a
+    #: "global" target, or forgets to under an "owner" one, is the exact
+    #: cross-tenant error the field exists to prevent.
+    identity_scope: str
     connection_id: Any
     binding_id: Any
     projection_id: Any

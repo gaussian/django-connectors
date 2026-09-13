@@ -236,6 +236,7 @@ def _write(
     context = WriterContext(
         owner_content_type_id=projection.binding.connection.owner_content_type_id,
         owner_object_id=projection.binding.connection.owner_object_id,
+        identity_scope=target.identity_scope,
         connection_id=projection.binding.connection_id,
         binding_id=projection.binding_id,
         projection_id=projection.id,
