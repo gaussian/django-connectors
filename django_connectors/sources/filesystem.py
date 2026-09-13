@@ -44,6 +44,7 @@ import os
 from typing import ClassVar
 from urllib.parse import urlsplit
 
+from django_connectors.auth.base import credential_value
 from django_connectors.exceptions import ConfigurationError
 from django_connectors.sources.base import SourceDefinition, as_config
 
@@ -115,31 +116,22 @@ class FilesystemSource(SourceDefinition):
                     f"resources.{name}.format must be one of "
                     f"{sorted(FORMAT_REQUIREMENTS)}, got {file_format!r}."
                 )
-            requirement = FORMAT_REQUIREMENTS[file_format]
-            if requirement is not None:
-                module, extra = requirement
-                if not module_available(module):
-                    raise ConfigurationError(
-                        f"resources.{name} reads {file_format} files, which "
-                        f"needs {module!r}. dlt imports it lazily inside the "
-                        f"reader, so without this check the failure would land "
-                        f"inside a Run instead of here. Install it with: "
-                        f"pip install 'django-connectors[{extra}]'"
-                    )
+            _require_driver(
+                name, FORMAT_REQUIREMENTS[file_format], f"reads {file_format} files"
+            )
 
             # Raises on an unknown scheme or a relative local path.
-            bucket_url, _ = resolve_location(name, spec, allowed=self.allowed_schemes)
-            requirement = SCHEME_REQUIREMENTS.get(urlsplit(bucket_url).scheme)
-            if requirement is not None:
-                module, extra = requirement
-                if not module_available(module):
-                    raise ConfigurationError(
-                        f"resources.{name} reads from {bucket_url!r}, which "
-                        f"needs {module!r}. fsspec imports it lazily on first "
-                        f"use, so without this check the failure would land "
-                        f"inside a Run instead of here. Install it with: "
-                        f"pip install 'django-connectors[{extra}]'"
-                    )
+            bucket_url, file_glob = resolve_location(
+                name, spec, allowed=self.allowed_schemes
+            )
+            scheme = urlsplit(bucket_url).scheme
+            if scheme == "file":
+                # The heuristic that tells a file from a dotted directory is
+                # only a heuristic; on local disk the answer is one stat away.
+                _check_local_location(name, bucket_url, file_glob)
+            _require_driver(
+                name, SCHEME_REQUIREMENTS.get(scheme), f"reads from {bucket_url!r}"
+            )
 
             disposition = spec.get("write_disposition", "merge")
             if disposition == "merge" and not spec.get("primary_key"):
@@ -230,10 +222,16 @@ def resolve_location(name, spec, *, allowed=frozenset(SCHEME_REQUIREMENTS)):
                 f"file) or a 'bucket_url'."
             )
         head, _, tail = path.rpartition("/")
-        if any(character in tail for character in GLOB_CHARACTERS) or _looks_like_file(
-            tail
+        # `head` is empty for a bare name (`orders.csv`) and ends in `:/` when
+        # the tail is the bucket itself (`s3://my.bucket`). Neither names a
+        # file inside a directory, and defaulting to `/` turned the first into
+        # a read from the filesystem root.
+        below_root = bool(head) and not head.endswith(":/")
+        if below_root and (
+            any(character in tail for character in GLOB_CHARACTERS)
+            or _looks_like_file(tail)
         ):
-            bucket_url, file_glob = head or "/", file_glob or tail
+            bucket_url, file_glob = head, file_glob or tail
         else:
             bucket_url = path
 
@@ -255,6 +253,43 @@ def resolve_location(name, spec, *, allowed=frozenset(SCHEME_REQUIREMENTS)):
         raise ConfigurationError(f"resources.{name}: {bucket_url!r} names no bucket.")
 
     return bucket_url, file_glob or "*"
+
+
+def _require_driver(name, requirement, what):
+    """Refuse at save time a format or scheme whose driver is not installed.
+
+    dlt's readers and fsspec's drivers both import lazily on first use, so
+    without this the failure lands inside a customer's Run instead of here.
+    """
+    if requirement is None:
+        return
+    module, extra = requirement
+    if not module_available(module):
+        raise ConfigurationError(
+            f"resources.{name} {what}, which needs {module!r}. It is imported "
+            f"lazily on first use, so without this check the failure would "
+            f"land inside a Run instead of here. Install it with: "
+            f"pip install 'django-connectors[{extra}]'"
+        )
+
+
+def _check_local_location(name, bucket_url, file_glob):
+    """A local directory must exist, and a single-file glob must name a file."""
+    directory = bucket_url.removeprefix("file://")
+    if not os.path.isdir(directory):
+        raise ConfigurationError(
+            f"resources.{name}: {directory!r} is not a directory on this "
+            f"worker. If it is a file, give its directory as 'bucket_url' and "
+            f"its name as 'file_glob'."
+        )
+    if not any(character in file_glob for character in GLOB_CHARACTERS):
+        target = os.path.join(directory, file_glob)
+        if os.path.isdir(target):
+            raise ConfigurationError(
+                f"resources.{name}: {target!r} is a directory, but its name "
+                f"looks like a file. Give it as 'bucket_url' with a "
+                f"'file_glob' to read what is inside it."
+            )
 
 
 def _looks_like_file(segment):
@@ -283,12 +318,24 @@ def bucket_credentials(bucket_url, credentials):
 
         if isinstance(credentials, AwsCredentials):
             return credentials
+        if credentials is None:
+            # Nothing at all means the worker's own role, deliberately.
+            return AwsCredentials()
         values = {}
-        if credentials is not None:
+        if not isinstance(credentials, str):
             for key in AWS_CREDENTIAL_KEYS:
-                value = _read_credential(credentials, key)
+                value = credential_value(credentials, key)
                 if value:
                     values[key] = value
+        if not values:
+            # A credential was supplied and none of it is usable. Falling back
+            # to the worker's role here would use a different account than the
+            # one the operator configured, silently.
+            raise ConfigurationError(
+                f"s3:// credentials must be a mapping with at least one of "
+                f"{list(AWS_CREDENTIAL_KEYS)}, or nothing for the worker's own "
+                f"role; got {type(credentials).__name__}."
+            )
         return AwsCredentials(**values)
     if credentials is None or isinstance(credentials, str | dict):
         raise ConfigurationError(
@@ -297,12 +344,6 @@ def bucket_credentials(bucket_url, credentials):
             f"enough to build one without guessing its shape."
         )
     return credentials
-
-
-def _read_credential(credentials, key):
-    if hasattr(credentials, "get"):
-        return credentials.get(key)
-    return getattr(credentials, key, None)
 
 
 def module_available(module_name):

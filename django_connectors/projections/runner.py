@@ -43,7 +43,7 @@ from django_connectors.enums import (
     ProjectionStatus,
 )
 from django_connectors.errors import describe
-from django_connectors.exceptions import CastError, ProjectionError, TargetWriteError
+from django_connectors.exceptions import CastError, InvalidRecordError, TargetWriteError
 from django_connectors.landing import access
 from django_connectors.landing.naming import (
     DELETED_COLUMN,
@@ -147,7 +147,10 @@ def _run(projection_run, projection):
             continue
         try:
             batch.append(_project(row, compiled, target))
-        except (ProjectionError, CastError) as exc:
+        except (InvalidRecordError, CastError) as exc:
+            # Only what one row's data can cause. A MappingValidationError —
+            # a column that is not in the landed row — is the mapping's fault,
+            # and skipping every row over it would report success on nothing.
             if not skip_invalid:
                 raise
             _skip(counts, str(exc), row=row.get(DLT_ID_COLUMN))
@@ -187,7 +190,10 @@ def _scope_for(projection_run):
 
 def _project(row, compiled, target):
     deleted = bool(row.get(DELETED_COLUMN))
-    values = compiled.apply(row)
+    # A delete needs its identity and nothing else. Evaluating the other
+    # fields too would let an unparseable value in a column the delete never
+    # uses block the delete — and leave the host holding a stale record.
+    values = compiled.apply(row, only=target.identity_fields if deleted else None)
 
     # Coercion happens before identity is taken, so the identity a writer joins
     # on is the declared type. Taking it from the raw values instead delivered
@@ -201,7 +207,7 @@ def _project(row, compiled, target):
     identity = {name: coerced.get(name) for name in target.identity_fields}
     missing = sorted(name for name, value in identity.items() if value is None)
     if missing:
-        raise ProjectionError(
+        raise InvalidRecordError(
             f"identity field(s) {missing} evaluated to None; the record cannot "
             f"be matched to an existing one"
         )
@@ -218,7 +224,7 @@ def _assert_required(values, target):
         name for name in target.required_fields if values.get(name) is None
     )
     if missing:
-        raise ProjectionError(
+        raise InvalidRecordError(
             f"target {target.key!r} requires {missing}, which evaluated to None"
         )
 

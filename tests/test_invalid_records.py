@@ -207,3 +207,41 @@ def test_the_api_exposes_the_policy_and_the_counters():
     assert "on_invalid_record" in ProjectionSerializer.Meta.fields
     assert "records_skipped" in ProjectionRunSerializer.Meta.fields
     assert "warnings" in ProjectionRunSerializer.Meta.fields
+
+
+# --- what skip must never swallow ------------------------------------------
+
+
+def test_skip_does_not_swallow_a_broken_mapping(
+    connectors_settings, make_binding, events_target, writer
+):
+    """A column that is not in the landed row is the mapping's fault. Skipping
+    every row over it would report success on nothing."""
+    binding, run = land_memory(make_binding, [[GOOD]])
+    projection = _skipping(binding, {**REF_MAPPING, "type": {"source": "gone"}})
+    projection_run = projection_services.run_projection(projection, source_run=run)
+    assert projection_run.status == ProjectionRunStatus.FAILED
+    assert "gone" in projection_run.error_message
+    assert projection_run.records_skipped == 0
+
+
+def test_a_delete_needs_its_identity_and_nothing_else(
+    connectors_settings, make_binding, events_target, writer
+):
+    """A soft-deleted row whose unused column will not cast still deletes."""
+    from django_connectors.enums import RunTrigger
+    from django_connectors.landing.naming import DELETED_COLUMN
+    from django_connectors.services import runs as run_services
+
+    binding, _ = land_memory(
+        make_binding,
+        [[GOOD], [{**GOOD, "happened_at": "n/a", DELETED_COLUMN: True}]],
+    )
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    projection_run = projection_services.run_projection(
+        _skipping(binding), source_run=second
+    )
+    assert projection_run.status == ProjectionRunStatus.SUCCEEDED
+    assert projection_run.records_deleted == 1
+    assert projection_run.records_skipped == 0
+    assert [r.operation for r in writer.records] == ["delete"]

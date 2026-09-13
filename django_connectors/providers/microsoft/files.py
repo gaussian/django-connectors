@@ -54,6 +54,7 @@ from email.utils import parsedate_to_datetime
 from typing import ClassVar
 from urllib.parse import quote, unquote, urlsplit
 
+from django_connectors.auth.base import first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import (
     AuthError,
@@ -888,15 +889,9 @@ def access_token(credentials):
     """
     if isinstance(credentials, str) and credentials:
         return credentials
-    if credentials is not None:
-        for key in _TOKEN_KEYS:
-            value = (
-                credentials.get(key)
-                if hasattr(credentials, "get")
-                else getattr(credentials, key, None)
-            )
-            if value:
-                return value
+    value = first_credential_value(credentials, _TOKEN_KEYS)
+    if value:
+        return value
     raise AuthError(
         "no Microsoft Graph access token was available for this Binding. The "
         "Connection needs an auth backend that returns one — "

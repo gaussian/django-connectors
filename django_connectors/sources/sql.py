@@ -31,6 +31,7 @@ no ``sql_database`` reflection
 import re
 from typing import ClassVar
 
+from django_connectors.auth.base import first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.sources.base import SourceDefinition, as_config
@@ -288,15 +289,7 @@ def _credentials_url(credentials):
         return None
     if isinstance(credentials, str):
         return credentials
-    for key in ("url", "dsn", "connection_string"):
-        value = (
-            credentials.get(key)
-            if isinstance(credentials, dict)
-            else getattr(credentials, key, None)
-        )
-        if value:
-            return value
-    return None
+    return first_credential_value(credentials, ("url", "dsn", "connection_string"))
 
 
 def create_engine(url):

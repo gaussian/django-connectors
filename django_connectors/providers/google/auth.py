@@ -36,7 +36,7 @@ import logging
 import time
 from typing import ClassVar
 
-from django_connectors.auth.base import AuthBackend
+from django_connectors.auth.base import AuthBackend, first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import (
     AuthError,
@@ -160,14 +160,9 @@ def bearer_token(credentials):
             )
         return token
 
-    for key in ("access_token", "token", "api_key"):
-        value = (
-            credentials.get(key)
-            if hasattr(credentials, "get")
-            else getattr(credentials, key, None)
-        )
-        if value:
-            return value
+    value = first_credential_value(credentials, ("access_token", "token", "api_key"))
+    if value:
+        return value
 
     raise AuthError(
         f"could not find an access token on the credentials the auth backend "

@@ -174,3 +174,15 @@ def test_a_locale_date_column_projects_with_a_format(
     assert projection_run.status == "succeeded", projection_run.error_message
     written = writer.records[0].values["occurred_at"]
     assert written.astimezone(dt.UTC) == dt.datetime(2024, 4, 3, 8, 30, tzinfo=dt.UTC)
+
+
+def test_colon_z_is_refused_because_strptime_rejects_it():
+    with pytest.raises(MappingValidationError, match="%:"):
+        compile_mapping({"f": {"source": "c", "cast": "datetime", "format": "%:z"}})
+
+
+def test_timezone_never_relabels_a_landed_datetime():
+    """A native datetime is a landed timestamp column: dlt already made it UTC."""
+    landed = dt.datetime(2024, 7, 3, 8, 0)  # naive, UTC by construction
+    value = _cast({"cast": "datetime", "timezone": "Europe/London"}, landed)
+    assert value == dt.datetime(2024, 7, 3, 8, 0, tzinfo=dt.UTC)

@@ -33,6 +33,7 @@ _EXPORTS = {
     "ProjectionError": "django_connectors.exceptions",
     "MappingValidationError": "django_connectors.exceptions",
     "CastError": "django_connectors.exceptions",
+    "InvalidRecordError": "django_connectors.exceptions",
     "SchemaDriftError": "django_connectors.exceptions",
     "TargetWriteError": "django_connectors.exceptions",
     "LockNotAcquired": "django_connectors.exceptions",

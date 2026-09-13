@@ -182,8 +182,8 @@ class DateTimeField(Field):
     spreadsheet's ``03/04/2024``, because a date a person typed is almost never
     ISO and guessing between day-first and month-first silently corrupts a
     third of a year's rows. ``timezone`` (an IANA name) says which wall clock
-    a naive parsed value is on; without it a naive value is UTC, since landed
-    timestamps are UTC by construction.
+    naive *text* is on. It never applies to a native datetime: that came from
+    a landed timestamp column, which dlt already converted to UTC.
     """
 
     compatible_dlt_types = frozenset({"timestamp", "date", "text", "bigint"})
@@ -195,25 +195,21 @@ class DateTimeField(Field):
         self.tzinfo = _validated_timezone(timezone)
 
     def _coerce(self, value):
+        # A native datetime came from a landed timestamp column: dlt converted
+        # it to UTC and dropped the offset, so naive means UTC — `timezone`
+        # must not relabel it. Only text is the customer's own rendering.
         if isinstance(value, dt.datetime):
-            return self._aware(value)
+            return _as_aware(value, dt.UTC)
         if isinstance(value, dt.date):
-            return self._aware(dt.datetime.combine(value, dt.time.min))
+            return _as_aware(dt.datetime.combine(value, dt.time.min), dt.UTC)
         if isinstance(value, int | float):
             return dt.datetime.fromtimestamp(value, tz=dt.UTC)
         text = str(value).strip()
         if self.format:
-            return self._aware(dt.datetime.strptime(text, self.format))
-        # dlt stores timestamps as MySQL datetime(6) with the offset dropped
-        # after conversion to UTC, so a naive value read back is UTC.
+            return _as_aware(dt.datetime.strptime(text, self.format), self.tzinfo)
         if text.endswith("Z"):
             text = f"{text[:-1]}+00:00"
-        return self._aware(dt.datetime.fromisoformat(text))
-
-    def _aware(self, value):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=self.tzinfo or dt.UTC)
-        return value
+        return _as_aware(dt.datetime.fromisoformat(text), self.tzinfo)
 
 
 class DateField(Field):
@@ -251,7 +247,14 @@ class JSONField(Field):
 #: ``strptime`` (which only fails on the first row) reports a bad pattern at
 #: the time the mapping is written.
 STRPTIME_DIRECTIVES = frozenset("aAbBcdfGHIjmMpSuUVwWxXyYzZ%")
-_DIRECTIVE_RE = re.compile(r"%(:?)(.|$)")
+_DIRECTIVE_RE = re.compile(r"%(.|$)")
+
+
+def _as_aware(value, tzinfo):
+    """Attach `tzinfo` (or UTC) to a naive datetime; leave an aware one alone."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=tzinfo or dt.UTC)
+    return value
 
 
 def _validated_format(pattern):
@@ -260,11 +263,11 @@ def _validated_format(pattern):
         return None
     if not isinstance(pattern, str) or not pattern:
         raise ValueError("'format' must be a non-empty strptime pattern")
-    for colon, directive in _DIRECTIVE_RE.findall(pattern):
-        if directive not in STRPTIME_DIRECTIVES or (colon and directive != "z"):
+    for directive in _DIRECTIVE_RE.findall(pattern):
+        if directive not in STRPTIME_DIRECTIVES:
             raise ValueError(
                 f"'format' {pattern!r} is not a valid strptime pattern: "
-                f"%{colon}{directive} is not a directive"
+                f"%{directive} is not a directive"
             )
     return pattern
 

@@ -234,10 +234,12 @@ class CompiledMapping:
     def matches(self, row):
         return all(item.matches(row) for item in self.filters)
 
-    def apply(self, row):
-        """Evaluate every field. Raises CastError naming the field that failed."""
+    def apply(self, row, *, only=None):
+        """Evaluate every field, or just `only`. CastError names the field."""
         values = {}
         for name, node in self.nodes.items():
+            if only is not None and name not in only:
+                continue
             try:
                 values[name] = node.evaluate(row)
             except CastError as exc:

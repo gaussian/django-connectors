@@ -133,6 +133,30 @@ class AuthBackend:
         return self.key or type(self).__name__
 
 
+def credential_value(credentials, key):
+    """One field off whatever an auth backend returned, or None.
+
+    A backend may return a plain dict, a :class:`Credentials` mapping, or an
+    SDK object with attributes; every source needs the same field either way.
+    ``hasattr(..., "get")`` rather than ``isinstance(..., dict)``: a
+    ``Credentials`` is a Mapping, not a dict, and two sources used to miss it.
+    """
+    if credentials is None:
+        return None
+    if hasattr(credentials, "get"):
+        return credentials.get(key)
+    return getattr(credentials, key, None)
+
+
+def first_credential_value(credentials, keys):
+    """The first non-empty value among `keys`, or None."""
+    for key in keys:
+        value = credential_value(credentials, key)
+        if value:
+            return value
+    return None
+
+
 class Credentials(Mapping):
     """A multi-field credential payload whose ``repr`` holds no credential.
 

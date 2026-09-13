@@ -43,6 +43,7 @@ from functools import cache
 from typing import ClassVar
 from urllib.parse import urljoin, urlsplit
 
+from django_connectors.auth.base import first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import (
     AuthError,
@@ -583,15 +584,7 @@ def _token(credentials):
         return None
     if isinstance(credentials, str):
         return credentials
-    for key in _TOKEN_KEYS:
-        value = (
-            credentials.get(key)
-            if isinstance(credentials, dict)
-            else getattr(credentials, key, None)
-        )
-        if value:
-            return value
-    return None
+    return first_credential_value(credentials, _TOKEN_KEYS)
 
 
 # --- error readability -----------------------------------------------------

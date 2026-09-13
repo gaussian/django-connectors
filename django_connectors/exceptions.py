@@ -68,6 +68,16 @@ class CastError(ProjectionError):
     """A value could not be cast to the type the target field declares."""
 
 
+class InvalidRecordError(ProjectionError):
+    """One landed row cannot become a record: a required or identity field is None.
+
+    Distinct from :class:`MappingValidationError` on purpose. This is about
+    *one row's data*; that is about the mapping itself — a column that is not
+    there — and a policy that skips rows must never skip a broken mapping, or
+    every row is dropped and the run reports success.
+    """
+
+
 class SchemaDriftError(ProjectionError):
     """The landing schema changed in a way the mapping can no longer satisfy."""
 

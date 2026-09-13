@@ -894,6 +894,60 @@ def test_s3_with_no_credentials_means_ambient():
     )
 
 
+@pytest.mark.parametrize("credentials", ["AKIA...", {"token": "x"}, {}])
+def test_s3_refuses_a_credential_it_cannot_use(credentials):
+    """Falling back to the worker's role would use a different account than
+    the one the operator configured, silently."""
+    with pytest.raises(ConfigurationError, match="at least one of"):
+        filesystem_source.bucket_credentials("s3://b/x", credentials)
+
+
+@pytest.mark.parametrize("path", ["orders.csv", "*.csv"])
+def test_a_bare_name_is_relative_and_refused(source_settings, make_binding, path):
+    binding = make_binding(
+        source="files",
+        config={"resources": {"events": {"path": path, "primary_key": "id"}}},
+    )
+    with pytest.raises(ConfigurationError, match="absolute"):
+        binding_services.validate_binding(binding)
+
+
+def test_a_dotted_bucket_name_is_a_bucket_not_a_file():
+    bucket_url, file_glob = filesystem_source.resolve_location(
+        "r", {"path": "s3://my.bucket"}
+    )
+    assert (bucket_url, file_glob) == ("s3://my.bucket", "*")
+
+
+def test_a_dotted_local_directory_is_checked_on_disk(
+    source_settings, make_binding, tmp_path
+):
+    (tmp_path / "release.v2").mkdir()
+    binding = make_binding(
+        source="files",
+        config={
+            "resources": {
+                "events": {"path": f"{tmp_path}/release.v2", "primary_key": "id"}
+            }
+        },
+    )
+    with pytest.raises(ConfigurationError, match="is a directory"):
+        binding_services.validate_binding(binding)
+
+
+def test_a_missing_local_directory_is_refused_at_save(
+    source_settings, make_binding, tmp_path
+):
+    binding = make_binding(
+        source="files",
+        config={
+            "resources": {"events": {"path": f"{tmp_path}/nope", "primary_key": "id"}}
+        },
+    )
+    with pytest.raises(ConfigurationError, match="not a directory"):
+        binding_services.validate_binding(binding)
+
+
 @pytest.mark.parametrize("credentials", [None, {"key": "x"}, "token"])
 def test_other_buckets_need_a_spec_or_a_filesystem(credentials):
     with pytest.raises(ConfigurationError, match="credential spec or an fsspec"):
@@ -943,3 +997,13 @@ def test_filesystem_merge_without_a_key_is_refused():
         filesystem_source.FilesystemSource().validate_config(
             {"resources": {"events": {"path": os.sep + "tmp"}}}
         )
+
+
+def test_sql_and_rest_read_a_credentials_mapping_not_only_a_dict():
+    """`Credentials` is a Mapping, not a dict; both sources used to miss it."""
+    from django_connectors.auth.base import Credentials
+    from django_connectors.sources import rest as rest_source
+    from django_connectors.sources import sql as sql_module
+
+    assert sql_module._credentials_url(Credentials(url="sqlite://")) == "sqlite://"
+    assert rest_source._token(Credentials(access_token="t")) == "t"
