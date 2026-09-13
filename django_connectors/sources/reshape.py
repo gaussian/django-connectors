@@ -19,7 +19,9 @@ library to turn it into one row per stage. So this is the upstream.
 Every other column is kept on every emitted row (``keep`` narrows that), and a
 stage whose value is empty is dropped unless ``drop_empty`` is false, because
 a blank cell in a stage column means "did not happen", not "happened at
-null". ``columns_matching`` is a glob (``"*_at"``) for sheets where listing
+null". The one exception is a case whose *every* stage is empty: it lands
+with each stage null, because a case absent from the package keeps the stage
+rows it landed before, and a cleared case must not. ``columns_matching`` is a glob (``"*_at"``) for sheets where listing
 the stages would be brittle.
 
 The landing layer extends the merge key with ``name_to``: one wide row is now
@@ -124,6 +126,10 @@ def _as_tuple(value):
     return (value,) if isinstance(value, str) else tuple(value)
 
 
+def _empty(value):
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def unpivot(spec):
     """A one-to-many record map for ``DltResource.add_yield_map``."""
     listed = tuple(spec.get("columns") or ())
@@ -156,12 +162,14 @@ def unpivot(spec):
             if keep is None
             else {k: row.get(k) for k in keep}
         )
-        for column in stages:
+        present = [column for column in stages if not _empty(row[column])]
+        # A case whose every stage is empty must still reach the landing
+        # table: merge replaces a case's rows only when the package carries
+        # its key, so emitting nothing would leave the old stage rows in
+        # place. It lands with every stage null — "cleared", not "at null".
+        emit = present if (drop_empty and present) else stages
+        for column in emit:
             value = row[column]
-            if drop_empty and (
-                value is None or (isinstance(value, str) and not value.strip())
-            ):
-                continue
-            yield {**base, name_to: column, value_to: value}
+            yield {**base, name_to: column, value_to: None if _empty(value) else value}
 
     return reshape

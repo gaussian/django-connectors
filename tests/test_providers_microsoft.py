@@ -2019,3 +2019,24 @@ def test_a_deleted_single_item_lands_as_a_tombstone(
         )
     )
     assert len(rows) == 1 and bool(rows[0][DELETED_COLUMN]) is True
+
+
+def test_content_refuses_a_graph_host_off_the_allow_list(
+    microsoft_settings, make_graph_binding, graph
+):
+    """A base URL edited after landing must not receive the tenant token."""
+    from django_connectors.providers.microsoft.files import EntraFilesSource
+
+    graph.seed(ROOT_ITEM, drive_item("F1", "one.pdf"))
+    binding = make_graph_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    binding.config["graph_base_url"] = "https://evil.example/v1.0"
+    binding.save(update_fields=["config"])
+    with pytest.raises(ConfigurationError, match="refusing to send"):
+        EntraFilesSource().fetch_content(
+            binding=binding,
+            credentials={"access_token": "t"},
+            resource="drive_items",
+            reference={"id": "F1", "drive_id": DRIVE_ID},
+            max_bytes=10,
+        )

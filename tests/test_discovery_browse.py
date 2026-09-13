@@ -201,3 +201,19 @@ def test_the_api_passes_every_browsing_parameter_through(
     assert [i["name"] for i in rest["items"]] == ["gamma"]
     assert client.get(url, {"q": "amm"}).json()["items"][0]["name"] == "gamma"
     assert client.get(url, {"cursor": "junk"}).status_code == 400
+
+
+def test_a_listing_the_worker_may_not_read_is_a_source_error(
+    source_settings, make_connection, tmp_path
+):
+    import os
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0)
+    connection = make_connection(provider="files", metadata={})
+    try:
+        with pytest.raises(SourceError, match="could not list"):
+            discovery.discover_remote(connection, path=str(locked))
+    finally:
+        os.chmod(locked, 0o700)

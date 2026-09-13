@@ -441,11 +441,13 @@ class EntraFilesSource(SourceDefinition):
         except ConfigurationError as exc:
             # The reference is the caller's data, not the Binding's config.
             raise SourceError(str(exc)) from exc
+        base = self.base_url(config)
+        assert_graph_url(base, allow_custom=self.allow_custom_graph_base_url)
         session = graph_session(access_token(credentials), timeout=self.timeout(config))
         try:
             return download_item(
                 session,
-                base_url=self.base_url(config),
+                base_url=base,
                 drive_id=drive_id,
                 item_id=item_id,
                 max_bytes=max_bytes,

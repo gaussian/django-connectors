@@ -41,10 +41,12 @@ happened to start in.
 """
 
 import os
+from collections.abc import Mapping
 from typing import ClassVar
 from urllib.parse import urlsplit
 
 from django_connectors.auth.base import credential_value
+from django_connectors.errors import scrub
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 from django_connectors.sources.reshape import validate_unpivot
@@ -243,6 +245,12 @@ class FilesystemSource(SourceDefinition):
             raise SourceError(
                 f"{bucket_url!r} does not exist or is not readable"
             ) from exc
+        except Exception as exc:
+            # PermissionError locally; botocore, gcsfs and adlfs each raise
+            # their own on a denied or unreachable bucket. All are the
+            # caller's configuration or access, not a bug, so all become the
+            # error the API turns into a 400 rather than a 500.
+            raise SourceError(f"could not list {bucket_url!r}: {scrub(exc)}") from exc
         items = []
         for entry in entries:
             full = entry.get("name") or ""
@@ -331,10 +339,14 @@ def resolve_location(name, spec, *, allowed=frozenset(SCHEME_REQUIREMENTS)):
                 f"file) or a 'bucket_url'."
             )
         head, _, tail = path.rpartition("/")
-        # `head` is empty for a bare name (`orders.csv`) and ends in `:/` when
-        # the tail is the bucket itself (`s3://my.bucket`). Neither names a
-        # file inside a directory, and defaulting to `/` turned the first into
-        # a read from the filesystem root.
+        # A leading slash is the filesystem root (`/*.jsonl` lists `/`), and
+        # dlt's own `file:///x` spelling leaves `file://` as the head. A bare
+        # name with no slash at all is relative and is refused below; `head`
+        # ending in `:/` means the tail is the bucket itself (`s3://my.bucket`).
+        if not head and path.startswith("/"):
+            head = "/"
+        elif head == "file://":
+            head = "file:///"
         below_root = bool(head) and not head.endswith(":/")
         if below_root and (
             any(character in tail for character in GLOB_CHARACTERS)
@@ -446,7 +458,7 @@ def bucket_credentials(bucket_url, credentials):
                 f"role; got {type(credentials).__name__}."
             )
         return AwsCredentials(**values)
-    if credentials is None or isinstance(credentials, str | dict):
+    if credentials is None or isinstance(credentials, str | Mapping):
         raise ConfigurationError(
             f"{scheme}:// needs the Connection's auth backend to return a dlt "
             f"credential spec or an fsspec filesystem; a bare mapping is not "

@@ -1948,3 +1948,24 @@ def test_sheets_unpivots_one_column_per_stage_into_one_row_per_stage(
         ("o1", "received", "01/03/2024"),
         ("o2", "received", "03/03/2024"),
     ]
+
+
+def test_sheets_tab_listing_pages(sheets_server, google_connection, settings):
+    api = sheets_server(FakeSheets({}))
+    api.sheet_titles = ["A", "B", "C"]
+    settings.DJANGO_CONNECTORS = {
+        **settings.DJANGO_CONNECTORS,
+        "DISCOVERY_PAGE_SIZE": 2,
+    }
+    source = LoopbackSheetsSource()
+    first = source.discover(
+        connection=google_connection(), credentials="ya29.test", path="spreadsheet/s1"
+    )
+    assert [i["name"] for i in first["items"]] == ["A", "B"]
+    second = source.discover(
+        connection=google_connection(),
+        credentials="ya29.test",
+        path="spreadsheet/s1",
+        cursor=first["next_cursor"],
+    )
+    assert [i["name"] for i in second["items"]] == ["C"]

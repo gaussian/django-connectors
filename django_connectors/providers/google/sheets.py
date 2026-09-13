@@ -371,7 +371,7 @@ class GoogleSheetsSource(SourceDefinition):
         """
         kind, _, target = (path or "").partition("/")
         if kind == "spreadsheet" and target:
-            return self._discover_tabs(credentials, target, query)
+            return self._discover_tabs(credentials, target, query, cursor, limit)
         if kind == "folder" and target:
             parent = target
         elif not path:
@@ -432,7 +432,7 @@ class GoogleSheetsSource(SourceDefinition):
             )
         return {"items": items, "next_cursor": payload.get("nextPageToken") or None}
 
-    def _discover_tabs(self, credentials, spreadsheet_id, query):
+    def _discover_tabs(self, credentials, spreadsheet_id, query, cursor, limit):
         assert_drive_id(spreadsheet_id)
         client = google_client(base_url=self.api_base_url, credentials=credentials)
         payload = google_json(
@@ -461,7 +461,7 @@ class GoogleSheetsSource(SourceDefinition):
                     "columns": grid.get("columnCount"),
                 }
             )
-        return discovery_page(items, query=query)
+        return discovery_page(items, cursor=cursor, limit=limit, query=query)
 
 
 # --- configuration helpers -------------------------------------------------

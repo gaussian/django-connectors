@@ -1007,3 +1007,22 @@ def test_sql_and_rest_read_a_credentials_mapping_not_only_a_dict():
 
     assert sql_module._credentials_url(Credentials(url="sqlite://")) == "sqlite://"
     assert rest_source._token(Credentials(access_token="t")) == "t"
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("/*.jsonl", ("file:///", "*.jsonl")),
+        ("file:///*.csv", ("file:///", "*.csv")),
+        ("/one.jsonl", ("file:///", "one.jsonl")),
+    ],
+)
+def test_a_root_level_glob_or_file_lists_the_root(path, expected):
+    assert filesystem_source.resolve_location("r", {"path": path}) == expected
+
+
+def test_other_buckets_refuse_a_credentials_mapping_too():
+    from django_connectors.auth.base import Credentials
+
+    with pytest.raises(ConfigurationError, match="credential spec or an fsspec"):
+        filesystem_source.bucket_credentials("gs://b/x", Credentials(token="t"))

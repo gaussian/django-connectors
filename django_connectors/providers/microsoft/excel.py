@@ -238,7 +238,16 @@ class EntraExcelSource(EntraFilesSource):
         if glob is not None and not isinstance(glob, str):
             raise ConfigurationError("'name_glob' must be a string like '*.xlsx'.")
         if "unpivot" in config:
-            validate_unpivot(config["unpivot"], primary_key=self.key_columns(config))
+            # The landed merge key carries the file and sheet as well as the
+            # customer's columns; an unpivot must leave all of them standing.
+            validate_unpivot(
+                config["unpivot"],
+                primary_key=(
+                    FILE_ID_COLUMN,
+                    SHEET_NAME_COLUMN,
+                    *self.key_columns(config),
+                ),
+            )
         return None
 
     def reshape_for(self, resource_name, binding):
@@ -329,7 +338,20 @@ class EntraExcelSource(EntraFilesSource):
         downloaded and re-parsed for nothing.
         """
         if config.get("item_id"):
-            item = self.single_item(config, session=session)
+            item = item_record(
+                self.single_item(config, session=session),
+                drive_id=config.get("drive_id") or "",
+            )
+            name = item.get("name") or ""
+            if not is_parsable_workbook(name):
+                # Explicitly named, so silence would mean "synced nothing,
+                # reported success" — the worst possible answer.
+                raise SourceError(
+                    f"driveItem {config['item_id']!r} is named {name!r}, which "
+                    f"openpyxl cannot read. Supported: "
+                    f"{', '.join(SUPPORTED_EXTENSIONS)}; legacy .xls and binary "
+                    f".xlsb are not, and would have to be re-saved."
+                )
             # Replace mode always re-reads: the table is being rebuilt, so
             # skipping an unchanged workbook would empty it instead.
             if keyed and not self.content_changed(item):
@@ -346,24 +368,6 @@ class EntraExcelSource(EntraFilesSource):
                 continue
             if is_parsable_workbook(record.get("name")):
                 yield record
-
-    def single_item(self, config, *, session):
-        """The one workbook named by ``item_id``, refused if openpyxl cannot read it."""
-        item = item_record(
-            super().single_item(config, session=session),
-            drive_id=config.get("drive_id") or "",
-        )
-        name = item.get("name") or ""
-        if not is_parsable_workbook(name):
-            # Explicitly named, so silence would mean "synced nothing, reported
-            # success" — the worst possible answer.
-            raise SourceError(
-                f"driveItem {config['item_id']!r} is named {name!r}, which "
-                f"openpyxl cannot read. Supported: "
-                f"{', '.join(SUPPORTED_EXTENSIONS)}; legacy .xls and binary "
-                f".xlsb are not, and would have to be re-saved."
-            )
-        return item
 
     def content_changed(self, item):
         """Whether this workbook's content differs from the last run's.

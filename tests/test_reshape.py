@@ -356,3 +356,41 @@ def test_sheets_refuses_an_unpivot_that_consumes_the_key_column_at_save_time():
                 },
             }
         )
+
+
+def test_a_case_with_every_stage_cleared_replaces_its_rows_with_nulls(
+    connectors_settings, make_binding
+):
+    """Absent from the package, the case would keep its old stage rows."""
+    cleared = {**WIDE, "received_at": "", "approved_at": None, "shipped_at": ""}
+    binding = make_binding(
+        source="wide",
+        config=memory_config(
+            batches=[[WIDE], [cleared]], primary_key="case", unpivot=SPEC
+        ),
+    )
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert _landed(binding) == [
+        ("C1", "approved_at", None),
+        ("C1", "received_at", None),
+        ("C1", "shipped_at", None),
+    ]
+
+
+def test_excel_checks_the_whole_landed_key_at_save_time():
+    from django_connectors.providers.microsoft.excel import EntraExcelSource
+
+    with pytest.raises(ConfigurationError, match="_file_id"):
+        EntraExcelSource().validate_config(
+            {
+                "drive_id": "d1",
+                "key_columns": ["order"],
+                "unpivot": {
+                    "columns": ["a"],
+                    "name_to": "s",
+                    "value_to": "v",
+                    "keep": ["order"],
+                },
+            }
+        )
