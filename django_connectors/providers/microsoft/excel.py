@@ -65,13 +65,9 @@ from django_connectors.providers.microsoft.files import (
     DEFAULT_TIMEOUT_SECONDS,
     EntraFilesSource,
     access_token,
-    assert_graph_id,
+    assert_single_item,
     download_item_content,
-    drive_address,
-    graph_request,
     graph_session,
-    item_record,
-    raise_for_graph_error,
 )
 from django_connectors.sources.base import as_config
 from django_connectors.sources.reshape import validate_unpivot
@@ -158,7 +154,7 @@ class EntraExcelSource(EntraFilesSource):
 
         item_id = config.get("item_id")
         if item_id:
-            assert_single_workbook(config)
+            assert_single_item(config)
 
         resource = config.get("resource", DEFAULT_RESOURCE)
         if not isinstance(resource, str) or not resource:
@@ -350,12 +346,8 @@ class EntraExcelSource(EntraFilesSource):
                 yield record
 
     def single_item(self, config, *, session):
-        """Metadata for the one workbook a Binding names with ``item_id``."""
-        base = self.base_url(config)
-        url = f"{base}/{drive_address(config)}/items/{config['item_id']}"
-        response = graph_request(session, "GET", url)
-        raise_for_graph_error(response, what=f"workbook {config['item_id']!r}")
-        item = item_record(response.json(), drive_id=config.get("drive_id") or "")
+        """The one workbook named by ``item_id``, refused if openpyxl cannot read it."""
+        item = super().single_item(config, session=session)
         name = item.get("name") or ""
         if not is_parsable_workbook(name):
             # Explicitly named, so silence would mean "synced nothing, reported
@@ -744,20 +736,6 @@ def normalized_sheets(config):
             "'sheets' must be a list of worksheet names (or use 'sheet' for one)."
         )
     return sheets
-
-
-def assert_single_workbook(config):
-    """``item_id`` names one workbook, so folder narrowing is meaningless."""
-    assert_graph_id("item_id", config["item_id"])
-    conflicting = sorted(
-        key for key in ("folder_path", "folder_item_id", "name_glob") if config.get(key)
-    )
-    if conflicting:
-        raise ConfigurationError(
-            f"'item_id' names one workbook, so {conflicting} cannot also apply. "
-            f"Drop 'item_id' to sync a folder, or drop {conflicting} to sync "
-            f"that one file."
-        )
 
 
 def _fit(row, width):

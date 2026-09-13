@@ -220,6 +220,20 @@ If a customer needs several tables joined into one logical record, that shaping
 belongs upstream — in their own SQL view, or in the dlt source — not in a
 projection DSL slowly growing into a query planner.
 
+## File bytes are fetched on request, never landed
+
+A landing column is the wrong place for a 40MB document: every merge rewrites
+the blob, it exceeds MySQL's ``TEXT`` limit and wedges the load package, and
+landing tables are sampled and previewed in a UI. So file sources land
+*metadata*, and a host that needs the file itself asks for it:
+``services.content.fetch_record_content(binding, resource, reference)``.
+The source that landed the record fetches it, with the Connection's
+credentials resolved as a Run resolves them, under ``CONTENT_MAX_BYTES``. A
+source says whether it has anything to give (``provides_content``); a query
+result or a spreadsheet range does not. This is the supported route — not a
+provider-private download function and a hand-built session, which is the
+boundary leaking in the direction this library exists to prevent.
+
 ## Reshaping happens at the source, not after landing
 
 One case is common enough to deserve its own mechanism: a spreadsheet with one

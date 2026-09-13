@@ -66,6 +66,11 @@ DEFAULTS: dict[str, Any] = {
     "PREVIEW_MAX_ROWS": 50,
     "SAMPLE_MAX_ROWS": 100,
     "PREVIEW_MAX_BYTES": 1024 * 1024,
+    # --- content -----------------------------------------------------------
+    # Ceiling on one fetch_record_content() call. A worker's memory is finite
+    # and "the customer uploaded a 4GB video into the reports folder" is a
+    # Tuesday; a host asking for more than this gets the ceiling.
+    "CONTENT_MAX_BYTES": 32 * 1024 * 1024,
     # --- webhooks ----------------------------------------------------------
     "WEBHOOK_MAX_BODY_BYTES": 64 * 1024,
     "WEBHOOK_DEDUPE_TTL": dt.timedelta(minutes=10),

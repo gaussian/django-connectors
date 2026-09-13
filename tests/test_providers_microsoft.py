@@ -72,6 +72,10 @@ from django_connectors.providers.microsoft.files import EntraFilesSource  # noqa
 from django_connectors.secrets import SecretStore  # noqa: E402
 from django_connectors.services import bindings as binding_services  # noqa: E402
 from django_connectors.services import runs as run_services  # noqa: E402
+from django_connectors.services.content import (  # noqa: E402
+    FetchedContent,
+    fetch_record_content,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -1393,7 +1397,7 @@ def test_excel_refuses_a_positional_merge_configuration():
 
 
 def test_excel_item_id_and_folder_narrowing_are_mutually_exclusive():
-    with pytest.raises(ConfigurationError, match="one workbook"):
+    with pytest.raises(ConfigurationError, match="one item"):
         EntraExcelSource().validate_config(
             {"drive_id": DRIVE_ID, "item_id": "X1", "folder_path": "/Finance"}
         )
@@ -1881,3 +1885,82 @@ def test_the_registry_can_resolve_every_shipped_microsoft_class(microsoft_settin
     else:  # pragma: no cover - guards the assertion above from being vacuous
         raise AssertionError("import_string did not fail for a missing name")
     assert ImproperlyConfigured  # imported for the registry contract above
+
+
+# --- content, and one item by id ----------------------------------------------
+
+
+def test_the_file_source_fetches_a_landed_items_bytes(
+    microsoft_settings, make_graph_binding, graph
+):
+    graph.seed(ROOT_ITEM, drive_item("F1", "report.pdf"))
+    graph.files["F1"] = b"%PDF-1.7 hello"
+    binding = make_graph_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    row = next(
+        iter(
+            access.iter_rows(
+                access.binding_relation(binding, "drive_items"), binding=binding
+            )
+        )
+    )
+
+    fetched = fetch_record_content(
+        binding, "drive_items", {"id": row["id"], "drive_id": row["drive_id"]}
+    )
+    assert isinstance(fetched, FetchedContent)
+    assert fetched.data == b"%PDF-1.7 hello"
+    assert fetched.size == 14
+    assert fetched.content_type == "application/octet-stream"
+
+
+def test_the_ceiling_holds_whatever_the_host_asks_for(
+    microsoft_settings, make_graph_binding, graph, settings
+):
+    graph.seed(ROOT_ITEM, drive_item("F1", "big.bin"))
+    graph.files["F1"] = b"x" * 100
+    settings.DJANGO_CONNECTORS = {**settings.DJANGO_CONNECTORS, "CONTENT_MAX_BYTES": 50}
+    binding = make_graph_binding()
+    for asked in (None, 0, 10_000):
+        with pytest.raises(SourceError, match="limit"):
+            fetch_record_content(binding, "drive_items", {"id": "F1"}, max_bytes=asked)
+
+
+def test_a_reference_missing_the_columns_is_named(
+    microsoft_settings, make_graph_binding, graph
+):
+    binding = make_graph_binding(drive_id=None, site_id="contoso.sharepoint.com,1,2")
+    with pytest.raises(SourceError, match="'id' and 'drive_id'"):
+        fetch_record_content(binding, "drive_items", {"id": "F1"})
+
+
+def test_a_single_item_binding_lands_that_item_only(
+    microsoft_settings, make_graph_binding, graph
+):
+    graph.seed(ROOT_ITEM, drive_item("F1", "one.pdf"), drive_item("F2", "two.pdf"))
+    binding = make_graph_binding(item_id="F1")
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "succeeded", run.error_message
+    rows = list(
+        access.iter_rows(
+            access.binding_relation(binding, "drive_items"), binding=binding
+        )
+    )
+    assert [r["id"] for r in rows] == ["F1"]
+
+
+def test_a_deleted_single_item_lands_as_a_tombstone(
+    microsoft_settings, make_graph_binding, graph
+):
+    graph.seed(ROOT_ITEM, drive_item("F1", "one.pdf"))
+    binding = make_graph_binding(item_id="F1")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    del graph.items["F1"]
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == "succeeded", second.error_message
+    rows = list(
+        access.iter_rows(
+            access.binding_relation(binding, "drive_items"), binding=binding
+        )
+    )
+    assert len(rows) == 1 and bool(rows[0][DELETED_COLUMN]) is True

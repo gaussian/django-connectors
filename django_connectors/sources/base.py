@@ -33,6 +33,11 @@ class SourceDefinition:
     #: the source whose data it announces.
     webhook = None
 
+    #: Whether :meth:`fetch_content` can return the bytes behind a landed
+    #: record. False for row-shaped sources (a query result, a spreadsheet
+    #: range): there is nothing behind a row but the row.
+    provides_content = False
+
     #: Whether this source can detect remote deletions and emit tombstones.
     #: False for every cursor-based source (REST, warehouse): a remote deletion
     #: emits nothing at all, so deletion propagation is genuinely unsupported
@@ -102,6 +107,19 @@ class SourceDefinition:
         surfaces as a PipelineStepFailed in a customer's Run.
         """
         return None
+
+    def fetch_content(self, *, binding, credentials, resource, reference, max_bytes):
+        """Return ``(bytes, content_type)`` for the record `reference` names.
+
+        File bytes are never landed — a landing column is the wrong place for
+        a 40MB document — but a host that lands file *metadata* needs the file
+        itself to do anything with it. This is the supported way to get it.
+        `reference` is a mapping of the landed columns the source needs to
+        address the content (documented per source: a driveItem id and its
+        drive, say); the host has those because its own mapping put them in
+        the record. `max_bytes` is not advisory.
+        """
+        raise SourceError(f"source {self.key!r} does not expose record content")
 
     def check_connection(self, *, connection, credentials):
         """Cheaply verify the credentials work. Return a short status string."""

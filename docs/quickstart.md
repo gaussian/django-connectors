@@ -77,6 +77,19 @@ register_target(TargetDefinition(
 ))
 ```
 
+A target that stores files gets the bytes on request — landed rows carry
+file *metadata*, never content:
+
+```python
+from django_connectors.services import content
+
+fetched = content.fetch_record_content(
+    Binding.objects.get(pk=context.binding_id), "drive_items",
+    {"id": record.values["item_id"], "drive_id": record.values["drive_id"]},
+)
+fetched.data, fetched.content_type   # under CONTENT_MAX_BYTES
+```
+
 Three rules the runner relies on:
 
 - **Be idempotent per identity.** A raised exception means the batch was not

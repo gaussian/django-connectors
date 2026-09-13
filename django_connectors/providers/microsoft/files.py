@@ -152,6 +152,9 @@ class EntraFilesSource(SourceDefinition):
 
     #: Delta reports deletions, which is what makes tombstones honest here.
     emits_tombstones = True
+    #: ``fetch_content`` downloads a driveItem; `reference` needs the landed
+    #: ``id`` and ``drive_id`` columns.
+    provides_content = True
 
     #: Opt-in escape hatch for a non-Microsoft Graph endpoint — a recorded-proxy
     #: test harness, or a cloud Microsoft has not shipped yet. A class attribute
@@ -164,6 +167,8 @@ class EntraFilesSource(SourceDefinition):
         """Reject a configuration that could not run, at Binding save time."""
         config = as_config(config)
         self.validate_location(config)
+        if config.get("item_id"):
+            assert_single_item(config)
 
         resource = config.get("resource", DEFAULT_RESOURCE)
         if not isinstance(resource, str) or not resource:
@@ -282,9 +287,20 @@ class EntraFilesSource(SourceDefinition):
         Excel source downloads every changed workbook — reuse one connection
         pool and one token rather than opening a second session per item.
         """
-        state = self.delta_state() if use_state else None
         owned = session is None
         session = session or graph_session(token, timeout=self.timeout(config))
+        if config.get("item_id"):
+            # One file, by id. No delta: the item's own metadata is the whole
+            # feed, and a 404 is the deletion — emitted as a tombstone so the
+            # row does not outlive the file.
+            try:
+                yield self.single_item_record(config, session=session)
+            finally:
+                if owned:
+                    session.close()
+            return
+
+        state = self.delta_state() if use_state else None
         base = self.base_url(config)
         scope = delta_scope(config)
         first_url = self.initial_delta_url(config, base=base, scope=scope)
@@ -369,6 +385,48 @@ class EntraFilesSource(SourceDefinition):
             return tombstone({"id": item["id"]})
 
         return item_record(item, drive_id=config.get("drive_id") or "")
+
+    def single_item(self, config, *, session):
+        """Metadata for the one driveItem a Binding names with ``item_id``."""
+        base = self.base_url(config)
+        url = f"{base}/{drive_address(config)}/items/{config['item_id']}"
+        response = graph_request(session, "GET", url)
+        raise_for_graph_error(response, what=f"driveItem {config['item_id']!r}")
+        return item_record(response.json(), drive_id=config.get("drive_id") or "")
+
+    def single_item_record(self, config, *, session):
+        """The single item's record, or its tombstone when Graph says it is gone."""
+        try:
+            return self.single_item(config, session=session)
+        except SourceError as exc:
+            if "could not find" not in str(exc):
+                raise
+            return tombstone({"id": config["item_id"]})
+
+    def fetch_content(self, *, binding, credentials, resource, reference, max_bytes):
+        """Download one driveItem. `reference` carries the landed ``id`` and
+        ``drive_id``; the Binding's configured drive is the fallback."""
+        config = binding.config or {}
+        item_id = reference.get("id")
+        drive_id = reference.get("drive_id") or config.get("drive_id")
+        if not item_id or not drive_id:
+            raise SourceError(
+                "fetch_content needs the landed 'id' and 'drive_id' columns in "
+                "`reference` to address a driveItem"
+            )
+        assert_graph_id("id", str(item_id))
+        assert_graph_id("drive_id", str(drive_id))
+        session = graph_session(access_token(credentials), timeout=self.timeout(config))
+        try:
+            return download_item(
+                session,
+                base_url=self.base_url(config),
+                drive_id=drive_id,
+                item_id=item_id,
+                max_bytes=max_bytes,
+            )
+        finally:
+            session.close()
 
     def delta_state(self):
         """dlt's per-resource state dict, which only persists on a good load."""
@@ -669,7 +727,22 @@ def raise_for_graph_error(response, *, what):
 def download_item_content(
     session, *, base_url, drive_id, item_id, max_bytes, chunk_size=1 << 16
 ):
-    """Return the bytes of one ``driveItem``. The documented content hook.
+    """The bytes of one ``driveItem``; see :func:`download_item`."""
+    data, _ = download_item(
+        session,
+        base_url=base_url,
+        drive_id=drive_id,
+        item_id=item_id,
+        max_bytes=max_bytes,
+        chunk_size=chunk_size,
+    )
+    return data
+
+
+def download_item(
+    session, *, base_url, drive_id, item_id, max_bytes, chunk_size=1 << 16
+):
+    """Return ``(bytes, content_type)`` of one ``driveItem``. The content hook.
 
     Deliberately *not* wired into the resource: file bytes must never become a
     landing column (see the module docstring). Callers that need content — the
@@ -705,7 +778,7 @@ def download_item_content(
                     f"while downloading; the transfer was abandoned."
                 )
             chunks.append(chunk)
-        return b"".join(chunks)
+        return b"".join(chunks), response.headers.get("Content-Type")
     finally:
         response.close()
 
@@ -838,6 +911,20 @@ def assert_graph_id(field, value):
             f"characters and may not contain '/', '\\', '?', '#', '%' or "
             f"whitespace — those would change which resource the request "
             f"addresses rather than which item."
+        )
+
+
+def assert_single_item(config):
+    """``item_id`` names one item, so folder narrowing is meaningless."""
+    assert_graph_id("item_id", config["item_id"])
+    conflicting = sorted(
+        key for key in ("folder_path", "folder_item_id", "name_glob") if config.get(key)
+    )
+    if conflicting:
+        raise ConfigurationError(
+            f"'item_id' names one item, so {conflicting} cannot also apply. "
+            f"Drop 'item_id' to sync a folder, or drop {conflicting} to sync "
+            f"that one item."
         )
 
 
