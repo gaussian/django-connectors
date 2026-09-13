@@ -61,7 +61,7 @@ from django_connectors.exceptions import (
     CredentialsRevoked,
     SourceError,
 )
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config
 from django_connectors.sources.memory import tombstone
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -156,7 +156,7 @@ class EntraFilesSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run, at Binding save time."""
-        config = config or {}
+        config = as_config(config)
         self.validate_location(config)
 
         resource = config.get("resource", DEFAULT_RESOURCE)

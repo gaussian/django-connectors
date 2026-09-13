@@ -26,7 +26,7 @@ from typing import ClassVar
 from urllib.parse import urlsplit
 
 from django_connectors.exceptions import ConfigurationError
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config
 
 # format -> (module it needs at read time, the extra that installs it).
 # None means "core dlt is enough".
@@ -55,7 +55,7 @@ class FilesystemSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run — including a missing extra."""
-        resources = (config or {}).get("resources")
+        resources = as_config(config).get("resources")
         if not isinstance(resources, dict) or not resources:
             raise ConfigurationError(
                 "filesystem source config needs a non-empty 'resources' mapping "

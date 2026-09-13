@@ -13,7 +13,7 @@ package because it costs ~0.6s per interpreter start.
 
 from typing import ClassVar
 
-from django_connectors.exceptions import SourceError
+from django_connectors.exceptions import ConfigurationError, SourceError
 
 
 class SourceDefinition:
@@ -94,3 +94,22 @@ class SourceDefinition:
 
     def __str__(self):
         return self.key or type(self).__name__
+
+
+def as_config(config):
+    """Return `config` as a dict, or explain that it is not one.
+
+    ``Binding.config`` is a JSON field, so a string or a number is a value the
+    database will happily store. Every source reads the config with ``.get``,
+    and a bare ``AttributeError`` from inside ``validate_config`` is not a form
+    error the Binding editor can show — it is a 500. Sources call this first so
+    the wrong shape is refused with the same exception as every other
+    configuration problem.
+    """
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise ConfigurationError(
+            f"source config must be a JSON object, got {type(config).__name__}"
+        )
+    return config

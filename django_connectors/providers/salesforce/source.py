@@ -81,7 +81,7 @@ from django_connectors.providers.salesforce.auth import (
     error_codes,
     parse_api_errors,
 )
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config
 from django_connectors.sources.memory import tombstone
 
 DEFAULT_API_VERSION = "60.0"
@@ -198,7 +198,7 @@ class SalesforceSource(SourceDefinition):
     # --- configuration -----------------------------------------------------
 
     def validate_config(self, config):
-        config = config or {}
+        config = as_config(config)
 
         version = api_version(config)
         if not API_VERSION_RE.match(version):

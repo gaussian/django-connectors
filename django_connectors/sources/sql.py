@@ -33,7 +33,7 @@ from typing import ClassVar
 
 from django_connectors.errors import scrub
 from django_connectors.exceptions import ConfigurationError, SourceError
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config
 
 # Bare identifiers only. Anything interpolated into a statement must match this;
 # everything else travels as a bound parameter.
@@ -71,7 +71,7 @@ class SqlSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run, or would land wrong data."""
-        config = config or {}
+        config = as_config(config)
 
         backend = config.get("backend", "sqlalchemy")
         if backend != "sqlalchemy":

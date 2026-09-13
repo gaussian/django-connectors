@@ -59,7 +59,7 @@ from django_connectors.providers.google.auth import (
     paginate,
     raise_for_google_error,
 )
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class GmailSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run, or would land wrong data."""
-        config = config or {}
+        config = as_config(config)
 
         user_id = config.get("user_id", "me")
         if not isinstance(user_id, str) or not user_id:

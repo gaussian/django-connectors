@@ -59,7 +59,7 @@ from django_connectors.providers.google.auth import (
     google_client,
     google_json,
 )
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,7 @@ class GoogleSheetsSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run, or would land wrong data."""
-        config = config or {}
+        config = as_config(config)
 
         spreadsheet_id = config.get("spreadsheet_id")
         if not isinstance(spreadsheet_id, str) or not spreadsheet_id:

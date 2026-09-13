@@ -30,7 +30,7 @@ batch yields nothing, which is what an unchanged remote source looks like.
 
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.landing.naming import DELETED_COLUMN
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config
 
 BATCH_INDEX_STATE_KEY = "memory_batch_index"
 
@@ -43,7 +43,7 @@ class MemorySource(SourceDefinition):
     emits_tombstones = True
 
     def validate_config(self, config):
-        resources = (config or {}).get("resources")
+        resources = as_config(config).get("resources")
         if not isinstance(resources, dict) or not resources:
             raise ConfigurationError(
                 "memory source config needs a non-empty 'resources' mapping"

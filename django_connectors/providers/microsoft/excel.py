@@ -73,6 +73,7 @@ from django_connectors.providers.microsoft.files import (
     item_record,
     raise_for_graph_error,
 )
+from django_connectors.sources.base import as_config
 
 DEFAULT_RESOURCE = "worksheet_rows"
 
@@ -151,7 +152,7 @@ class EntraExcelSource(EntraFilesSource):
     # --- configuration -----------------------------------------------------
 
     def validate_config(self, config):
-        config = config or {}
+        config = as_config(config)
         self.validate_location(config)
 
         item_id = config.get("item_id")

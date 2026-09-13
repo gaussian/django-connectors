@@ -50,7 +50,7 @@ from django_connectors.exceptions import (
     ConnectorError,
     SourceError,
 )
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config
 
 # Only these two reach a network the way a customer expects. `file:`, `ftp:` and
 # friends turn a "call an API" feature into "read the worker's filesystem".
@@ -156,7 +156,7 @@ class RestSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration the Binding editor should never be able to save."""
-        config = config or {}
+        config = as_config(config)
 
         base_url = config.get("base_url")
         if not isinstance(base_url, str) or not base_url:
