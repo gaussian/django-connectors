@@ -219,3 +219,15 @@ backends.
 If a customer needs several tables joined into one logical record, that shaping
 belongs upstream — in their own SQL view, or in the dlt source — not in a
 projection DSL slowly growing into a query planner.
+
+## Reshaping happens at the source, not after landing
+
+One case is common enough to deserve its own mechanism: a spreadsheet with one
+row per case and one column per stage. The projection is one row in, one
+record out, and for a spreadsheet there is no upstream — nothing sits between
+the sheet and this library. So the source is the upstream. A source declares
+an ``unpivot`` the way it declares a cursor (``reshape_for``), the landing
+layer applies it *before* the tenant metadata is stamped, and extends the
+merge key with the new stage column — one wide row is now several landed
+rows, and without the stage in the key they would merge back into one. Landing,
+merge, incremental projection and the mapping DSL then see ordinary rows.

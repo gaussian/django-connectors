@@ -61,6 +61,7 @@ from django_connectors.providers.google.auth import (
     google_json,
 )
 from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
+from django_connectors.sources.reshape import validate_unpivot
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,8 @@ class GoogleSheetsSource(SourceDefinition):
                 spec["key_column"], str
             ):
                 raise ConfigurationError(f"ranges.{name}.key_column must be a string")
+            if spec["unpivot"] is not None:
+                validate_unpivot(spec["unpivot"], where=f"ranges.{name}.unpivot")
             # Without a header row the columns are named column_1..N, which a
             # key_column could legitimately name — but a customer who wrote a
             # business name here has made a mistake worth catching at save time.
@@ -238,6 +241,13 @@ class GoogleSheetsSource(SourceDefinition):
                     f"Declare a key_column, or leave skip_unchanged off."
                 )
         return None
+
+    def reshape_for(self, resource_name, binding):
+        config = binding.config or {}
+        raw = (config.get("ranges") or {}).get(resource_name)
+        if raw is None:
+            return None
+        return range_spec(resource_name, raw, config)["unpivot"]
 
     def incremental_for(self, resource_name, binding):
         """Always ``None``. Sheets exposes no per-row cursor of any kind.
@@ -499,6 +509,7 @@ def range_spec(name, raw_spec, config):
         "key_column": raw_spec.get("key_column", config.get("key_column")),
         "header_row": bool(raw_spec.get("header_row", config.get("header_row", True))),
         "missing_key": raw_spec.get("missing_key", config.get("missing_key", "error")),
+        "unpivot": raw_spec.get("unpivot", config.get("unpivot")),
     }
 
 

@@ -73,6 +73,16 @@ class SourceDefinition:
         """
         return None
 
+    def reshape_for(self, resource_name, binding):
+        """An ``unpivot`` spec for a resource, or None to land rows as they are.
+
+        Declared the way a cursor is: the source says *what* to reshape and
+        the landing layer applies it — before the tenant metadata is stamped,
+        and with the merge key extended by the new name column so the rows one
+        wide row becomes do not merge back into one. See ``sources.reshape``.
+        """
+        return None
+
     def validate_config(self, config):
         """Raise ``ConfigurationError`` if `config` is unusable.
 

@@ -183,6 +183,18 @@ than the way databases do — a spreadsheet's `03/04/2024`, a CSV's `£1,234.56`
 `strip` and `decimal_separator` to `integer`, `decimal` and `float`. A bad
 option is a validation error naming the field, not a failed run.
 
+A sheet with one row per case and one **column** per stage is reshaped at the
+source, so the mapping sees one row per stage:
+
+```python
+"ranges": {"orders": {"range": "Orders!A:F", "key_column": "order_id",
+           "unpivot": {"columns": ["received", "approved", "shipped"],
+                       "name_to": "stage", "value_to": "on"}}}
+```
+
+The merge key becomes `(order_id, stage)`; map identity from both. The same
+`unpivot` key works on the Excel, filesystem, SQL, REST and memory sources.
+
 ```python
 projections.validate_projection(projection)   # errors and warnings, by field
 projections.preview_projection(projection)    # real rows, writer never called

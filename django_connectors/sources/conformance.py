@@ -57,6 +57,7 @@ def static_problems(definition):
     problems += _incremental_problems(definition)
     problems += _webhook_problems(definition)
     problems += _discover_problems(definition)
+    problems += _reshape_problems(definition)
     return problems
 
 
@@ -214,5 +215,18 @@ def _discover_problems(definition):
             f"`discover` does not accept {missing}; every source takes "
             f"{list(DISCOVER_KWARGS)} as keyword arguments so one UI can browse "
             f"them all"
+        ]
+    return []
+
+
+def _reshape_problems(definition):
+    binding = SimpleNamespace(config={}, source=definition.key, resources=[])
+    try:
+        result = definition.reshape_for("resource", binding)
+    except Exception as exc:
+        return [f"reshape_for() raised {type(exc).__name__} on an empty config: {exc}"]
+    if result is not None and not isinstance(result, dict):
+        return [
+            f"reshape_for() must return None or an unpivot spec dict, got {type(result).__name__}"
         ]
     return []

@@ -74,6 +74,7 @@ from django_connectors.providers.microsoft.files import (
     raise_for_graph_error,
 )
 from django_connectors.sources.base import as_config
+from django_connectors.sources.reshape import validate_unpivot
 
 DEFAULT_RESOURCE = "worksheet_rows"
 
@@ -239,7 +240,15 @@ class EntraExcelSource(EntraFilesSource):
         glob = config.get("name_glob")
         if glob is not None and not isinstance(glob, str):
             raise ConfigurationError("'name_glob' must be a string like '*.xlsx'.")
+        if "unpivot" in config:
+            validate_unpivot(config["unpivot"])
         return None
+
+    def reshape_for(self, resource_name, binding):
+        config = binding.config or {}
+        if resource_name != config.get("resource", DEFAULT_RESOURCE):
+            return None
+        return config.get("unpivot")
 
     # --- extraction --------------------------------------------------------
 

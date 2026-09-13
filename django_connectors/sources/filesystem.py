@@ -47,6 +47,7 @@ from urllib.parse import urlsplit
 from django_connectors.auth.base import credential_value
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
+from django_connectors.sources.reshape import validate_unpivot
 
 # format -> (module it needs at read time, the extra that installs it).
 # None means "core dlt is enough".
@@ -140,7 +141,13 @@ class FilesystemSource(SourceDefinition):
                     f"'primary_key'. Without a stable key, re-reading a file "
                     f"appends every row again instead of updating it."
                 )
+            if "unpivot" in spec:
+                validate_unpivot(spec["unpivot"], where=f"resources.{name}.unpivot")
         return None
+
+    def reshape_for(self, resource_name, binding):
+        spec = ((binding.config or {}).get("resources") or {}).get(resource_name) or {}
+        return spec.get("unpivot")
 
     # --- extraction --------------------------------------------------------
 

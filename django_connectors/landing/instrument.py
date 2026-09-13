@@ -153,17 +153,36 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
         resource._hints.get("write_disposition"), resource.name, declared_primary_key
     )
 
+    reshape = (
+        source_definition.reshape_for(resource.name, binding)
+        if source_definition is not None
+        else None
+    )
+
     hints = {
         "table_name": table_name,
         "write_disposition": write_disposition,
         "columns": dict(METADATA_COLUMN_HINTS),
     }
     if write_disposition["disposition"] == "merge":
-        # Unconditional: the binding id always leads the merge identity.
-        hints["primary_key"] = (BINDING_ID_COLUMN, *declared_primary_key)
+        # Unconditional: the binding id always leads the merge identity. An
+        # unpivot adds its name column too — one wide row is now several landed
+        # rows, and without the stage in the key they would merge into one.
+        hints["primary_key"] = (
+            BINDING_ID_COLUMN,
+            *declared_primary_key,
+            *((reshape["name_to"],) if reshape else ()),
+        )
 
     incremental = _build_incremental(source_definition, resource.name, binding)
     if incremental is not None:
+        if reshape and _consumes_cursor(reshape, incremental):
+            raise SourceError(
+                f"resource {resource.name!r}: the incremental cursor "
+                f"{incremental.cursor_path!r} is one of the unpivoted columns, "
+                f"so it would not survive to the landed row. Keep it, or "
+                f"choose a cursor the unpivot does not consume."
+            )
         hints["incremental"] = incremental
         dedup_column = _dedup_sort_column(resource, incremental, write_disposition)
         if dedup_column:
@@ -171,9 +190,21 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
 
     resource.apply_hints(**hints)
 
+    # Reshape first, then stamp: the injector must see every row that lands.
+    if reshape:
+        from django_connectors.sources.reshape import unpivot, validate_unpivot
+
+        resource.add_yield_map(unpivot(validate_unpivot(reshape)))
     resource.add_map(make_metadata_injector(str(binding.id), str(run.id)))
 
     _assert_no_hard_delete(resource)
+
+
+def _consumes_cursor(reshape, incremental):
+    from django_connectors.sources.reshape import unpivoted_columns
+
+    cursor = str(getattr(incremental, "cursor_path", "") or "")
+    return bool(cursor) and cursor in unpivoted_columns(reshape, [cursor])
 
 
 def _normalize_write_disposition(declared, resource_name, primary_key):

@@ -35,6 +35,7 @@ from django_connectors.auth.base import first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
+from django_connectors.sources.reshape import validate_unpivot
 
 # Bare identifiers only. Anything interpolated into a statement must match this;
 # everything else travels as a bound parameter.
@@ -131,12 +132,20 @@ class SqlSource(SourceDefinition):
             raise ConfigurationError("'chunk_size' must be a positive integer")
 
         _validate_identifier(_resource_name(config), "resource")
+        if "unpivot" in config:
+            validate_unpivot(config["unpivot"])
         # Cheap and worth doing at save time whenever the DSN is known here.
         if config.get("url"):
             create_engine(config["url"]).dispose()
         return None
 
     # --- extraction --------------------------------------------------------
+
+    def reshape_for(self, resource_name, binding):
+        config = binding.config or {}
+        if resource_name != _resource_name(config):
+            return None
+        return config.get("unpivot")
 
     def incremental_for(self, resource_name, binding):
         """Cursor kwargs only. See ``SourceDefinition.incremental_for``."""

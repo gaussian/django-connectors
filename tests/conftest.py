@@ -113,12 +113,14 @@ def make_binding(make_connection):
 
 
 def memory_config(
-    *, resource="events", batches, primary_key="id", cursor=None, **extra
+    *, resource="events", batches, primary_key="id", cursor=None, unpivot=None, **extra
 ):
     """Build a MemorySource config for one resource."""
     spec = {"primary_key": primary_key, "batches": batches}
     if cursor:
         spec["cursor"] = cursor
+    if unpivot:
+        spec["unpivot"] = unpivot
     return {"resources": {resource: spec}, **extra}
 
 

@@ -1906,3 +1906,45 @@ def test_workspace_backend_refuses_an_empty_scope_list(
     )
     with pytest.raises(ConfigurationError, match="empty"):
         auth_backends.get("google_workspace").scopes_for(connection)
+
+
+# --- sheets: a wide sheet lands long ------------------------------------------
+
+
+def test_sheets_unpivots_one_column_per_stage_into_one_row_per_stage(
+    sheets_server, sheets_binding
+):
+    """The layout people actually use, and the projection is one row in, one out."""
+    sheets_server(
+        FakeSheets(
+            orders_grid(
+                [
+                    ["Order ID", "Received", "Approved", "Shipped"],
+                    ["o1", "01/03/2024", "02/03/2024", ""],
+                    ["o2", "03/03/2024", "", ""],
+                ]
+            )
+        )
+    )
+    binding = sheets_binding(
+        ranges={
+            "orders": {
+                "range": ORDERS_RANGE,
+                "key_column": "order_id",
+                "unpivot": {
+                    "columns": ["received", "approved", "shipped"],
+                    "name_to": "stage",
+                    "value_to": "on",
+                },
+            }
+        }
+    )
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    rows = access.iter_rows(access.binding_relation(binding, "orders"), binding=binding)
+    assert sorted((r["order_id"], r["stage"], r["on"]) for r in rows) == [
+        ("o1", "approved", "02/03/2024"),
+        ("o1", "received", "01/03/2024"),
+        ("o2", "received", "03/03/2024"),
+    ]

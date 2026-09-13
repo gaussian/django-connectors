@@ -31,6 +31,7 @@ batch yields nothing, which is what an unchanged remote source looks like.
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.landing.naming import DELETED_COLUMN
 from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
+from django_connectors.sources.reshape import validate_unpivot
 
 BATCH_INDEX_STATE_KEY = "memory_batch_index"
 
@@ -64,7 +65,13 @@ class MemorySource(SourceDefinition):
                     f"resource {name!r} uses merge disposition and must declare "
                     f"'primary_key'"
                 )
+            if "unpivot" in spec:
+                validate_unpivot(spec["unpivot"], where=f"resources.{name}.unpivot")
         return None
+
+    def reshape_for(self, resource_name, binding):
+        spec = ((binding.config or {}).get("resources") or {}).get(resource_name) or {}
+        return spec.get("unpivot")
 
     def incremental_for(self, resource_name, binding):
         spec = (binding.config or {}).get("resources", {}).get(resource_name) or {}
