@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from django_connectors.conf import conf
 from django_connectors.exceptions import SourceError
+from django_connectors.landing import access, schema
+from django_connectors.landing.naming import is_internal_column
 from django_connectors.registry import sources
 
 
@@ -31,8 +33,14 @@ def fetch_record_content(binding, resource, reference, *, max_bytes=None):
     """The content behind one landed record of `binding`'s `resource`.
 
     `reference` is what the source needs to address it — the landed columns
-    its docstring names. Raises ``SourceError`` for a source that has no
-    content to give, and for a payload over the ceiling.
+    its docstring names — and it must name a row this Binding actually
+    landed: the reference is checked against the landed table on the
+    resource's merge key before any credential is used. A host will sooner
+    or later build a reference from request input, and without that check a
+    caller scoped to one folder could fetch any item the tenant-wide token
+    can read. Raises ``SourceError`` for a source that has no content to
+    give, a reference that matches nothing landed, and a payload over the
+    ceiling.
     """
     from django_connectors.services.runs import _credentials_for
 
@@ -42,6 +50,8 @@ def fetch_record_content(binding, resource, reference, *, max_bytes=None):
             f"source {binding.source!r} lands rows with nothing behind them; "
             f"it does not provide record content"
         )
+    reference = dict(reference or {})
+    _assert_landed(binding, resource, reference)
     ceiling = int(conf.CONTENT_MAX_BYTES)
     limit = (
         ceiling
@@ -52,7 +62,49 @@ def fetch_record_content(binding, resource, reference, *, max_bytes=None):
         binding=binding,
         credentials=_credentials_for(binding.connection),
         resource=resource,
-        reference=dict(reference or {}),
+        reference=reference,
         max_bytes=limit,
     )
     return FetchedContent(data=bytes(data), content_type=content_type)
+
+
+def _assert_landed(binding, resource, reference):
+    """The reference must equal a landed row on the resource's merge key.
+
+    The merge key is read from the landed dlt schema, as the projection
+    validator reads it, and the rows are streamed rather than filtered in SQL:
+    a content fetch costs far more than a scan of one Binding's table, and a
+    Python comparison is the same on every dialect.
+    """
+    key = _merge_key(binding, resource)
+    missing = sorted(column for column in key if reference.get(column) in (None, ""))
+    if missing:
+        raise SourceError(
+            f"reference must carry the landed merge key column(s) {sorted(key)}; "
+            f"missing {missing}"
+        )
+    wanted = {column: str(reference[column]) for column in key}
+    relation = access.binding_relation(binding, resource)
+    for row in access.iter_rows(relation, binding=binding):
+        if all(str(row.get(column)) == value for column, value in wanted.items()):
+            return
+    raise SourceError(
+        f"no landed {resource!r} row of this binding matches {wanted}; content "
+        f"is fetched only for records this binding landed"
+    )
+
+
+def _merge_key(binding, resource):
+    try:
+        columns = schema.merge_key_for(binding, resource)
+    except KeyError:
+        raise SourceError(
+            f"resource {resource!r} has not landed for this binding"
+        ) from None
+    business = {name for name in columns or () if not is_internal_column(name)}
+    if not business:
+        raise SourceError(
+            f"resource {resource!r} has not landed with a merge key, so a "
+            f"reference cannot be matched to a landed row"
+        )
+    return business

@@ -104,6 +104,32 @@ def columns_for(binding, resource):
     return entry["columns"] if entry else {}
 
 
+def merge_key_for(binding, resource):
+    """A landed resource's merge identity (tenant column included), or None.
+
+    Read from the landed dlt schema rather than ``Binding.config``: where the
+    key is declared is source-specific, while ``instrument_source`` writes
+    exactly one merge identity into the schema for all of them. The landed
+    *tables* cannot answer, because the destination is configured with
+    ``create_primary_keys=False``. None means the resource has not landed, or
+    landed under append/replace and so has no merge key. Raises ``KeyError``
+    for a resource that has not landed.
+    """
+    from django_connectors.landing import access
+
+    if binding.landing_schema_at is None:
+        return None
+    table = access.binding_dataset(binding).schema.tables[
+        landing_table_name(binding.source, resource, binding.landing_key)
+    ]
+    columns = {
+        name
+        for name, column in (table.get("columns") or {}).items()
+        if (column or {}).get("primary_key")
+    }
+    return columns or None
+
+
 def variant_columns(columns, column_name):
     """Sibling columns dlt created when the source changed a column's type."""
     return sorted(

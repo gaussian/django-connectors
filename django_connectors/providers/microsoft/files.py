@@ -94,6 +94,9 @@ DEFAULT_TIMEOUT_SECONDS = 60
 
 #: Where the delta link lives in dlt's resource state.
 DELTA_STATE_KEY = "graph_delta"
+#: Set once a single-item Binding has landed its item, so a later 404 is a
+#: deletion rather than a misconfiguration.
+SINGLE_ITEM_SEEN_KEY = "single_item_seen"
 
 #: Statuses worth retrying in place. 429 is Graph's normal operating mode under
 #: load; 503/504 are its normal operating mode during a service update.
@@ -387,21 +390,39 @@ class EntraFilesSource(SourceDefinition):
         return item_record(item, drive_id=config.get("drive_id") or "")
 
     def single_item(self, config, *, session):
-        """Metadata for the one driveItem a Binding names with ``item_id``."""
+        """The raw Graph driveItem a Binding names with ``item_id``."""
         base = self.base_url(config)
         url = f"{base}/{drive_address(config)}/items/{config['item_id']}"
         response = graph_request(session, "GET", url)
         raise_for_graph_error(response, what=f"driveItem {config['item_id']!r}")
-        return item_record(response.json(), drive_id=config.get("drive_id") or "")
+        return response.json()
 
     def single_item_record(self, config, *, session):
-        """The single item's record, or its tombstone when Graph says it is gone."""
+        """The single item's record; its tombstone only once it has been seen.
+
+        A 404 on an item no run has landed is a wrong id or a wrong drive, and
+        landing a dead row for it would report success on a misconfiguration.
+        Whether the item was ever seen lives in dlt's resource state, which
+        only persists on a successful load.
+        """
+        state = self.delta_state()
         try:
-            return self.single_item(config, session=session)
+            item = self.single_item(config, session=session)
         except SourceError as exc:
-            if "could not find" not in str(exc):
+            if "could not find" not in str(exc) or not state.get(SINGLE_ITEM_SEEN_KEY):
                 raise
             return tombstone({"id": config["item_id"]})
+        record = self.record_for(item, config)
+        if record is None:
+            # record_for skips the drive root and, without include_folders,
+            # folders. Explicitly named, silence would mean "synced nothing".
+            raise SourceError(
+                f"driveItem {config['item_id']!r} is the drive root or a "
+                f"folder; name a file, or use 'folder_item_id' to sync a "
+                f"folder's contents."
+            )
+        state[SINGLE_ITEM_SEEN_KEY] = True
+        return record
 
     def fetch_content(self, *, binding, credentials, resource, reference, max_bytes):
         """Download one driveItem. `reference` carries the landed ``id`` and
@@ -414,8 +435,12 @@ class EntraFilesSource(SourceDefinition):
                 "fetch_content needs the landed 'id' and 'drive_id' columns in "
                 "`reference` to address a driveItem"
             )
-        assert_graph_id("id", str(item_id))
-        assert_graph_id("drive_id", str(drive_id))
+        try:
+            assert_graph_id("id", str(item_id))
+            assert_graph_id("drive_id", str(drive_id))
+        except ConfigurationError as exc:
+            # The reference is the caller's data, not the Binding's config.
+            raise SourceError(str(exc)) from exc
         session = graph_session(access_token(credentials), timeout=self.timeout(config))
         try:
             return download_item(
@@ -725,7 +750,14 @@ def raise_for_graph_error(response, *, what):
 
 
 def download_item_content(
-    session, *, base_url, drive_id, item_id, max_bytes, chunk_size=1 << 16
+    session,
+    *,
+    base_url,
+    drive_id,
+    item_id,
+    max_bytes,
+    chunk_size=1 << 16,
+    limit_hint="",
 ):
     """The bytes of one ``driveItem``; see :func:`download_item`."""
     data, _ = download_item(
@@ -735,12 +767,20 @@ def download_item_content(
         item_id=item_id,
         max_bytes=max_bytes,
         chunk_size=chunk_size,
+        limit_hint=limit_hint,
     )
     return data
 
 
 def download_item(
-    session, *, base_url, drive_id, item_id, max_bytes, chunk_size=1 << 16
+    session,
+    *,
+    base_url,
+    drive_id,
+    item_id,
+    max_bytes,
+    chunk_size=1 << 16,
+    limit_hint="",
 ):
     """Return ``(bytes, content_type)`` of one ``driveItem``. The content hook.
 
@@ -764,8 +804,7 @@ def download_item(
         if declared and declared.isdigit() and int(declared) > max_bytes:
             raise SourceError(
                 f"driveItem {item_id!r} is {declared} bytes, over the "
-                f"{max_bytes}-byte limit for this binding. Raise "
-                f"'max_file_bytes' if the worker can genuinely hold it."
+                f"{max_bytes}-byte limit this call was given. {limit_hint}".rstrip()
             )
 
         chunks = []

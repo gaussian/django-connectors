@@ -68,6 +68,7 @@ from django_connectors.providers.microsoft.files import (
     assert_single_item,
     download_item_content,
     graph_session,
+    item_record,
 )
 from django_connectors.sources.base import as_config
 from django_connectors.sources.reshape import validate_unpivot
@@ -311,6 +312,7 @@ class EntraExcelSource(EntraFilesSource):
                     drive_id=drive_id,
                     item_id=item["id"],
                     max_bytes=max_bytes,
+                    limit_hint="Raise 'max_file_bytes' if the worker can genuinely hold it.",
                 )
                 yield from self.rows_for_workbook(data, item, config)
         finally:
@@ -347,7 +349,10 @@ class EntraExcelSource(EntraFilesSource):
 
     def single_item(self, config, *, session):
         """The one workbook named by ``item_id``, refused if openpyxl cannot read it."""
-        item = super().single_item(config, session=session)
+        item = item_record(
+            super().single_item(config, session=session),
+            drive_id=config.get("drive_id") or "",
+        )
         name = item.get("name") or ""
         if not is_parsable_workbook(name):
             # Explicitly named, so silence would mean "synced nothing, reported

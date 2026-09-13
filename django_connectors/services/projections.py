@@ -11,8 +11,7 @@ from django_connectors.enums import (
     ProjectionStatus,
 )
 from django_connectors.exceptions import ConfigurationError, ProjectionError
-from django_connectors.landing import access
-from django_connectors.landing.naming import landing_table_name
+from django_connectors.landing import access, schema
 from django_connectors.models import Projection, ProjectionRun
 from django_connectors.projections import preview as preview_module
 from django_connectors.projections import runner as projection_runner
@@ -35,35 +34,12 @@ def landing_columns_for(projection):
 
 
 def merge_key_columns_for(projection):
-    """The merge identity the landed resource carries, or None if unknowable.
-
-    Read from the landed dlt schema rather than from ``Binding.config``: where
-    the key is declared is source-specific — per resource for the memory, REST
-    and filesystem sources, top-level for sql, hard-coded for every provider —
-    while ``instrument_source`` writes exactly one merge identity into the
-    schema for all of them. The landed *tables* cannot answer this at all,
-    because the destination is configured with ``create_primary_keys=False``.
-
-    None means the resource has not landed, or landed under append/replace and
-    so has no merge key.
-    """
-    binding = projection.binding
-    if binding.landing_schema_at is None:
-        return None
+    """The merge identity the landed resource carries, or None if unknowable."""
     try:
-        schema = access.binding_dataset(binding).schema
-        table = schema.tables[
-            landing_table_name(binding.source, projection.resource, binding.landing_key)
-        ]
-        columns = {
-            name
-            for name, column in (table.get("columns") or {}).items()
-            if (column or {}).get("primary_key")
-        }
+        return schema.merge_key_for(projection.binding, projection.resource)
     except Exception as exc:
         logger.debug("landing merge key unavailable: %s", type(exc).__name__)
         return None
-    return columns or None
 
 
 def validate_projection(projection, *, save=True):

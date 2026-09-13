@@ -1921,17 +1921,72 @@ def test_the_ceiling_holds_whatever_the_host_asks_for(
     graph.files["F1"] = b"x" * 100
     settings.DJANGO_CONNECTORS = {**settings.DJANGO_CONNECTORS, "CONTENT_MAX_BYTES": 50}
     binding = make_graph_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     for asked in (None, 0, 10_000):
         with pytest.raises(SourceError, match="limit"):
-            fetch_record_content(binding, "drive_items", {"id": "F1"}, max_bytes=asked)
+            fetch_record_content(
+                binding,
+                "drive_items",
+                {"id": "F1", "drive_id": DRIVE_ID},
+                max_bytes=asked,
+            )
 
 
-def test_a_reference_missing_the_columns_is_named(
+def test_content_is_fetched_only_for_a_row_this_binding_landed(
     microsoft_settings, make_graph_binding, graph
 ):
-    binding = make_graph_binding(drive_id=None, site_id="contoso.sharepoint.com,1,2")
-    with pytest.raises(SourceError, match="'id' and 'drive_id'"):
+    """A host will build a reference from request input sooner or later."""
+    graph.seed(ROOT_ITEM, drive_item("F1", "mine.pdf"), drive_item("F2", "theirs.pdf"))
+    graph.files["F2"] = b"secret"
+    binding = make_graph_binding(name_glob="mine*")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+
+    with pytest.raises(
+        SourceError, match="fetched only for records this binding landed"
+    ):
+        fetch_record_content(binding, "drive_items", {"id": "F2", "drive_id": DRIVE_ID})
+    with pytest.raises(SourceError, match="merge key column"):
+        fetch_record_content(binding, "drive_items", {"drive_id": DRIVE_ID})
+
+
+def test_content_before_any_run_is_a_named_error(
+    microsoft_settings, make_graph_binding
+):
+    binding = make_graph_binding()
+    with pytest.raises(SourceError, match="not landed"):
         fetch_record_content(binding, "drive_items", {"id": "F1"})
+
+
+def test_a_malformed_reference_is_a_source_error(
+    microsoft_settings, make_graph_binding, graph
+):
+    """Bad reference data, not bad Binding config: the documented exception."""
+    graph.seed(ROOT_ITEM, drive_item("F1", "one.pdf"))
+    binding = make_graph_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    with pytest.raises(SourceError):
+        fetch_record_content(binding, "drive_items", {"id": "F1", "drive_id": "bad/id"})
+
+
+def test_a_missing_single_item_on_first_sight_is_a_failed_run(
+    microsoft_settings, make_graph_binding, graph
+):
+    """A wrong id on a new Binding must not land a dead row and report success."""
+    graph.seed(ROOT_ITEM)
+    binding = make_graph_binding(item_id="NOPE")
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.FAILED
+    assert "could not find" in run.error_message
+
+
+def test_a_single_item_that_is_a_folder_is_refused(
+    microsoft_settings, make_graph_binding, graph
+):
+    graph.seed(ROOT_ITEM, drive_item("D1", "Reports", is_folder=True))
+    binding = make_graph_binding(item_id="D1")
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.FAILED
+    assert "folder_item_id" in run.error_message
 
 
 def test_a_single_item_binding_lands_that_item_only(
