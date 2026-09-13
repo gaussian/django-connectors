@@ -13,7 +13,10 @@ plus `targets/` and `sources/` (registered shapes, no customer data). Runs nest
 under their Binding and projection runs under their Projection — there is no
 flat collection whose default queryset spans tenants.
 
-Actions: `connections/<id>/test` and `/discover`; `bindings/<id>/run`,
+Actions: `connections/<id>/test` and `/discover` (`?q=` narrows, `?path=`
+descends, `?cursor=` pages, `?limit=` up to `DISCOVERY_PAGE_SIZE`; every source
+answers `{"items": [...], "next_cursor": ...}` and each item carries the `path`
+to hand back); `bindings/<id>/run`,
 `/landing-schema`, `/resources/<name>/sample`, `/runs`;
 `projections/<id>/validate`, `/preview`, `/mapping` (PATCH), `/run`,
 `/replay`, `/runs`. Each one is a thin call into `django_connectors.services`.

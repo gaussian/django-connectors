@@ -88,8 +88,25 @@ class SourceDefinition:
         """Cheaply verify the credentials work. Return a short status string."""
         raise SourceError(f"source {self.key!r} does not support connection tests")
 
-    def discover(self, *, connection, credentials, query=None):
-        """List what could be synchronized — tables, folders, endpoints."""
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """Browse what could be synchronized, one page at a time.
+
+        Every source answers in one shape, because the person configuring a
+        Binding is looking at one screen whatever the provider is::
+
+            {"items": [{"id": ..., "name": ..., "kind": ..., "path": ...}, ...],
+             "next_cursor": None | str}
+
+        ``path`` is where to look — a folder id, a schema name, a bucket
+        prefix — and is whatever an earlier item's ``path`` said, so a UI
+        passes it back without knowing what it means. ``None`` is the top.
+        ``cursor`` is opaque and comes from the previous page. ``query``
+        narrows by name. ``kind`` tells the UI what an item is: ``folder``,
+        ``file``, ``schema``, ``table``, ``spreadsheet``, ``sheet``, ``site``,
+        ``drive``, ``label``, ``object``, ``field``, ``resource``.
+        """
         raise SourceError(f"source {self.key!r} does not support discovery")
 
     def __str__(self):
@@ -113,3 +130,30 @@ def as_config(config):
             f"source config must be a JSON object, got {type(config).__name__}"
         )
     return config
+
+
+def discovery_page(items, *, cursor=None, limit=None, query=None, name_key="name"):
+    """One page of an in-memory list, in the discovery envelope.
+
+    For sources that must fetch the whole list anyway (a database's tables,
+    an org's objects, a mailbox's labels). The cursor is the offset as text,
+    which is opaque enough: a client that fabricates one gets a page, not an
+    exception. Providers with a native page token do not use this.
+    """
+    from django_connectors.conf import conf
+
+    if query:
+        needle = str(query).strip().lower()
+        items = [
+            item for item in items if needle in str(item.get(name_key, "")).lower()
+        ]
+    size = int(limit or conf.DISCOVERY_PAGE_SIZE)
+    try:
+        start = max(int(cursor or 0), 0)
+    except (TypeError, ValueError):
+        raise ConfigurationError(
+            f"discovery cursor {cursor!r} is not one this source issued"
+        ) from None
+    page = items[start : start + size]
+    next_cursor = str(start + size) if start + size < len(items) else None
+    return {"items": page, "next_cursor": next_cursor}

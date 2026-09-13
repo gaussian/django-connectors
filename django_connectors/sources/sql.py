@@ -34,7 +34,7 @@ from typing import ClassVar
 from django_connectors.auth.base import first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import ConfigurationError, SourceError
-from django_connectors.sources.base import SourceDefinition, as_config
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 
 # Bare identifiers only. Anything interpolated into a statement must match this;
 # everything else travels as a bound parameter.
@@ -208,6 +208,59 @@ class SqlSource(SourceDefinition):
         finally:
             engine.dispose()
         return "ok"
+
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """Schemas at the top; a schema's tables and views one level down.
+
+        Reflection through SQLAlchemy's inspector, never a hand-written query
+        against the catalog: every dialect names its catalog differently, and
+        the inspector already knows them all.
+        """
+        from sqlalchemy import inspect as sqlalchemy_inspect
+        from sqlalchemy.exc import SQLAlchemyError
+
+        config = connection.metadata or {}
+        engine = create_engine(connection_url(config, credentials))
+        try:
+            inspector = sqlalchemy_inspect(engine)
+            if path is None:
+                items = [
+                    {"id": schema, "name": schema, "kind": "schema", "path": schema}
+                    for schema in inspector.get_schema_names()
+                ]
+            else:
+                _validate_identifier(path, "path")
+                items = [
+                    {
+                        "id": f"{path}.{name}",
+                        "name": name,
+                        "kind": "table",
+                        "path": None,
+                        "db_schema": path,
+                        "table": name,
+                    }
+                    for name in inspector.get_table_names(schema=path)
+                ] + [
+                    {
+                        "id": f"{path}.{name}",
+                        "name": name,
+                        "kind": "view",
+                        "path": None,
+                        "db_schema": path,
+                        "table": name,
+                    }
+                    for name in inspector.get_view_names(schema=path)
+                ]
+        except SQLAlchemyError as exc:
+            raise SourceError(
+                f"could not list the source database: {scrub(exc)}"
+            ) from exc
+        finally:
+            engine.dispose()
+        items.sort(key=lambda item: item["name"])
+        return discovery_page(items, cursor=cursor, limit=limit, query=query)
 
 
 # --- helpers ---------------------------------------------------------------

@@ -30,7 +30,7 @@ batch yields nothing, which is what an unchanged remote source looks like.
 
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.landing.naming import DELETED_COLUMN
-from django_connectors.sources.base import SourceDefinition, as_config
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 
 BATCH_INDEX_STATE_KEY = "memory_batch_index"
 
@@ -119,8 +119,15 @@ class MemorySource(SourceDefinition):
     def check_connection(self, *, connection, credentials):
         return "ok"
 
-    def discover(self, *, connection, credentials, query=None):
-        return {"resources": []}
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """The resources named in ``Connection.metadata["resources"]``, if any."""
+        names = (connection.metadata or {}).get("resources") or []
+        items = [
+            {"id": name, "name": name, "kind": "table", "path": None} for name in names
+        ]
+        return discovery_page(items, cursor=cursor, limit=limit, query=query)
 
 
 def tombstone(primary_key_values):

@@ -309,11 +309,7 @@ class FakeGraph:
         if path.endswith("/content"):
             return self._content(start_response, path)
         if path.endswith("/children"):
-            return self._respond(
-                start_response,
-                200,
-                {"value": [item for item in self.items.values() if "root" not in item]},
-            )
+            return self._children(start_response, path, query)
         if "/items/" in path:
             item_id = path.split("/items/", 1)[1].split("/")[0]
             item = self.items.get(item_id)
@@ -341,6 +337,24 @@ class FakeGraph:
                 {"value": [{"id": SITE_ID, "displayName": "Contoso"}]},
             )
         return self._respond(start_response, 404, {"error": {"code": "unknownRoute"}})
+
+    def _children(self, start_response, path, query):
+        """``/root/children`` or ``/items/<id>/children``, paged by ``$top``."""
+        parent = (
+            path.split("/items/", 1)[1].split("/")[0] if "/items/" in path else None
+        )
+        results = [
+            item
+            for item in self.items.values()
+            if "root" not in item
+            and (parent is None or item["parentReference"].get("id") == parent)
+        ]
+        top = int(query.get("$top", [str(self.page_size)])[0])
+        page = int(query.get("_page", ["0"])[0])
+        body = {"value": results[page * top : (page + 1) * top]}
+        if (page + 1) * top < len(results):
+            body["@odata.nextLink"] = f"{self.origin}{path}?$top={top}&_page={page + 1}"
+        return self._respond(start_response, 200, body)
 
     def _delta(self, start_response, path, query):
         token = query.get("token", [None])[0]
@@ -676,7 +690,12 @@ def test_discover_lists_a_drives_children_when_one_is_configured(
     microsoft_settings, make_connection, graph
 ):
     """Discovery runs before any Binding exists, so it reads Connection.metadata."""
-    graph.seed(ROOT_ITEM, drive_item("F1", "budget.xlsx"), drive_item("F2", "a.docx"))
+    graph.seed(
+        ROOT_ITEM,
+        drive_item("F1", "budget.xlsx"),
+        drive_item("F2", "a.docx"),
+        drive_item("D1", "Archive", is_folder=True),
+    )
     connection = make_connection(
         provider="microsoft",
         auth_backend="token",
@@ -686,10 +705,64 @@ def test_discover_lists_a_drives_children_when_one_is_configured(
     result = LoopbackFilesSource().discover(
         connection=connection, credentials={"access_token": "APP-ONLY-TOKEN"}
     )
-    assert sorted(entry["name"] for entry in result["items"]) == [
-        "a.docx",
-        "budget.xlsx",
+    assert sorted((e["name"], e["kind"]) for e in result["items"]) == [
+        ("Archive", "folder"),
+        ("a.docx", "file"),
+        ("budget.xlsx", "file"),
     ]
+    folder = next(e for e in result["items"] if e["kind"] == "folder")
+    assert folder["path"] == "D1"
+    assert result["next_cursor"] is None
+
+
+def test_discover_pages_a_folder_through_graphs_own_next_link(
+    microsoft_settings, make_connection, graph
+):
+    items = [drive_item(f"F{i}", f"file{i}.xlsx") for i in range(5)]
+    for item in items:
+        item["parentReference"]["id"] = "D1"
+    graph.seed(ROOT_ITEM, drive_item("D1", "Reports", is_folder=True), *items)
+    connection = make_connection(
+        provider="microsoft",
+        auth_backend="token",
+        metadata={"graph_base_url": f"{graph.origin}/v1.0", "drive_id": DRIVE_ID},
+    )
+    source = LoopbackFilesSource()
+    token = {"access_token": "APP-ONLY-TOKEN"}
+
+    first = source.discover(
+        connection=connection, credentials=token, path="D1", limit=2
+    )
+    assert [e["name"] for e in first["items"]] == ["file0.xlsx", "file1.xlsx"]
+    assert first["next_cursor"].startswith(graph.origin)
+
+    second = source.discover(
+        connection=connection, credentials=token, cursor=first["next_cursor"]
+    )
+    assert [e["name"] for e in second["items"]] == ["file2.xlsx", "file3.xlsx"]
+
+    third = source.discover(
+        connection=connection, credentials=token, cursor=second["next_cursor"]
+    )
+    assert [e["name"] for e in third["items"]] == ["file4.xlsx"]
+    assert third["next_cursor"] is None
+
+
+def test_discover_refuses_a_cursor_pointing_off_graph(
+    microsoft_settings, make_connection, graph
+):
+    """A cursor is followed with the tenant-wide token attached."""
+    connection = make_connection(
+        provider="microsoft",
+        auth_backend="token",
+        metadata={"graph_base_url": f"{graph.origin}/v1.0", "drive_id": DRIVE_ID},
+    )
+    with pytest.raises(SourceError, match="Refusing to follow"):
+        LoopbackFilesSource().discover(
+            connection=connection,
+            credentials={"access_token": "APP-ONLY-TOKEN"},
+            cursor="https://evil.example/v1.0/steal",
+        )
 
 
 def test_discover_searches_for_sites_when_nothing_is_configured_yet(
@@ -706,7 +779,9 @@ def test_discover_searches_for_sites_when_nothing_is_configured_yet(
         credentials={"access_token": "APP-ONLY-TOKEN"},
         query="contoso",
     )
-    assert [entry["id"] for entry in result["sites"]] == [SITE_ID]
+    assert [(entry["id"], entry["kind"]) for entry in result["items"]] == [
+        (SITE_ID, "site")
+    ]
     assert graph.requests[0]["query"] == {"search": ["contoso"]}
 
 

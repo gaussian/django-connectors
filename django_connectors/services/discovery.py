@@ -47,11 +47,22 @@ def sample_resource(binding, resource, *, limit=None):
     ]
 
 
-def discover_remote(connection, *, query=None, source_key=None, credentials=None):
-    """Ask the provider what is available to synchronize.
+def discover_remote(
+    connection,
+    *,
+    query=None,
+    path=None,
+    cursor=None,
+    limit=None,
+    source_key=None,
+    credentials=None,
+):
+    """Ask the provider what is available to synchronize, one page at a time.
 
     Distinct from :func:`get_landing_schema`, which describes what has already
-    landed. This one talks to the provider and is the expensive call.
+    landed. This one talks to the provider and is the expensive call. See
+    ``SourceDefinition.discover`` for the envelope and what `path` means.
+    `limit` is clamped to ``DISCOVERY_PAGE_SIZE``.
     """
     key = source_key or connection.provider
     if key not in sources:
@@ -66,8 +77,14 @@ def discover_remote(connection, *, query=None, source_key=None, credentials=None
         credentials = auth_backends.get(connection.auth_backend).get_credentials(
             connection
         )
+    limit = min(int(limit or conf.DISCOVERY_PAGE_SIZE), conf.DISCOVERY_PAGE_SIZE)
     return definition.discover(
-        connection=connection, credentials=credentials, query=query
+        connection=connection,
+        credentials=credentials,
+        query=query,
+        path=path,
+        cursor=cursor,
+        limit=limit,
     )
 
 

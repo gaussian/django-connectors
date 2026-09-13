@@ -56,6 +56,7 @@ def static_problems(definition):
     problems += _validate_config_problems(definition)
     problems += _incremental_problems(definition)
     problems += _webhook_problems(definition)
+    problems += _discover_problems(definition)
     return problems
 
 
@@ -191,4 +192,27 @@ def _webhook_problems(definition):
     ]
     if missing:
         return [f"`webhook` adapter lacks {missing}; see webhooks.base.WebhookAdapter"]
+    return []
+
+
+DISCOVER_KWARGS = ("connection", "credentials", "query", "path", "cursor", "limit")
+
+
+def _discover_problems(definition):
+    """``discover`` takes the browsing keywords, or a UI cannot page or descend."""
+    import inspect
+
+    try:
+        parameters = inspect.signature(definition.discover).parameters
+    except (TypeError, ValueError):
+        return ["`discover` is not introspectable"]
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return []
+    missing = [name for name in DISCOVER_KWARGS if name not in parameters]
+    if missing:
+        return [
+            f"`discover` does not accept {missing}; every source takes "
+            f"{list(DISCOVER_KWARGS)} as keyword arguments so one UI can browse "
+            f"them all"
+        ]
     return []

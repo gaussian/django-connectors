@@ -50,6 +50,7 @@ in practice (dates, durations, errors, formulas).
 """
 
 import logging
+import re
 from typing import ClassVar
 
 from django_connectors.exceptions import ConfigurationError, SourceError
@@ -59,7 +60,7 @@ from django_connectors.providers.google.auth import (
     google_client,
     google_json,
 )
-from django_connectors.sources.base import SourceDefinition, as_config
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,14 @@ SHEETS_API_BASE_URL = "https://sheets.googleapis.com/v4/"
 DRIVE_API_BASE_URL = "https://www.googleapis.com/drive/v3/"
 
 MODIFIED_TIME_STATE_KEY = "sheets_drive_modified_time"
+
+SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
+FOLDER_MIME = "application/vnd.google-apps.folder"
+DEFAULT_DISCOVERY_PAGE_SIZE = 100
+
+#: Drive ids are URL-safe base64-ish. Anything else would change which
+#: resource a request path or a query literal addresses.
+DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 
 # UNFORMATTED_VALUE keeps numbers numeric instead of handing back the locale's
 # display string, which is what makes a currency column land as a number.
@@ -327,43 +336,128 @@ class GoogleSheetsSource(SourceDefinition):
         title = (payload.get("properties") or {}).get("title", "untitled")
         return f"ok ({title})"
 
-    def discover(self, *, connection, credentials, query=None):
-        """Every tab in the spreadsheet, as a candidate range."""
-        config = connection.metadata or {}
-        spreadsheet_id = config.get("spreadsheet_id")
-        if not spreadsheet_id:
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """Find a spreadsheet in Drive, then its tabs.
+
+        Three levels, each an item's ``path`` from the level above:
+
+        * ``None`` — every spreadsheet the credential can see, across shared
+          drives, newest first; ``query`` matches the name. This is the "pick
+          your spreadsheet" screen, and it needs the Drive scope
+          (``drive.metadata.readonly``) that ``skip_unchanged`` also needs.
+        * ``folder/<id>`` — that folder's sub-folders and spreadsheets.
+        * ``spreadsheet/<id>`` — the tabs, as candidate ranges. Sheets API
+          only; no Drive scope needed.
+
+        The two kinds of id are prefixed because a Drive file id says nothing
+        about what it is, and a UI must be able to hand a ``path`` back without
+        knowing. ``cursor`` is Drive's own ``nextPageToken``.
+        """
+        kind, _, target = (path or "").partition("/")
+        if kind == "spreadsheet" and target:
+            return self._discover_tabs(credentials, target, query)
+        if kind == "folder" and target:
+            parent = target
+        elif not path:
+            parent = None
+        else:
             raise ConfigurationError(
-                "discovery needs Connection.metadata['spreadsheet_id']."
+                f"google_sheets discovery path must be 'folder/<id>' or "
+                f"'spreadsheet/<id>', got {path!r}."
             )
+        return self._discover_drive(credentials, parent, query, cursor, limit)
+
+    def _discover_drive(self, credentials, parent, query, cursor, limit):
+        terms = ["trashed = false"]
+        if parent:
+            assert_drive_id(parent)
+            terms.append(f"'{parent}' in parents")
+            terms.append(
+                f"(mimeType = '{SPREADSHEET_MIME}' or mimeType = '{FOLDER_MIME}')"
+            )
+        else:
+            terms.append(f"mimeType = '{SPREADSHEET_MIME}'")
+        if query:
+            # Drive's query language quotes with single quotes; escape the
+            # only character that could end the literal early.
+            needle = str(query).replace("\\", "\\\\").replace("'", "\\'")
+            terms.append(f"name contains '{needle}'")
+        params = {
+            "q": " and ".join(terms),
+            "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink)",
+            "pageSize": int(limit or DEFAULT_DISCOVERY_PAGE_SIZE),
+            "orderBy": "folder,modifiedTime desc",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+        }
+        if cursor:
+            params["pageToken"] = cursor
+        client = google_client(
+            base_url=self.drive_api_base_url, credentials=credentials
+        )
+        payload = google_json(
+            client, "files", params=params, what="listing Drive spreadsheets"
+        )
+        items = []
+        for entry in payload.get("files") or []:
+            is_folder = entry.get("mimeType") == FOLDER_MIME
+            file_id = entry.get("id")
+            items.append(
+                {
+                    "id": file_id,
+                    "name": entry.get("name"),
+                    "kind": "folder" if is_folder else "spreadsheet",
+                    "path": f"{'folder' if is_folder else 'spreadsheet'}/{file_id}",
+                    "modified_at": entry.get("modifiedTime"),
+                    "web_url": entry.get("webViewLink"),
+                    # What a Binding needs, so the UI copies rather than derives.
+                    "spreadsheet_id": None if is_folder else file_id,
+                }
+            )
+        return {"items": items, "next_cursor": payload.get("nextPageToken") or None}
+
+    def _discover_tabs(self, credentials, spreadsheet_id, query):
+        assert_drive_id(spreadsheet_id)
         client = google_client(base_url=self.api_base_url, credentials=credentials)
         payload = google_json(
             client,
             f"spreadsheets/{spreadsheet_id}",
-            params={"fields": "sheets.properties"},
+            params={"fields": "properties.title,sheets.properties"},
             what="listing the spreadsheet's tabs",
         )
-        resources = []
+        items = []
         for sheet in payload.get("sheets") or ():
             properties = (sheet or {}).get("properties") or {}
             title = properties.get("title")
             if not title:
                 continue
-            if query and query.lower() not in title.lower():
-                continue
-            resources.append(
+            grid = properties.get("gridProperties") or {}
+            items.append(
                 {
-                    "name": normalize_identifier(title),
-                    "range": f"{title}",
-                    "rows": (properties.get("gridProperties") or {}).get("rowCount"),
-                    "columns": (properties.get("gridProperties") or {}).get(
-                        "columnCount"
-                    ),
+                    "id": str(properties.get("sheetId")),
+                    "name": title,
+                    "kind": "sheet",
+                    "path": None,
+                    # What a Binding's `ranges` entry needs.
+                    "resource": normalize_identifier(title),
+                    "range": title,
+                    "rows": grid.get("rowCount"),
+                    "columns": grid.get("columnCount"),
                 }
             )
-        return {"resources": resources}
+        return discovery_page(items, query=query)
 
 
 # --- configuration helpers -------------------------------------------------
+
+
+def assert_drive_id(value):
+    if not isinstance(value, str) or not DRIVE_ID_RE.fullmatch(value):
+        raise ConfigurationError(
+            f"{value!r} is not a Drive id; ids are letters, digits, '-' and '_'."
+        )
 
 
 def _validate_resource_name(name):

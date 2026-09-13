@@ -21,6 +21,7 @@ themselves speak plain HTTP and need no SDK.
 
 import datetime as dt
 import json
+import re
 import threading
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, make_server
@@ -362,6 +363,9 @@ class FakeSheets(_FakeApi):
         self.title = title
         self.modified_time = modified_time
         self.sheet_titles = ["Orders", "Lookup"]
+        #: Drive `files.list` corpus: (id, name, mimeType, parent id or None).
+        self.drive_files = []
+        self.drive_page_size = 2
 
     def __call__(self, environ, start_response):
         self.record(environ)
@@ -375,6 +379,8 @@ class FakeSheets(_FakeApi):
             status, payload, headers = self.forced.pop(0)
             return _json(start_response, payload, status=status, headers=headers)
 
+        if path == "/files":
+            return self._list_files(start_response, query)
         if path.startswith("/files/"):
             return _json(start_response, {"modifiedTime": self.modified_time})
         if path.endswith("/values:batchGet"):
@@ -386,6 +392,28 @@ class FakeSheets(_FakeApi):
             google_error(404, f"no such path {path}"),
             status="404 Not Found",
         )
+
+    def _list_files(self, start_response, query):
+        """A small model of Drive's query language: parents, mimeType, name."""
+        q = query.get("q", [""])[0]
+        parent = re.search(r"'([^']+)' in parents", q)
+        parent = parent.group(1) if parent else None
+        needle = re.search(r"name contains '([^']*)'", q)
+        needle = needle.group(1).lower() if needle else None
+        allowed_types = set(re.findall(r"mimeType = '([^']+)'", q))
+        rows = [
+            {"id": i, "name": n, "mimeType": m, "modifiedTime": self.modified_time}
+            for i, n, m, parent_id in self.drive_files
+            if (parent is None or parent_id == parent)
+            and (not allowed_types or m in allowed_types)
+            and (needle is None or needle in n.lower())
+        ]
+        start = int(query.get("pageToken", ["0"])[0])
+        page = rows[start : start + self.drive_page_size]
+        payload = {"files": page}
+        if start + self.drive_page_size < len(rows):
+            payload["nextPageToken"] = str(start + self.drive_page_size)
+        return _json(start_response, payload)
 
     def _batch_get(self, start_response, query):
         value_ranges = []
@@ -999,15 +1027,26 @@ def test_gmail_check_connection_makes_one_request(gmail_server, google_connectio
     assert api.requests[0]["path"].endswith("/profile")
 
 
-def test_gmail_discover_lists_resources_and_labels(gmail_server, google_connection):
+def test_gmail_discover_lists_resources_then_labels_under_a_path(
+    gmail_server, google_connection
+):
     gmail_server(
         FakeGmail(labels=[{"id": "Label_1", "name": "Finance", "type": "user"}])
     )
-    result = LoopbackGmailSource().discover(
-        connection=google_connection(), credentials="ya29.test"
+    source = LoopbackGmailSource()
+    top = source.discover(connection=google_connection(), credentials="ya29.test")
+    assert [(i["name"], i["kind"]) for i in top["items"]] == [
+        ("messages", "resource"),
+        ("labels", "resource"),
+        ("labels", "folder"),
+    ]
+    labels = source.discover(
+        connection=google_connection(), credentials="ya29.test", path="labels"
     )
-    assert [entry["name"] for entry in result["resources"]] == ["messages", "labels"]
-    assert result["labels"] == [{"id": "Label_1", "name": "Finance"}]
+    assert labels["items"] == [
+        {"id": "Label_1", "name": "Finance", "kind": "label", "path": None}
+    ]
+    assert labels["next_cursor"] is None
 
 
 # --- gmail: configuration and record shape -----------------------------------
@@ -1482,10 +1521,9 @@ def test_sheets_http_401_is_a_revoked_credential(sheets_server, google_connectio
         )
 
 
-def test_sheets_check_connection_and_discover(sheets_server, google_connection):
+def test_sheets_check_connection(sheets_server, google_connection):
     sheets_server(FakeSheets({}, title="Q3 orders"))
     connection = google_connection(metadata={"spreadsheet_id": "sheet-1"})
-
     assert (
         LoopbackSheetsSource().check_connection(
             connection=connection, credentials="ya29.test"
@@ -1493,10 +1531,87 @@ def test_sheets_check_connection_and_discover(sheets_server, google_connection):
         == "ok (Q3 orders)"
     )
 
-    discovered = LoopbackSheetsSource().discover(
-        connection=connection, credentials="ya29.test"
+
+SPREADSHEET = "application/vnd.google-apps.spreadsheet"
+FOLDER = "application/vnd.google-apps.folder"
+
+
+def _drive(sheets_server):
+    api = sheets_server(FakeSheets({}))
+    api.drive_files = [
+        ("s1", "Orders 2024", SPREADSHEET, None),
+        ("s2", "Orders 2023", SPREADSHEET, "f1"),
+        ("s3", "Budget", SPREADSHEET, None),
+        ("f1", "Archive", FOLDER, None),
+        ("d1", "notes.docx", "application/vnd.openxmlformats", None),
+    ]
+    return api
+
+
+def test_sheets_discover_finds_spreadsheets_across_drive_and_pages(
+    sheets_server, google_connection
+):
+    """The 'pick your spreadsheet' screen: no spreadsheet id known yet."""
+    _drive(sheets_server)
+    source = LoopbackSheetsSource()
+    connection = google_connection()
+
+    first = source.discover(connection=connection, credentials="ya29.test")
+    assert [i["name"] for i in first["items"]] == ["Orders 2024", "Orders 2023"]
+    assert all(i["kind"] == "spreadsheet" for i in first["items"])
+    assert first["items"][0]["spreadsheet_id"] == "s1"
+    assert first["items"][0]["path"] == "spreadsheet/s1"
+    assert first["next_cursor"] == "2"
+
+    second = source.discover(
+        connection=connection, credentials="ya29.test", cursor=first["next_cursor"]
     )
-    assert [entry["name"] for entry in discovered["resources"]] == ["orders", "lookup"]
+    assert [i["name"] for i in second["items"]] == ["Budget"]
+    assert second["next_cursor"] is None
+
+
+def test_sheets_discover_narrows_by_name(sheets_server, google_connection):
+    _drive(sheets_server)
+    result = LoopbackSheetsSource().discover(
+        connection=google_connection(), credentials="ya29.test", query="orders"
+    )
+    assert [i["name"] for i in result["items"]] == ["Orders 2024", "Orders 2023"]
+
+
+def test_sheets_discover_browses_a_folder(sheets_server, google_connection):
+    _drive(sheets_server)
+    result = LoopbackSheetsSource().discover(
+        connection=google_connection(), credentials="ya29.test", path="folder/f1"
+    )
+    assert [(i["name"], i["kind"]) for i in result["items"]] == [
+        ("Orders 2023", "spreadsheet")
+    ]
+
+
+def test_sheets_discover_lists_a_spreadsheets_tabs(sheets_server, google_connection):
+    sheets_server(FakeSheets({}))
+    result = LoopbackSheetsSource().discover(
+        connection=google_connection(),
+        credentials="ya29.test",
+        path="spreadsheet/sheet-1",
+    )
+    assert [(i["name"], i["kind"], i["resource"]) for i in result["items"]] == [
+        ("Orders", "sheet", "orders"),
+        ("Lookup", "sheet", "lookup"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "path", ["nonsense", "folder/", "spreadsheet/../x", "folder/a b"]
+)
+def test_sheets_discover_refuses_a_path_it_did_not_issue(
+    sheets_server, google_connection, path
+):
+    sheets_server(FakeSheets({}))
+    with pytest.raises(ConfigurationError):
+        LoopbackSheetsSource().discover(
+            connection=google_connection(), credentials="ya29.test", path=path
+        )
 
 
 # --- sheets: configuration ---------------------------------------------------

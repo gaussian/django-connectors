@@ -89,6 +89,25 @@ Three rules the runner relies on:
 
 ## 3. Connect a customer's system
 
+Before a Binding exists, discovery shows what could be synchronized — one
+shape for every source, so a "pick what to sync" screen is one screen:
+
+```python
+from django_connectors.services import discovery
+
+page = discovery.discover_remote(connection)                 # the top level
+page = discovery.discover_remote(connection, query="orders") # narrowed by name
+page = discovery.discover_remote(connection, path=page["items"][0]["path"])
+page = discovery.discover_remote(connection, cursor=page["next_cursor"])
+# {"items": [{"id", "name", "kind", "path", ...}, ...], "next_cursor": None | str}
+```
+
+`kind` is what the item is (`folder`, `file`, `schema`, `table`,
+`spreadsheet`, `sheet`, `site`, `object`, …); `path` is what to pass back to
+descend, and is `None` on a leaf. Items also carry whatever a Binding needs
+verbatim — a `spreadsheet_id`, a `db_schema` and `table`, a bucket prefix.
+
+
 ```python
 from django_connectors.models import Binding, Connection
 from django_connectors.services import runs

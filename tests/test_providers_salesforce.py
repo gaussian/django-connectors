@@ -1003,12 +1003,13 @@ def test_discover_lists_the_orgs_queryable_sobjects(
 
     result = discovery_services.discover_remote(connection, source_key="salesforce")
 
-    names = [entry["name"] for entry in result["resources"]]
+    names = [entry["name"] for entry in result["items"]]
     assert names == ["Account", "Contact", "Widget__c"]
     assert "AggregateResult" not in names, "a non-queryable object cannot be synced"
-    assert {"name": "Widget__c", "custom": True}.items() <= result["resources"][
-        2
-    ].items()
+    assert {"name": "Widget__c", "custom": True, "kind": "object"}.items() <= result[
+        "items"
+    ][2].items()
+    assert result["next_cursor"] is None
 
 
 def test_discover_with_an_exact_name_returns_that_objects_fields(
@@ -1026,13 +1027,16 @@ def test_discover_with_an_exact_name_returns_that_objects_fields(
         },
     )
 
-    result = discovery_services.discover_remote(
+    objects = discovery_services.discover_remote(
         connection, source_key="salesforce", query="account"
     )
+    assert [entry["name"] for entry in objects["items"]] == ["Account"]
 
-    assert [entry["name"] for entry in result["resources"]] == ["Account"]
-    field_names = [field["name"] for field in result["resources"][0]["fields"]]
-    assert "SystemModstamp" in field_names
+    fields = discovery_services.discover_remote(
+        connection, source_key="salesforce", path=objects["items"][0]["path"]
+    )
+    assert all(field["kind"] == "field" for field in fields["items"])
+    assert "SystemModstamp" in [field["name"] for field in fields["items"]]
 
 
 def test_check_connection_probes_the_configured_object_with_one_request(

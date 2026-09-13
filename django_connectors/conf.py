@@ -60,6 +60,9 @@ DEFAULTS: dict[str, Any] = {
     # How many per-row reasons a ProjectionRun keeps in `warnings`. The count
     # in `records_skipped` is always exact; only the explanations are capped.
     "PROJECTION_MAX_WARNINGS": 100,
+    # Items per page from SourceDefinition.discover(); also the ceiling a
+    # client may ask for, so one request cannot pull a whole drive listing.
+    "DISCOVERY_PAGE_SIZE": 100,
     "PREVIEW_MAX_ROWS": 50,
     "SAMPLE_MAX_ROWS": 100,
     "PREVIEW_MAX_BYTES": 1024 * 1024,

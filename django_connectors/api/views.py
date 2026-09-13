@@ -103,14 +103,20 @@ class ConnectionViewSet(BaseViewSet):
 
     @action(detail=True, methods=["get"])
     def discover(self, request, pk=None):
+        """``?q=`` narrows, ``?path=`` descends, ``?cursor=`` pages, ``?limit=``."""
         connection = self.get_object()
+        params = request.query_params
         try:
             return Response(
                 discovery.discover_remote(
-                    connection, query=request.query_params.get("q")
+                    connection,
+                    query=params.get("q"),
+                    path=params.get("path"),
+                    cursor=params.get("cursor"),
+                    limit=params.get("limit"),
                 )
             )
-        except ConnectorError as exc:
+        except (ConnectorError, ValueError) as exc:
             return _error(exc)
 
 

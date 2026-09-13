@@ -45,8 +45,8 @@ from typing import ClassVar
 from urllib.parse import urlsplit
 
 from django_connectors.auth.base import credential_value
-from django_connectors.exceptions import ConfigurationError
-from django_connectors.sources.base import SourceDefinition, as_config
+from django_connectors.exceptions import ConfigurationError, SourceError
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 
 # format -> (module it needs at read time, the extra that installs it).
 # None means "core dlt is enough".
@@ -186,6 +186,89 @@ class FilesystemSource(SourceDefinition):
             hints["primary_key"] = spec["primary_key"]
         resource.apply_hints(**hints)
         return resource
+
+    # --- operations --------------------------------------------------------
+
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """List a directory or bucket prefix: folders and files, one level.
+
+        ``path`` is the location to list, in the same forms a Binding's
+        ``path`` takes; with none given, ``Connection.metadata["root"]`` is the
+        starting point. A local root is required to be absolute for the same
+        reason a Binding's is. Listing is not recursive — a UI descends by
+        passing an item's ``path`` back — so a bucket with a million objects
+        costs one page, not one walk.
+        """
+        root = path or (connection.metadata or {}).get("root")
+        if not root:
+            raise ConfigurationError(
+                "discovery needs a 'path' to list, or Connection.metadata['root']."
+            )
+        bucket_url, _ = resolve_location(
+            "root", {"path": root}, allowed=self.allowed_schemes
+        )
+        scheme = urlsplit(bucket_url).scheme
+        _require_driver(
+            "root", SCHEME_REQUIREMENTS.get(scheme), f"lists {bucket_url!r}"
+        )
+
+        import fsspec
+        from fsspec.spec import AbstractFileSystem
+
+        if scheme == "file":
+            fs = fsspec.filesystem("file")
+        else:
+            opened = bucket_credentials(bucket_url, credentials)
+            fs = (
+                opened
+                if isinstance(opened, AbstractFileSystem)
+                else _fsspec_for(scheme, opened)
+            )
+        try:
+            entries = fs.ls(bucket_url, detail=True)
+        except FileNotFoundError as exc:
+            raise SourceError(
+                f"{bucket_url!r} does not exist or is not readable"
+            ) from exc
+        items = []
+        for entry in entries:
+            full = entry.get("name") or ""
+            name = full.rstrip("/").rpartition("/")[2]
+            is_folder = entry.get("type") == "directory"
+            location = _rejoin(bucket_url, name)
+            items.append(
+                {
+                    "id": location,
+                    "name": name,
+                    "kind": "folder" if is_folder else "file",
+                    "path": location if is_folder else None,
+                    "size": None if is_folder else entry.get("size"),
+                }
+            )
+        items.sort(key=lambda item: (item["kind"] != "folder", item["name"]))
+        return discovery_page(items, cursor=cursor, limit=limit, query=query)
+
+
+def _fsspec_for(scheme, spec):
+    """An fsspec filesystem from a dlt credential spec, for listing only."""
+    import fsspec
+
+    to_kwargs = getattr(spec, "to_s3fs_credentials", None) or getattr(
+        spec, "to_native_credentials", None
+    )
+    return fsspec.filesystem(scheme, **(to_kwargs() if to_kwargs else {}))
+
+
+def _rejoin(bucket_url, name):
+    """`bucket_url` + one path segment, in the form a Binding would accept."""
+    prefix = (
+        bucket_url.removeprefix("file://")
+        if bucket_url.startswith("file://")
+        else bucket_url
+    )
+    return f"{prefix.rstrip('/')}/{name}"
 
 
 def _reader(spec):

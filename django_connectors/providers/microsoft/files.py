@@ -408,41 +408,65 @@ class EntraFilesSource(SourceDefinition):
             session.close()
         return f"ok: {drive.get('driveType', 'drive')} {drive.get('name', '')}".strip()
 
-    def discover(self, *, connection, credentials, query=None):
-        """List what could be synchronized: sites, drives, or a folder's children.
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """Sites at the top when no drive is configured; otherwise a folder.
 
-        Driven by ``Connection.metadata`` because discovery happens *before* any
-        Binding exists to carry a config.
+        Driven by ``Connection.metadata`` because discovery happens *before*
+        any Binding exists to carry a config. ``path`` is a folder's driveItem
+        id (the root when None). ``cursor`` is Graph's own ``@odata.nextLink``,
+        held to the same origin before it is followed, since it is followed
+        with the tenant-wide token attached.
         """
         config = connection.metadata or {}
         base = self.base_url(config)
         assert_graph_url(base, allow_custom=self.allow_custom_graph_base_url)
         session = graph_session(access_token(credentials), timeout=self.timeout(config))
         try:
-            if config.get("drive_id") or config.get("site_id"):
+            if cursor:
+                assert_same_origin(cursor, base)
+                url = cursor
+            elif config.get("drive_id") or config.get("site_id"):
                 self.validate_location(config)
-                url = f"{base}/{drive_address(config)}/root/children?$top=200"
-                key = "items"
+                if path:
+                    assert_graph_id("path", path)
+                    parent = f"items/{path}"
+                else:
+                    parent = "root"
+                top = int(limit or DEFAULT_PAGE_SIZE)
+                url = f"{base}/{drive_address(config)}/{parent}/children?$top={top}"
             else:
                 url = f"{base}/sites?search={quote(str(query or ''), safe='')}"
-                key = "sites"
             response = graph_request(session, "GET", url)
             raise_for_graph_error(response, what="discovery")
             payload = response.json()
         finally:
             session.close()
 
-        return {
-            key: [
+        items = []
+        for entry in payload.get("value") or []:
+            is_site = (
+                "displayName" in entry and "folder" not in entry and "file" not in entry
+            )
+            is_folder = "folder" in entry
+            name = entry.get("name") or entry.get("displayName")
+            if query and not is_site and query.lower() not in (name or "").lower():
+                continue
+            items.append(
                 {
                     "id": entry.get("id"),
-                    "name": entry.get("name") or entry.get("displayName"),
+                    "name": name,
+                    "kind": "site" if is_site else "folder" if is_folder else "file",
+                    "path": entry.get("id") if is_folder else None,
                     "web_url": entry.get("webUrl"),
-                    "is_folder": "folder" in entry,
+                    "size": entry.get("size"),
                 }
-                for entry in payload.get("value") or []
-            ]
-        }
+            )
+        next_link = payload.get("@odata.nextLink")
+        if next_link:
+            assert_same_origin(next_link, base)
+        return {"items": items, "next_cursor": next_link}
 
 
 # --- HTTP ------------------------------------------------------------------

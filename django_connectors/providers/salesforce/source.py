@@ -81,7 +81,7 @@ from django_connectors.providers.salesforce.auth import (
     error_codes,
     parse_api_errors,
 )
-from django_connectors.sources.base import SourceDefinition, as_config
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 from django_connectors.sources.memory import tombstone
 
 DEFAULT_API_VERSION = "60.0"
@@ -391,8 +391,10 @@ class SalesforceSource(SourceDefinition):
         )
         return f"ok ({sobject}: {payload.get('totalSize', 0)} matching records)"
 
-    def discover(self, *, connection, credentials, query=None):
-        """List the SObjects this org exposes, and optionally one object's fields.
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """The org's queryable SObjects; under ``path`` one object's fields.
 
         Cheap and genuinely useful: without it the person configuring a Binding
         has to know the API name of every custom object in the org, and custom
@@ -400,9 +402,16 @@ class SalesforceSource(SourceDefinition):
         """
         config = connection.metadata or {}
         client = self.client_for(config, credentials, connection=connection)
-        payload = client.get_path(f"{client.base_path}/sobjects/")
 
-        resources = []
+        if path is not None:
+            items = [
+                {**field, "id": field.get("name"), "kind": "field", "path": None}
+                for field in client.describe_fields(path)
+            ]
+            return discovery_page(items, cursor=cursor, limit=limit, query=query)
+
+        payload = client.get_path(f"{client.base_path}/sobjects/")
+        items = []
         for entry in payload.get("sobjects") or []:
             if not isinstance(entry, dict):
                 continue
@@ -411,29 +420,27 @@ class SalesforceSource(SourceDefinition):
                 # Not synchronizable at all; offering it would only produce a
                 # Binding that fails on its first run.
                 continue
-            resources.append(
+            items.append(
                 {
+                    "id": name,
                     "name": name,
+                    "kind": "object",
+                    "path": name,
                     "label": entry.get("label") or name,
                     "custom": bool(entry.get("custom")),
                     "createable": bool(entry.get("createable")),
                     "deletable": bool(entry.get("deletable")),
                 }
             )
-
         if query:
             needle = str(query).strip().lower()
-            resources = [
+            items = [
                 entry
-                for entry in resources
+                for entry in items
                 if needle in entry["name"].lower() or needle in entry["label"].lower()
             ]
-            exact = [entry for entry in resources if entry["name"].lower() == needle]
-            if exact:
-                exact[0]["fields"] = client.describe_fields(exact[0]["name"])
-
-        resources.sort(key=lambda entry: entry["name"])
-        return {"resources": resources}
+        items.sort(key=lambda entry: entry["name"])
+        return discovery_page(items, cursor=cursor, limit=limit)
 
     # --- client construction ------------------------------------------------
 
