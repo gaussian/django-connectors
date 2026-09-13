@@ -50,7 +50,7 @@ DJANGO_CONNECTORS = {
 ```
 
 Extras: `mysql`, `postgres`, `drf`, `celery`, `allauth`, `secrets`, `sql`, `csv`,
-`parquet`, `s3`, `google`, `microsoft`. Installing one never enables behaviour by itself —
+`parquet`, `s3`, `gs`, `az`, `google`, `microsoft`. Installing one never enables behaviour by itself —
 the corresponding source or backend must also be named in the setting.
 
 ## Declare a target
@@ -107,7 +107,8 @@ python manage.py demo
 
 Built in: `memory` (a test driver with injectable failure modes), `rest`
 (config-driven, over `dlt.sources.rest_api`), `sql` (warehouses and databases),
-`filesystem` (JSONL/CSV/Parquet). Provider connectors for Gmail, Google Sheets,
+`filesystem` (JSONL/CSV/Parquet on local disk, S3, GCS or Azure — one file, a
+prefix, or a recursive glob). Provider connectors for Gmail, Google Sheets,
 Microsoft/Entra files and Excel, and Salesforce ship under
 `django_connectors.providers` — see their module docstrings for what is and is
 not verified against a live provider.

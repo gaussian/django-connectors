@@ -721,8 +721,103 @@ def test_filesystem_rejects_a_format_whose_extra_is_missing_at_save_time(
     assert f"django-connectors[{extra}]" in message
 
 
-def test_filesystem_refuses_a_cloud_bucket_for_now(source_settings, make_binding):
-    binding = make_binding(
+class MemoryBucketSource(filesystem_source.FilesystemSource):
+    """The shipped source plus an in-process scheme, for tests only."""
+
+    allowed_schemes = filesystem_source.FilesystemSource.allowed_schemes | {"memory"}
+
+
+class MemoryBucketBackend:
+    """Hands the source a ready fsspec filesystem, as a host backend may."""
+
+    def get_credentials(self, connection):
+        import fsspec
+
+        return fsspec.filesystem("memory")
+
+
+@pytest.fixture
+def bucket_settings(source_settings, settings):
+    settings.DJANGO_CONNECTORS = {
+        **source_settings,
+        "SOURCES": {
+            **source_settings["SOURCES"],
+            "bucket": "tests.test_sources.MemoryBucketSource",
+        },
+        "AUTH_BACKENDS": {
+            **source_settings["AUTH_BACKENDS"],
+            "memfs": "tests.test_sources.MemoryBucketBackend",
+        },
+    }
+    return settings.DJANGO_CONNECTORS
+
+
+def _memory_files(records_by_path):
+    import fsspec
+
+    fs = fsspec.filesystem("memory")
+    fs.store.clear()
+    for path, records in records_by_path.items():
+        with fs.open(path, "w") as handle:
+            handle.write("".join(json.dumps(r) + "\n" for r in records))
+    return fs
+
+
+def _bucket_binding(make_connection, make_binding, path):
+    connection = make_connection(provider="bucket", auth_backend="memfs")
+    spec = {"path": path, "format": "jsonl", "primary_key": "id"}
+    return make_binding(
+        connection=connection, source="bucket", config={"resources": {"events": spec}}
+    )
+
+
+def _landed_ids(binding):
+    from django_connectors.landing import access
+
+    rows = access.iter_rows(access.binding_relation(binding, "events"), binding=binding)
+    return sorted(row["id"] for row in rows)
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("memory://bucket/exports", ["1", "2"]),  # whole prefix
+        ("memory://bucket/exports/**/*.jsonl", ["1", "2", "3"]),  # recursive
+        ("memory://bucket/exports/one.jsonl", ["1"]),  # one file
+    ],
+    ids=["prefix", "recursive", "single-file"],
+)
+def test_bucket_addressing_prefix_recursive_and_single_file(
+    bucket_settings, make_connection, make_binding, path, expected
+):
+    _memory_files(
+        {
+            "bucket/exports/one.jsonl": [{"id": "1"}],
+            "bucket/exports/two.jsonl": [{"id": "2"}],
+            "bucket/exports/2024/three.jsonl": [{"id": "3"}],
+        }
+    )
+    binding = _bucket_binding(make_connection, make_binding, path)
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "succeeded", run.error_message
+    assert _landed_ids(binding) == expected
+
+
+def test_a_local_single_file_path_lands_that_file_only(
+    source_settings, make_binding, tmp_path
+):
+    """A file name used to be read as a directory: zero rows, status succeeded."""
+    write_jsonl(tmp_path / "in" / "one.jsonl", [{"id": "1"}])
+    write_jsonl(tmp_path / "in" / "two.jsonl", [{"id": "2"}])
+    spec = {"path": f"{tmp_path}/in/one.jsonl", "format": "jsonl", "primary_key": "id"}
+    binding = make_binding(source="files", config={"resources": {"events": spec}})
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "succeeded", run.error_message
+    assert _landed_ids(binding) == ["1"]
+
+
+def _s3_binding(make_binding):
+    return make_binding(
         source="files",
         config={
             "resources": {
@@ -730,8 +825,94 @@ def test_filesystem_refuses_a_cloud_bucket_for_now(source_settings, make_binding
             }
         },
     )
-    with pytest.raises(ConfigurationError, match="not supported in"):
+
+
+def test_s3_is_accepted_when_its_driver_is_installed(source_settings, make_binding):
+    pytest.importorskip("s3fs")
+    binding_services.validate_binding(_s3_binding(make_binding))
+
+
+def test_s3_without_its_driver_names_the_extra_at_save_time(
+    source_settings, make_binding, monkeypatch
+):
+    monkeypatch.setattr(
+        filesystem_source, "module_available", lambda module: module != "s3fs"
+    )
+    with pytest.raises(ConfigurationError, match=r"django-connectors\[s3\]"):
+        binding_services.validate_binding(_s3_binding(make_binding))
+
+
+@pytest.mark.parametrize("scheme", ["ftp", "http", "memory"])
+def test_unknown_schemes_are_still_refused(source_settings, make_binding, scheme):
+    binding = make_binding(
+        source="files",
+        config={
+            "resources": {
+                "events": {"bucket_url": f"{scheme}://x/y", "primary_key": "id"}
+            }
+        },
+    )
+    with pytest.raises(ConfigurationError, match="not supported"):
         binding_services.validate_binding(binding)
+
+
+def test_a_bucket_url_without_a_bucket_is_refused(source_settings, make_binding):
+    binding = make_binding(
+        source="files",
+        config={
+            "resources": {"events": {"bucket_url": "s3:///prefix", "primary_key": "id"}}
+        },
+    )
+    with pytest.raises(ConfigurationError, match="names no bucket"):
+        binding_services.validate_binding(binding)
+
+
+def test_s3_credentials_are_built_from_the_boto_names():
+    from dlt.common.configuration.specs import AwsCredentials
+
+    built = filesystem_source.bucket_credentials(
+        "s3://bucket/x",
+        {
+            "aws_access_key_id": "AKIA",
+            "aws_secret_access_key": "secret",
+            "region_name": "eu-west-2",
+            "endpoint_url": "http://minio:9000",
+            "ignored": "x",
+        },
+    )
+    assert isinstance(built, AwsCredentials)
+    assert built.aws_access_key_id == "AKIA"
+    assert built.region_name == "eu-west-2"
+    assert built.endpoint_url == "http://minio:9000"
+
+
+def test_s3_with_no_credentials_means_ambient():
+    from dlt.common.configuration.specs import AwsCredentials
+
+    assert isinstance(
+        filesystem_source.bucket_credentials("s3://b/x", None), AwsCredentials
+    )
+
+
+@pytest.mark.parametrize("credentials", [None, {"key": "x"}, "token"])
+def test_other_buckets_need_a_spec_or_a_filesystem(credentials):
+    with pytest.raises(ConfigurationError, match="credential spec or an fsspec"):
+        filesystem_source.bucket_credentials("gs://b/x", credentials)
+
+
+@pytest.mark.parametrize(
+    "segment, is_file",
+    [
+        ("orders.csv", True),
+        ("archive.tar.gz", True),
+        ("exports", False),
+        (".hidden", False),
+        ("v1.2", False),
+        ("data.2024", False),
+    ],
+)
+def test_file_name_heuristic(segment, is_file):
+    assert filesystem_source._looks_like_file(segment) is is_file
 
 
 def test_filesystem_refuses_a_relative_path(source_settings, make_binding):
