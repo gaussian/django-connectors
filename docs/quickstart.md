@@ -176,3 +176,4 @@ the sweeper is the safety net.
 
 - [architecture.md](architecture.md) — why the pieces are shaped this way
 - [operations.md](operations.md) — MySQL, concurrency, retention, deployment
+- [api.md](api.md) — the optional REST API, and composing it with your own

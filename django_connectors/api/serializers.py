@@ -14,7 +14,7 @@ Defence in depth is worth it for the one field capable of carrying a landing DSN
 
 from rest_framework import serializers
 
-from django_connectors.api.scoping import resolve_owner
+from django_connectors.api.scoping import OWNER_CONTEXT_KEY, resolve_owner
 from django_connectors.errors import scrub
 from django_connectors.models import (
     Binding,
@@ -48,10 +48,7 @@ class OwnerScopedPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        request = self.context.get("request")
-        if request is None:
-            return queryset.none()
-        owner = resolve_owner(request)
+        owner = self._owner()
         if owner is None:
             return queryset.none()
         content_type_id, object_id = owner
@@ -62,6 +59,23 @@ class OwnerScopedPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
                 f"{prefix}owner_object_id": object_id,
             }
         )
+
+    def _owner(self):
+        """The owner to scope on: the viewset's answer, else the setting's.
+
+        A viewset that mixes in ``OwnerScopedQuerysetMixin`` puts its resolved
+        owner in the serializer context, so a host overriding ``get_owner()``
+        scopes writes with the same answer it scopes reads with. The key being
+        *present and None* means "nobody" and fails closed; it being absent
+        means the serializer is used outside those viewsets, where the setting
+        is the only source of truth.
+        """
+        if OWNER_CONTEXT_KEY in self.context:
+            return self.context[OWNER_CONTEXT_KEY]
+        request = self.context.get("request")
+        if request is None:
+            return None
+        return resolve_owner(request)
 
 
 class ScrubbedCharField(serializers.CharField):

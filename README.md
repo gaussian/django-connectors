@@ -119,6 +119,7 @@ Writing your own means subclassing `SourceDefinition` and returning a dlt source
 - [docs/quickstart.md](docs/quickstart.md) — end to end in ten minutes
 - [docs/architecture.md](docs/architecture.md) — why the pieces are shaped as they are
 - [docs/operations.md](docs/operations.md) — deploying on MySQL or PostgreSQL, concurrency, retention
+- [docs/api.md](docs/api.md) — the optional REST API, and composing it with your own
 - [AGENTS.md](AGENTS.md) — development workflow and test tiers
 
 ## Development

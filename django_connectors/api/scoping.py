@@ -68,6 +68,14 @@ class OwnerScopedQuerysetMixin:
     ``Connection.owner_*``. A subclass that does not declare one is a
     programming error and raises at class-definition time rather than quietly
     returning everything.
+
+    **Composing with your own API.** A host that already has an authentication
+    scheme overrides :meth:`get_owner` and sets ``permission_classes`` on a
+    subclass; ``API_OWNER_RESOLVER`` and ``API_PERMISSION_CLASSES`` then never
+    need to be set. The owner this method returns is what scopes reads, what
+    scopes writable relations on the serializer (via the serializer context),
+    and what a newly created Connection is stamped with — one answer, three
+    uses, so a host cannot scope reads by one tenancy and writes by another.
     """
 
     #: e.g. "" on Connection, "connection" on Binding, "binding__connection" on Run.
@@ -85,9 +93,27 @@ class OwnerScopedQuerysetMixin:
                 f"no owner_lookup, so it cannot scope its queryset to a tenant."
             )
 
+    def get_owner(self):
+        """``(content_type_id, object_id)`` for the caller, or None for nobody.
+
+        The default delegates to ``API_OWNER_RESOLVER``. Override it to answer
+        from your own request state — ``self.request.team``, a session, a token
+        claim. Return a model instance or an explicit ``(content_type,
+        object_id)`` pair; both are normalised. Return None to show nothing.
+        """
+        return resolve_owner(self.request)
+
+    def resolved_owner(self):
+        """:meth:`get_owner`, normalised. Cached per request so the three
+        consumers (queryset, serializer context, create) agree on one answer."""
+        if not hasattr(self, "_resolved_owner"):
+            owner = self.get_owner()
+            self._resolved_owner = None if owner is None else normalize_owner(owner)
+        return self._resolved_owner
+
     def get_queryset(self):
         queryset = super().get_queryset()
-        owner = resolve_owner(self.request)
+        owner = self.resolved_owner()
         if owner is None:
             return queryset.none()
         content_type_id, object_id = owner
@@ -99,3 +125,14 @@ class OwnerScopedQuerysetMixin:
                 f"{prefix}owner_object_id": object_id,
             }
         )
+
+    def get_serializer_context(self):
+        # The serializer's writable relations scope on this, not on the setting,
+        # so an overridden get_owner() governs writes as well as reads.
+        context = super().get_serializer_context()
+        context[OWNER_CONTEXT_KEY] = self.resolved_owner()
+        return context
+
+
+#: Serializer context key carrying the viewset's resolved owner.
+OWNER_CONTEXT_KEY = "connectors_owner"
