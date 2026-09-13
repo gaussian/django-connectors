@@ -1,314 +1,515 @@
-"""Every SourceDefinition must pass the same contract.
+"""The connector contract, applied uniformly to every source this repo ships.
 
-Two layers:
+The provider connectors are mock-tested with zero network, and their own
+modules are thorough about *provider* behaviour — pagination, throttling, delta
+tokens, cell types. What none of them does is assert the same things about all
+of them, and a rule that holds for four connectors and not the fifth is exactly
+the rule nobody notices.
 
-* **Static** — no credentials, no network, runs against every source class
-  shipped in the package *and* every source a host registers. This is the gate
-  the connector contract lives behind: a source that constructs its own
-  ``Incremental``, omits a write disposition, or crashes ``validate_config``
-  with a ``TypeError`` fails here, not in a customer's Run.
-* **Dynamic** — for sources that can run with no provider at all (memory,
-  filesystem, sql over sqlite), a canned payload is landed through the real
-  instrumentation and the landing invariants are asserted on what arrived.
+So the contract is a suite, and it lives in
+``django_connectors.testing.conformance`` — in the wheel, not here, because it
+applies to host-defined SourceDefinitions too and a suite that only exists in
+this repository can only be run against the connectors this repository happens
+to ship.
 
-The enumeration test at the bottom is what makes this a gate rather than a
-suite: a source class added to the package without being listed here fails.
+Two halves, split by what they need:
+
+* **This module** runs the credential-free half over every shipped source, and
+  gates the list against the filesystem so a new connector cannot silently opt
+  out.
+* **Each connector's own module** runs the landing half, because that needs the
+  in-process fake that module already has. One fake per provider, not one per
+  suite: a second copy would be a second belief about the provider, drifting
+  independently of the first. This module asserts that each of those tests
+  exists, by name.
 """
 
-import importlib
-import inspect
-import pkgutil
-from types import SimpleNamespace
+import ast
+import importlib.util
+import pathlib
 from typing import ClassVar
 
 import pytest
-from django.utils.module_loading import import_string
 
 from django_connectors.enums import RunStatus, RunTrigger
-from django_connectors.landing import access
-from django_connectors.landing.naming import (
-    BINDING_ID_COLUMN,
-    DELETED_COLUMN,
-    RUN_ID_COLUMN,
-    landing_table_name,
-)
+from django_connectors.exceptions import ConfigurationError
+from django_connectors.landing.naming import DELETED_COLUMN
+from django_connectors.providers.google.gmail import GmailSource
+from django_connectors.providers.google.sheets import GoogleSheetsSource
+from django_connectors.providers.microsoft.excel import EntraExcelSource
+from django_connectors.providers.microsoft.files import EntraFilesSource
+from django_connectors.providers.salesforce.source import SalesforceSource
+from django_connectors.services import runs as run_services
 from django_connectors.sources.base import SourceDefinition
-from django_connectors.sources.conformance import (
-    GARBAGE_CONFIGS,
-    assert_source_conforms,
-    static_problems,
-)
-from tests.test_sources import (
-    SQLITE_ROWS,
-    files_config,
-    make_sqlite_database,
-    sql_config,
-    write_jsonl,
-)
+from django_connectors.sources.filesystem import FilesystemSource
+from django_connectors.sources.memory import MemorySource, tombstone
+from django_connectors.sources.rest import RestSource
+from django_connectors.sources.sql import SqlSource
+from django_connectors.testing import conformance
+from tests.conftest import memory_config
 
-#: Every source class this package ships. The enumeration test below fails if
-#: a class exists on disk that is not listed here.
-SHIPPED_SOURCES = (
-    "django_connectors.sources.memory.MemorySource",
-    "django_connectors.sources.rest.RestSource",
-    "django_connectors.sources.sql.SqlSource",
-    "django_connectors.sources.filesystem.FilesystemSource",
-    "django_connectors.providers.google.gmail.GmailSource",
-    "django_connectors.providers.google.sheets.GoogleSheetsSource",
-    "django_connectors.providers.microsoft.files.EntraFilesSource",
-    "django_connectors.providers.microsoft.excel.EntraExcelSource",
-    "django_connectors.providers.salesforce.source.SalesforceSource",
-)
-
-SOURCE_PACKAGES = ("django_connectors.sources", "django_connectors.providers")
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+PACKAGE_ROOT = REPO_ROOT / "django_connectors"
 
 
-def _shipped_keys():
-    return [import_string(path).key for path in SHIPPED_SOURCES]
+class Case:
+    """One connector, plus the smallest input the credential-free half needs."""
+
+    def __init__(self, definition, *, invalid_configs):
+        self.definition = definition
+        #: Configs the source must refuse with ConfigurationError. Supplied per
+        #: connector rather than invented generically: a source with no required
+        #: keys legitimately accepts ``{}``, so "reject an empty dict" would be
+        #: wrong for it and vacuous for everyone else.
+        self.invalid_configs = invalid_configs
+
+    @property
+    def key(self):
+        return self.definition.key
+
+    def __repr__(self):
+        return self.key
 
 
-# --- static: every shipped source ------------------------------------------
+CASES = [
+    Case(MemorySource(), invalid_configs=[{}, {"resources": {"e": {"batches": 1}}}]),
+    Case(
+        RestSource(),
+        invalid_configs=[{}, {"base_url": "https://api.test/"}, {"resources": {}}],
+    ),
+    Case(SqlSource(), invalid_configs=[{}, {"url": "sqlite:///x.db"}]),
+    Case(FilesystemSource(), invalid_configs=[{}, {"resources": {}}]),
+    Case(
+        GmailSource(),
+        invalid_configs=[
+            {"user_id": "someone/else"},
+            {"message_format": "raw"},
+            {"label_ids": "INBOX"},
+        ],
+    ),
+    Case(GoogleSheetsSource(), invalid_configs=[{}, {"spreadsheet_id": "s"}]),
+    Case(EntraFilesSource(), invalid_configs=[{}, {"drive_id": ""}]),
+    Case(EntraExcelSource(), invalid_configs=[{}, {"drive_id": ""}]),
+    Case(SalesforceSource(), invalid_configs=[{}, {"objects": {}}]),
+]
 
+CASES_BY_KEY = {case.key: case for case in CASES}
 
-@pytest.mark.parametrize("path", SHIPPED_SOURCES, ids=_shipped_keys())
-def test_shipped_source_conforms(path):
-    assert_source_conforms(import_string(path)())
-
-
-def test_every_source_class_on_disk_is_listed():
-    """Adding a source without listing it here must fail, or the gate is prose."""
-    found = set()
-    for package_name in SOURCE_PACKAGES:
-        package = importlib.import_module(package_name)
-        for info in pkgutil.walk_packages(package.__path__, f"{package_name}."):
-            module = importlib.import_module(info.name)
-            for _, obj in inspect.getmembers(module, inspect.isclass):
-                if (
-                    issubclass(obj, SourceDefinition)
-                    and obj is not SourceDefinition
-                    and obj.__module__ == module.__name__
-                    and obj.key
-                ):
-                    found.add(f"{obj.__module__}.{obj.__qualname__}")
-    assert found == set(SHIPPED_SOURCES), (
-        f"unlisted: {sorted(found - set(SHIPPED_SOURCES))}; "
-        f"missing on disk: {sorted(set(SHIPPED_SOURCES) - found)}"
-    )
-
-
-def test_registered_sources_conform(connectors_settings):
-    """What a host runs in its own suite: every key in SOURCES passes."""
-    from django_connectors.registry import sources
-
-    for key, definition in sources.all().items():
-        assert not static_problems(definition), (key, static_problems(definition))
-
-
-# --- static: the checks themselves catch what they claim to ----------------
-
-
-class _Crashing(SourceDefinition):
-    key = "crashing"
-    provider = "test"
-
-    def validate_config(self, config):
-        return config.get("resources")  # AttributeError on a string
-
-
-class _BuildsItsOwnIncremental(SourceDefinition):
-    key = "own_incremental"
-    provider = "test"
-
-    def incremental_for(self, resource_name, binding):
-        from dlt.extract.incremental import Incremental
-
-        return Incremental(cursor_path="updated_at")
-
-
-class _BadFlags(SourceDefinition):
-    key = "Bad Key"
-    provider = ""
-    emits_tombstones = 1
-    required_extras: ClassVar[dict] = {"pandas": None}
-    supported_auth_backends = "static"
-
-
-def test_static_checks_catch_a_validate_config_that_crashes():
-    problems = static_problems(_Crashing())
-    assert any("AttributeError" in p for p in problems)
-    assert any("must return None" in p for p in problems)
-
-
-def test_static_checks_catch_a_source_that_constructs_its_own_incremental():
-    problems = static_problems(_BuildsItsOwnIncremental())
-    assert any("never construct the Incremental" in p for p in problems)
-
-
-def test_static_checks_catch_bad_identity_and_flags():
-    problems = "\n".join(static_problems(_BadFlags()))
-    assert "naming convention" in problems
-    assert "`provider`" in problems
-    assert "`emits_tombstones`" in problems
-    assert "`required_extras`" in problems
-    assert "`supported_auth_backends`" in problems
-
-
-def test_assert_helper_names_every_problem_at_once():
-    with pytest.raises(AssertionError) as excinfo:
-        assert_source_conforms(_BadFlags())
-    assert excinfo.value.args[0].count("\n  - ") >= 4
-
-
-def test_garbage_configs_cover_the_json_shapes_a_binding_can_store():
-    """A JSON field stores any JSON value; the fuzz set must include non-objects."""
-    kinds = {type(item).__name__ for item in GARBAGE_CONFIGS}
-    assert {"NoneType", "dict", "list", "str", "int"} <= kinds
-
-
-# --- dynamic: offline-capable sources land with the invariants -------------
-
-
-def _offline_cases():
-    def memory(tmp_path):
-        return (
-            "memory",
-            {
-                "resources": {
-                    "events": {
-                        "primary_key": "id",
-                        "batches": [
-                            [{"id": "1", "v": "a"}, {"id": "2", "v": "b"}],
-                        ],
-                    }
-                }
-            },
-            "events",
-            ("id",),
-        )
-
-    def filesystem(tmp_path):
-        write_jsonl(
-            tmp_path / "in" / "a.jsonl", [{"id": "1", "v": "a"}, {"id": "2", "v": "b"}]
-        )
-        return "filesystem", files_config(tmp_path / "in"), "events", ("id",)
-
-    def sql(tmp_path):
-        url = make_sqlite_database(tmp_path, SQLITE_ROWS)
-        return "sql", sql_config(url), "orders", ("id",)
-
-    return {"memory": memory, "filesystem": filesystem, "sql": sql}
-
-
-OFFLINE_SOURCES = {
-    "memory": "django_connectors.sources.memory.MemorySource",
-    "filesystem": "django_connectors.sources.filesystem.FilesystemSource",
-    "sql": "django_connectors.sources.sql.SqlSource",
+#: Where each connector's landing half lives. The test is named
+#: ``test_<key>_conformance`` in that file, and the gate below checks it is
+#: really there — the fakes cannot move here without duplicating them.
+LANDING_SUITES = {
+    "memory": "tests/test_source_conformance.py",
+    "rest": "tests/test_sources.py",
+    "sql": "tests/test_sources.py",
+    "filesystem": "tests/test_sources.py",
+    "gmail": "tests/test_providers_google.py",
+    "google_sheets": "tests/test_providers_google.py",
+    "entra_files": "tests/test_providers_microsoft.py",
+    "entra_excel": "tests/test_providers_microsoft.py",
+    "salesforce": "tests/test_providers_salesforce.py",
 }
 
 
-@pytest.fixture
-def offline_settings(connectors_settings, settings):
-    settings.DJANGO_CONNECTORS = {
-        **connectors_settings,
-        "SOURCES": {**connectors_settings["SOURCES"], **OFFLINE_SOURCES},
+# --- the suite covers every source, and cannot quietly stop --------------
+
+
+def _shipped_source_keys():
+    """Every ``key`` declared by a SourceDefinition subclass in the package.
+
+    Read from the filesystem rather than from the registry: a registry contains
+    only what a *host* configured, so a source can ship and be registered by
+    nobody — which is precisely the source most likely to go unchecked.
+    """
+    known_bases = {"SourceDefinition"} | {
+        type(case.definition).__name__ for case in CASES
     }
-    return settings.DJANGO_CONNECTORS
+    keys = set()
+    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+        if path.parent.name == "testing":
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            bases = {
+                base.id if isinstance(base, ast.Name) else getattr(base, "attr", "")
+                for base in node.bases
+            }
+            if not bases & known_bases:
+                continue
+            for statement in node.body:
+                if (
+                    isinstance(statement, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name) and target.id == "key"
+                        for target in statement.targets
+                    )
+                    and isinstance(statement.value, ast.Constant)
+                    and statement.value.value
+                ):
+                    keys.add(statement.value.value)
+    return keys
 
 
-@pytest.mark.parametrize("case", sorted(_offline_cases()))
-def test_offline_source_declares_disposition_and_instruments_cleanly(
-    case, offline_settings, make_binding, tmp_path
-):
-    """Before instrumentation: disposition stated. After: every invariant applied."""
-    from django_connectors.landing.instrument import instrument_source
-    from django_connectors.registry import sources
+def test_every_source_the_library_ships_has_a_conformance_case():
+    shipped = _shipped_source_keys()
+    assert shipped, "found no SourceDefinition subclasses at all"
+    missing = sorted(shipped - set(CASES_BY_KEY))
+    assert not missing, (
+        f"sources {missing} ship with no conformance case. Add one to CASES in "
+        f"this module — the contract is not optional for a new connector."
+    )
 
-    source_key, config, resource_name, pk = _offline_cases()[case](tmp_path)
-    binding = make_binding(source=source_key, config=config)
-    definition = sources.get(source_key)
-    run = SimpleNamespace(id="00000000-0000-0000-0000-000000000000")
 
-    source = definition.build_source(binding=binding, credentials=None, run=run)
-    assert type(source).__name__ == "DltSource"
-    for resource in source.resources.values():
-        # dlt defaults this hint to "append" when omitted; a source must say it.
-        assert "write_disposition" in resource._hints, (
-            f"{source_key}:{resource.name} does not state write_disposition"
+def test_every_source_also_has_a_landing_conformance_test():
+    """The credential-free half alone would let a connector land nonsense."""
+    missing = sorted(set(CASES_BY_KEY) - set(LANDING_SUITES))
+    assert not missing, f"no landing suite declared for {missing}"
+
+    for key, relative in sorted(LANDING_SUITES.items()):
+        path = REPO_ROOT / relative
+        assert path.exists(), f"{relative} does not exist"
+        assert f"def test_{key}_conformance(" in path.read_text(), (
+            f"{relative} declares no `test_{key}_conformance`. The landing half "
+            f"of the suite lives beside the fake it needs; add it there."
         )
 
-    instrument_source(source, binding=binding, run=run, source_definition=definition)
-    assert source.max_table_nesting == 0
-    resource = source.resources[resource_name]
-    hints = resource._hints
-    assert tuple(hints["primary_key"]) == (BINDING_ID_COLUMN, *pk)
-    for column, spec in (hints.get("columns") or {}).items():
-        assert not spec.get("hard_delete"), f"{column} carries hard_delete"
+
+# --- the credential-free half, over every source -------------------------
 
 
-@pytest.mark.parametrize("case", sorted(_offline_cases()))
-def test_offline_source_lands_rows_carrying_tenant_metadata(
-    case, offline_settings, make_binding, tmp_path
-):
-    from django_connectors.services import runs as run_services
+@pytest.mark.parametrize("case", CASES, ids=repr)
+def test_the_definition_honours_the_contract(case):
+    failures = conformance.check_definition(
+        case.definition, invalid_configs=case.invalid_configs
+    )
+    assert failures == [], "\n".join(failures)
 
-    source_key, config, resource_name, pk = _offline_cases()[case](tmp_path)
-    binding = make_binding(source=source_key, config=config)
+
+@pytest.mark.parametrize("case", CASES, ids=repr)
+def test_validate_config_raises_configuration_error_and_not_something_else(case):
+    """Restated on its own because the save path keys on the exception *type*.
+
+    ``Binding.clean()`` and the API serializer catch ``ConnectorError`` and let
+    anything else through, so a source raising ``ValueError`` produces a 500
+    where it should have produced a field error.
+    """
+    for config in case.invalid_configs:
+        with pytest.raises(ConfigurationError):
+            case.definition.validate_config(config)
+
+
+# --- the suite must itself be able to fail --------------------------------
+
+
+def test_the_suite_notices_a_source_that_breaks_the_contract():
+    """A conformance suite nothing can fail is a suite that proves nothing."""
+
+    class Sloppy:
+        key = "sloppy"
+        required_extras: ClassVar[list] = ["pandas"]  # not a dict
+        emits_tombstones = "yes"  # not a bool
+        supported_auth_backends = "static"  # a string, not a sequence of keys
+
+        def validate_config(self, config):
+            return None  # accepts anything
+
+    failures = "\n".join(conformance.check_definition(Sloppy(), invalid_configs=[{}]))
+    for expected in (
+        "required_extras",
+        "emits_tombstones",
+        "supported_auth_backends",
+        "accepted a config",
+        "provides_content",
+        "no `discover` method",
+        "no `reshape_for` method",
+    ):
+        assert expected in failures, (expected, failures)
+
+
+def test_a_source_with_no_invalid_configs_is_reported_rather_than_passing():
+    """Silence is not conformance: supplying nothing must not look like success."""
+    failures = conformance.check_definition(MemorySource(), invalid_configs=[])
+    assert any("never proven to reject" in failure for failure in failures)
+
+
+@pytest.fixture
+def load_source_module(tmp_path):
+    """Import a throwaway source module from disk, and make it introspectable.
+
+    Registered in ``sys.modules`` because ``inspect.getsourcefile`` resolves a
+    class's file through it — without that the conformance checks would find no
+    source to parse and report the deliberately-broken module as clean, which
+    is the failure mode these tests exist to rule out.
+    """
+    import sys
+
+    loaded_names = []
+
+    def load(name, body):
+        module = tmp_path / f"{name}.py"
+        module.write_text(body)
+        spec = importlib.util.spec_from_file_location(name, module)
+        loaded = importlib.util.module_from_spec(spec)
+        sys.modules[name] = loaded
+        loaded_names.append(name)
+        spec.loader.exec_module(loaded)
+        return loaded
+
+    yield load
+
+    for name in loaded_names:
+        sys.modules.pop(name, None)
+
+
+def test_an_omitted_write_disposition_is_caught_at_the_call_site(load_source_module):
+    """The only place the omission is still visible.
+
+    ``dlt.resource()`` defaults the hint to ``"append"`` rather than to None, so
+    a resource that omits it is byte-identical at runtime to one that states
+    ``"append"`` deliberately. Nothing observable distinguishes them; the call
+    site does.
+    """
+    loaded = load_source_module(
+        "sloppy_source",
+        "from django_connectors.sources.base import SourceDefinition\n"
+        "class Sloppy(SourceDefinition):\n"
+        "    key = 'sloppy'\n"
+        "    def build_source(self, *, binding, credentials, run):\n"
+        "        import dlt\n"
+        "        return dlt.resource(lambda: [], name='x', primary_key='id')()\n",
+    )
+    failures = conformance.check_definition(
+        loaded.Sloppy(), invalid_configs=[{"impossible": True}]
+    )
+    assert any("write_disposition" in failure for failure in failures), failures
+
+
+def test_a_module_scope_dlt_import_is_caught(load_source_module):
+    loaded = load_source_module(
+        "eager_source",
+        "import dlt\n"
+        "from django_connectors.sources.base import SourceDefinition\n"
+        "class Eager(SourceDefinition):\n"
+        "    key = 'eager'\n",
+    )
+    failures = conformance.check_definition(
+        loaded.Eager(), invalid_configs=[{"impossible": True}]
+    )
+    assert any("module-scope dlt import" in failure for failure in failures), failures
+
+
+def test_a_subclass_does_not_escape_its_parents_module(load_source_module):
+    """A host points a shipped connector at a sandbox by subclassing it.
+
+    Checking only the subclass's own module would then parse an almost empty
+    file and report conformance.
+    """
+    loaded = load_source_module(
+        "subclassed_source",
+        "import dlt\n"
+        "from django_connectors.sources.base import SourceDefinition\n"
+        "class Parent(SourceDefinition):\n"
+        "    key = 'parent'\n",
+    )
+
+    class Child(loaded.Parent):
+        key = "child"
+
+    failures = conformance.check_definition(
+        Child(), invalid_configs=[{"impossible": True}]
+    )
+    assert any("module-scope dlt import" in failure for failure in failures), failures
+
+
+def test_incremental_kwargs_that_construct_an_incremental_are_caught(tmp_path):
+    """dlt strips the incremental from a *bound* resource's signature.
+
+    A source that builds its own is beyond the library's reach entirely, and
+    the two settings the library forces each drop records with no error.
+    """
+    from dlt.extract.incremental import Incremental
+
+    class BuildsItsOwn(MemorySource):
+        key = "builds_its_own"
+
+        def incremental_for(self, resource_name, binding):
+            return Incremental(cursor_path="updated_at")
+
+    failures = conformance._check_incremental_kwargs(
+        "builds_its_own", BuildsItsOwn(), "events", None, Incremental
+    )
+    assert any("returned an Incremental" in failure for failure in failures), failures
+
+
+def test_incremental_kwargs_setting_the_dedup_key_are_caught():
+    """The library forces it empty, so setting it here is silently discarded.
+
+    dlt's default drops a record updated at exactly the stored cursor value.
+    """
+    from dlt.extract.incremental import Incremental
+
+    class SetsDedupKey(MemorySource):
+        key = "sets_dedup_key"
+
+        def incremental_for(self, resource_name, binding):
+            return {"cursor_path": "updated_at", "primary_key": "id"}
+
+    failures = conformance._check_incremental_kwargs(
+        "sets_dedup_key", SetsDedupKey(), "events", None, Incremental
+    )
+    assert any("primary_key" in failure for failure in failures), failures
+
+
+# --- tombstones ------------------------------------------------------------
+
+
+def test_a_source_claiming_tombstones_emits_one_carrying_only_the_merge_key():
+    """``delete-insert`` merge replaces the whole row.
+
+    Every column a tombstone omits lands as NULL, which is why a target
+    identity field sourced from outside the merge key is None on the delete
+    path — and why Projection validation refuses that configuration up front.
+    """
+    assert MemorySource().emits_tombstones is True
+    assert (
+        conformance.check_tombstone_shape(
+            tombstone({"id": "1"}), merge_key_columns=["id"]
+        )
+        == []
+    )
+
+
+def test_a_tombstone_carrying_a_payload_column_is_reported():
+    failures = conformance.check_tombstone_shape(
+        {"id": "1", DELETED_COLUMN: True, "name": "still here"},
+        merge_key_columns=["id"],
+    )
+    assert any("non-key column" in failure for failure in failures), failures
+
+
+def test_a_tombstone_missing_the_deleted_flag_is_reported():
+    failures = conformance.check_tombstone_shape({"id": "1"}, merge_key_columns=["id"])
+    assert any(DELETED_COLUMN in failure for failure in failures), failures
+
+
+# --- the landing half, for the one source that needs no fake ---------------
+
+
+@pytest.mark.django_db
+def test_memory_conformance(connectors_settings, make_binding):
+    from django_connectors.models import Run
+    from django_connectors.registry import sources
+
+    definition = sources.get("memory")
+    binding = make_binding(
+        config=memory_config(
+            batches=[
+                [{"id": "1", "meta": {"nested": "value"}}],
+                [tombstone({"id": "1"})],
+            ]
+        )
+    )
+
+    built = conformance.check_built_source(
+        definition,
+        binding=binding,
+        credentials=None,
+        run=Run.objects.create(binding=binding),
+    )
+    assert built == [], "\n".join(built)
 
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     assert run.status == RunStatus.SUCCEEDED, run.error_message
 
-    relation = access.binding_relation(binding, resource_name)
-    rows = list(access.iter_rows(relation, binding=binding))
-    assert rows, "nothing landed"
-    for row in rows:
-        assert row[BINDING_ID_COLUMN] == str(binding.id)
-        assert row[RUN_ID_COLUMN] == str(run.id)
-        assert row[DELETED_COLUMN] in (True, False, 0, 1)
-
-    # No child tables: nesting is off, so dicts/lists land as JSON columns.
-    table = landing_table_name(source_key, resource_name, binding.landing_key)
-    schema = access.binding_dataset(binding).schema
-    children = [name for name in schema.tables if name.startswith(f"{table}__")]
-    assert not children, children
-
-    # Merge identity in the landed schema leads with the binding id.
-    merge_key = {
-        name
-        for name, column in schema.tables[table]["columns"].items()
-        if column.get("primary_key")
-    }
-    assert merge_key == {BINDING_ID_COLUMN, *pk}
+    landed = conformance.check_landing_invariants(
+        binding, expected_resources=["events"]
+    )
+    assert landed == [], "\n".join(landed)
 
 
-def test_tombstone_source_marks_the_row_deleted_and_keeps_its_key(
-    offline_settings, make_binding
+@pytest.mark.django_db
+def test_the_landing_half_notices_a_missing_tenant_column(
+    connectors_settings, make_binding, monkeypatch
 ):
-    """emits_tombstones=True means a later batch can delete, and the key survives."""
-    from django_connectors.registry import sources
-    from django_connectors.services import runs as run_services
-    from django_connectors.sources.memory import tombstone
+    """The `add_map` arity bug writes NULL binding ids with no error at all."""
+    from django_connectors.landing import instrument
 
-    assert sources.get("memory").emits_tombstones is True
-    binding = make_binding(
-        source="memory",
-        config={
-            "resources": {
-                "events": {
-                    "primary_key": "id",
-                    "batches": [
-                        [{"id": "1", "v": "a"}],
-                        [tombstone({"id": "1"})],
-                    ],
-                }
-            }
+    monkeypatch.setattr(
+        instrument,
+        "METADATA_COLUMN_HINTS",
+        {
+            key: value
+            for key, value in instrument.METADATA_COLUMN_HINTS.items()
+            if key != instrument.RUN_ID_COLUMN
         },
     )
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
-
-    rows = list(
-        access.iter_rows(access.binding_relation(binding, "events"), binding=binding)
+    monkeypatch.setattr(
+        instrument,
+        "make_metadata_injector",
+        lambda binding_id, run_id: (
+            lambda row: {
+                **row,
+                instrument.BINDING_ID_COLUMN: binding_id,
+                DELETED_COLUMN: row.get(DELETED_COLUMN, False),
+            }
+        ),
     )
-    assert len(rows) == 1
-    assert rows[0]["id"] == "1"
-    assert bool(rows[0][DELETED_COLUMN]) is True
+
+    binding = make_binding(config=memory_config(batches=[[{"id": "1"}]]))
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+
+    failures = conformance.check_landing_invariants(binding)
+    assert any("_connector_run_id" in failure for failure in failures), failures
+
+
+# --- the checks the integration review added -------------------------------
+
+
+def test_a_validate_config_that_crashes_on_a_non_object_is_caught():
+    """`Binding.config` is a JSON field; a string or a number is a stored value."""
+
+    class Crashing(SourceDefinition):
+        key = "crashing"
+        provider = "test"
+
+        def validate_config(self, config):
+            return config.get("resources")  # AttributeError on "x"
+
+    failures = "\n".join(conformance.check_definition(Crashing(), invalid_configs=[{}]))
+    assert "AttributeError" in failures
+    assert "must return None" in failures
+
+
+def test_a_discover_without_the_browsing_keywords_is_caught():
+    class OldStyle(SourceDefinition):
+        key = "old_style"
+        provider = "test"
+
+        def discover(self, *, connection, credentials, query=None):
+            return {"resources": []}
+
+    failures = "\n".join(conformance.check_definition(OldStyle(), invalid_configs=[{}]))
+    assert "['path', 'cursor', 'limit']" in failures
+
+
+def test_a_reshape_for_that_returns_the_wrong_thing_is_caught():
+    class Odd(SourceDefinition):
+        key = "odd"
+        provider = "test"
+
+        def reshape_for(self, resource_name, binding):
+            return ["received_at"]
+
+    failures = "\n".join(conformance.check_definition(Odd(), invalid_configs=[{}]))
+    assert "unpivot spec dict" in failures
+
+
+def test_a_key_dlt_would_rewrite_is_caught():
+    class BadKey(SourceDefinition):
+        key = "Bad Key"
+        provider = "test"
+
+    failures = "\n".join(conformance.check_definition(BadKey(), invalid_configs=[{}]))
+    assert "naming convention" in failures

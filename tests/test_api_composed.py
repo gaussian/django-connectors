@@ -27,6 +27,10 @@ from rest_framework.test import APIClient
 
 from django_connectors.api import views as api_views
 from django_connectors.models import Binding, Connection
+from tests.conftest import memory_config
+
+#: Save-time validation refuses an empty config, so a creatable Binding needs a real one.
+VALID_CONFIG = memory_config(batches=[[{"id": "1"}]])
 
 pytestmark = pytest.mark.django_db
 
@@ -190,7 +194,7 @@ def test_writable_relations_scope_on_the_host_owner(
 
     stolen = client.post(
         _url("binding-list"),
-        {"connection": str(victim.id), "source": "memory", "config": {}},
+        {"connection": str(victim.id), "source": "memory", "config": VALID_CONFIG},
         format="json",
     )
     assert stolen.status_code == 400
@@ -199,7 +203,7 @@ def test_writable_relations_scope_on_the_host_owner(
 
     legitimate = client.post(
         _url("binding-list"),
-        {"connection": str(own.id), "source": "memory", "config": {}},
+        {"connection": str(own.id), "source": "memory", "config": VALID_CONFIG},
         format="json",
     )
     assert legitimate.status_code == 201, legitimate.data
@@ -212,7 +216,7 @@ def test_reads_and_writes_agree_when_the_host_owner_is_none(
     own = make_connection(owner_id="nobody")
     response = client_as("nobody").post(
         _url("binding-list"),
-        {"connection": str(own.id), "source": "memory", "config": {}},
+        {"connection": str(own.id), "source": "memory", "config": VALID_CONFIG},
         format="json",
     )
     # None fails closed on the writable relation too: not "nobody's

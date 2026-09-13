@@ -65,6 +65,48 @@ Each Binding also gets its own dlt **schema name**. A cold restore resolves a
 schema by name from `_dlt_version` and takes the newest row, so a shared name
 hands one Binding another's columns.
 
+## The library provisions the landing indexes
+
+dlt creates **no primary key and no index** on a landing table, and the only
+merge strategy the sqlalchemy destination supports is `delete-insert`, whose
+delete step joins the landing table to the staging table on the merge key. With
+no index that join scans the whole table on every load. Measured on MySQL 8.4:
+200 rows into 5k/20k/50k took 0.50s/1.41s/3.30s, and **10,000 rows into a
+60,000-row table took 179 seconds**. With the index below the same loads were
+flat at 0.13–0.17s across 50k/100k/200k, and the index survived dlt's own
+`ALTER TABLE` schema evolution.
+
+Declaring a primary key on the destination is not the fix and would be worse:
+`create_primary_keys=True` hard-fails unless every key column carries a
+`precision` hint, emits columns in a different order from the declared one, and
+— being a real uniqueness constraint — turns a source that emits a duplicate key
+inside one batch from a soft dedupe into a permanently poisoned load package.
+
+So `landing/index.py` issues the `CREATE INDEX` itself, after each successful
+load, idempotently, for two indexes per table:
+
+| Index | Serves |
+| --- | --- |
+| `(_connector_binding_id, …resource primary key)` | dlt's merge predicate |
+| `(_dlt_load_id, _connector_binding_id)` | the incremental projection window |
+
+The second leads with the load id, not the binding id, because
+`access.binding_relation` deliberately emits no tenant `WHERE` clause —
+PostgreSQL rejects the `CAST(x AS TEXT(36))` dlt renders against a
+precision-hinted column — so `_dlt_load_id IN (…)` is the only predicate, and an
+index led by the binding id could not serve it.
+
+It is dialect-aware in exactly one place, and that place is load-bearing: dlt
+maps a `str` column with no precision hint to `TEXT`, and MySQL refuses to index
+one without a prefix length (*error 1170*), while PostgreSQL has no such rule and
+rejects the prefix syntax. MySQL also has no `CREATE INDEX IF NOT EXISTS`, so
+idempotency is established by reflection rather than by syntax. Both are
+asserted on real servers in the `serverdb` tier; sqlite can express neither.
+
+A failure here never fails the Run — the rows landed correctly, and what is
+degraded is the cost of the *next* merge. The Binding moves to `needs_review`
+instead, which keeps it syncing while making the degradation visible.
+
 ## Tenant identity
 
 Every root landing record carries `_connector_binding_id`, `_connector_run_id`

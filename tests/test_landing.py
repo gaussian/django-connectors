@@ -604,9 +604,15 @@ def test_repeated_enqueues_collapse_to_one_queued_run(
 
 
 def test_no_module_constructs_sql_outside_the_access_chokepoint():
-    """Five features need tenant-scoped landing reads; one place implements it."""
+    """Five features need tenant-scoped landing reads; one place implements it.
+
+    ``landing/index.py`` is the one exemption, and only because it touches no
+    rows at all: it issues DDL against a table whose name is already derived
+    per-Binding, so there is no tenant filter for it to forget. The companion
+    test below holds it to that.
+    """
     package_root = pathlib.Path(__file__).resolve().parent.parent / "django_connectors"
-    allowed = {"landing/access.py"}
+    allowed = {"landing/access.py", "landing/index.py"}
     forbidden = ("sql_client", "execute_sql", "drop_tables")
 
     offenders = []
@@ -623,6 +629,28 @@ def test_no_module_constructs_sql_outside_the_access_chokepoint():
         f"caller that builds its own query is another chance to forget the "
         f"tenant filter."
     )
+
+
+def test_the_index_module_issues_no_row_level_sql():
+    """Its exemption above is only defensible while it stays DDL-only.
+
+    The moment it selects, inserts, updates or deletes it is reading or writing
+    customer rows outside the one module that knows how to scope them.
+    """
+    path = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "django_connectors"
+        / "landing"
+        / "index.py"
+    )
+    source = path.read_text().lower()
+    # Only the executable body: the module docstring quotes dlt's own merge SQL.
+    body = source.split('"""', 2)[-1]
+    for statement in ("select ", "insert ", "update ", "delete "):
+        assert statement not in body, (
+            f"landing/index.py issues {statement.strip()!r}; it is exempt from "
+            f"the access chokepoint only for as long as it touches no rows."
+        )
 
 
 def test_no_module_scope_dlt_import_in_the_landing_layer():

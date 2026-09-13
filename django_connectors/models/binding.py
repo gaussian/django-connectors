@@ -109,6 +109,11 @@ class Binding(models.Model):
         return f"{self.source} ({self.landing_key or 'unsaved'})"
 
     def save(self, *args, **kwargs):
+        """Assign a landing key, and deliberately validate nothing.
+
+        Configuration validation lives in :meth:`clean` — see there for why it
+        must not happen here.
+        """
         if self.landing_key:
             return super().save(*args, **kwargs)
 
@@ -124,6 +129,35 @@ class Binding(models.Model):
                     raise
                 self.landing_key = ""
         return None
+
+    def clean(self):
+        """Reject a configuration that could not run, next to the field at fault.
+
+        ``full_clean()`` is what the admin and every ModelForm call before
+        saving, so this is where "malformed config", "unregistered source" and
+        "landing table name over 63 characters" become form errors instead of a
+        failed Run in front of a customer. The DRF layer does not call
+        ``full_clean()``, so ``BindingSerializer.validate`` runs the same checks.
+
+        Deliberately here rather than in :meth:`save`. A Binding whose source
+        key has stopped being registered — a renamed source, an uninstalled
+        extra — must stay savable, or nobody can disable the row that is
+        failing and automated recovery cannot write ``enabled=False`` either.
+        Programmatic creation is likewise left alone; that is ordinary Django,
+        where validation belongs to forms.
+
+        The import is function-scoped because the source registry resolves
+        dotted paths on first use, and this module is imported while Django is
+        still building the app registry.
+        """
+        super().clean()
+        from django.core.exceptions import ValidationError
+
+        from django_connectors.services.bindings import binding_field_errors
+
+        errors = binding_field_errors(self)
+        if errors:
+            raise ValidationError(errors)
 
     @property
     def pipeline_name(self):

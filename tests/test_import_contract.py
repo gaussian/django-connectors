@@ -52,7 +52,11 @@ def test_importing_the_package_does_not_import_dlt():
         "print(django_connectors.__version__)\n"
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "0.0.1"
+    # Compared with the package, not with a literal: the literal broke on the
+    # first version bump, in every test job, for a change unrelated to imports.
+    import django_connectors
+
+    assert result.stdout.strip() == django_connectors.__version__
 
 
 def test_django_setup_does_not_import_dlt():

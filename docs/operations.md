@@ -88,6 +88,39 @@ Bindings that is ~10,000 InnoDB tables plus staging. That is fine for MySQL with
 commitment worth knowing about. The alternative — a shared table — silently loses
 loads, so it is not on the table.
 
+## Landing indexes
+
+The library creates the indexes dlt does not (see
+[architecture](architecture.md#the-library-provisions-the-landing-indexes)),
+after each successful load. This needs `CREATE INDEX` on the landing dataset —
+the same role that already creates and alters the landing tables.
+
+If the landing role has no DDL rights, or you manage the indexes yourself, turn
+it off:
+
+```python
+DJANGO_CONNECTORS = {
+    "PROVISION_LANDING_INDEXES": False,
+}
+```
+
+Left on with a role that cannot create indexes, every Binding lands correctly
+and then moves to `needs_review` on every run, with `Binding.last_error` naming
+the index and the database's own refusal.
+
+A Binding that landed before this library provisioned indexes — or one whose
+provisioning failed and has since been fixed — is caught up by its next
+successful Run, or immediately:
+
+```python
+from django_connectors.landing.index import ensure_landing_indexes
+
+ensure_landing_indexes(binding)  # idempotent; never raises
+```
+
+`needs_review` is **not** cleared by a later successful run. It records that a
+human has not looked yet; clear it deliberately once you have.
+
 ## Retention and deletion
 
 `landing_retention` offers only `current_state` and `permanent`, and there is no

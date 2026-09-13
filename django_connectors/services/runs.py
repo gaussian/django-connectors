@@ -199,10 +199,43 @@ def _succeed(binding, run, result):
             "landing_schema_version_hash",
             "landing_schema_at",
         ]
+
+    _apply_index_report(binding, result.get("indexes"))
     binding.save(update_fields=updated)
 
     _after_success(binding, run)
     return run
+
+
+def _apply_index_report(binding, report):
+    """Downgrade a Binding whose landing indexes could not be provisioned.
+
+    Mutates `binding` in place; the caller saves. ``needs_review`` rather than
+    a failed Run because the data landed correctly — what is degraded is the
+    cost of the *next* merge, which without an index is linear in table size
+    (measured at 179s for 10,000 rows into a 60,000-row table). ``is_runnable``
+    includes ``needs_review``, so the Binding keeps syncing while the problem
+    is visible.
+
+    Deliberately not cleared by a later run that succeeds. "Needs review" means
+    a human decides; a status that healed itself would be one an operator
+    learns to ignore. Provisioning is retried on every successful run
+    regardless, so the index does appear once the cause is removed.
+    """
+    failures = (report or {}).get("failed")
+    if not failures:
+        return binding
+
+    detail = "; ".join(
+        f"{failure.get('index') or 'landing index'}: {failure.get('error')}"
+        for failure in failures
+    )
+    binding.status = BindingStatus.NEEDS_REVIEW
+    binding.last_error = (
+        f"landed successfully, but could not provision landing index(es) — "
+        f"merge cost grows with table size until this is fixed. {detail}"
+    )
+    return binding
 
 
 def _after_success(binding, run):

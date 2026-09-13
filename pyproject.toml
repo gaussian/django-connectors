@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-connectors"
-version = "0.0.1"
+version = "0.0.2"
 description = "A Django framework for connecting applications to third-party systems, with support for authentication, polling, webhooks, incremental sync, and data ingestion via dlt."
 readme = "README.md"
 license = "MIT"
@@ -57,6 +57,7 @@ Issues = "https://github.com/gaussian/django-connectors/issues"
 dev = [
   "pytest>=8.0",
   "pytest-django>=4.9",
+  "pytest-recording>=0.13",
   "ruff>=0.10",
 ]
 
@@ -76,6 +77,10 @@ markers = [
   # round-trips. Parameterized over every configured backend; unconfigured ones
   # skip. Everything unmarked must pass on sqlite with no docker.
   "serverdb: requires a real database server (set DJANGO_CONNECTORS_TEST_MYSQL_URL and/or _POSTGRES_URL)",
+  # Replays a recorded provider exchange from tests/cassettes/. Skips when no
+  # cassette exists; records with --record-mode=rewrite and the
+  # DJANGO_CONNECTORS_RECORD_* variables. See tests/test_recorded.py.
+  "recorded: replays a recorded provider exchange (record with --record-mode=rewrite)",
 ]
 
 [tool.ruff]
