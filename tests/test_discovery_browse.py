@@ -13,11 +13,11 @@ import pytest
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.services import discovery
 from django_connectors.sources.base import discovery_page
-from tests.test_sources import (
-    SQLITE_ROWS,
-    make_sqlite_database,
-    write_jsonl,
-)
+from tests import test_sources
+from tests.test_sources import SQLITE_ROWS, make_sqlite_database, write_jsonl
+
+#: Registers the `sql` and `files` sources; shared with the source tests.
+source_settings = test_sources.source_settings
 
 pytestmark = pytest.mark.django_db
 
@@ -56,19 +56,7 @@ def test_the_service_clamps_limit_to_the_configured_page_size(
 # --- sql -------------------------------------------------------------------
 
 
-@pytest.fixture
-def sql_settings(connectors_settings, settings):
-    settings.DJANGO_CONNECTORS = {
-        **connectors_settings,
-        "SOURCES": {
-            **connectors_settings["SOURCES"],
-            "sql": "django_connectors.sources.sql.SqlSource",
-        },
-    }
-    return settings.DJANGO_CONNECTORS
-
-
-def test_sql_lists_schemas_then_tables(sql_settings, make_connection, tmp_path):
+def test_sql_lists_schemas_then_tables(source_settings, make_connection, tmp_path):
     url = make_sqlite_database(tmp_path, SQLITE_ROWS)
     connection = make_connection(provider="sql", metadata={"url": url})
 
@@ -82,37 +70,41 @@ def test_sql_lists_schemas_then_tables(sql_settings, make_connection, tmp_path):
     assert orders["table"] == "orders"
 
 
-def test_sql_refuses_a_schema_name_that_is_not_an_identifier(
-    sql_settings, make_connection, tmp_path
+def test_sql_descends_only_into_a_schema_it_listed(
+    source_settings, make_connection, tmp_path
 ):
+    """Membership, not an identifier regex: `my-app-prod` is a legal name."""
     url = make_sqlite_database(tmp_path, SQLITE_ROWS)
     connection = make_connection(provider="sql", metadata={"url": url})
-    with pytest.raises(ConfigurationError, match="plain identifier"):
+    with pytest.raises(ConfigurationError, match="not one this database lists"):
         discovery.discover_remote(connection, path="main; drop table orders")
+
+
+def test_a_non_positive_limit_means_the_default_not_a_loop(
+    connectors_settings, make_connection, settings
+):
+    settings.DJANGO_CONNECTORS = {**connectors_settings, "DISCOVERY_PAGE_SIZE": 2}
+    connection = make_connection(
+        provider="memory", metadata={"resources": ["a", "b", "c"]}
+    )
+    for limit in (-1, 0, "0"):
+        page = discovery.discover_remote(connection, limit=limit)
+        assert [i["name"] for i in page["items"]] == ["a", "b"]
+        assert page["next_cursor"] == "2"
+    with pytest.raises(ConfigurationError, match="not a number"):
+        discovery.discover_remote(connection, limit="ten")
 
 
 # --- filesystem ------------------------------------------------------------
 
 
-@pytest.fixture
-def files_settings(connectors_settings, settings):
-    settings.DJANGO_CONNECTORS = {
-        **connectors_settings,
-        "SOURCES": {
-            **connectors_settings["SOURCES"],
-            "filesystem": "django_connectors.sources.filesystem.FilesystemSource",
-        },
-    }
-    return settings.DJANGO_CONNECTORS
-
-
 def test_filesystem_lists_one_level_folders_first(
-    files_settings, make_connection, tmp_path
+    source_settings, make_connection, tmp_path
 ):
     write_jsonl(tmp_path / "exports" / "b.jsonl", [{"id": "1"}])
     write_jsonl(tmp_path / "exports" / "2024" / "a.jsonl", [{"id": "2"}])
     connection = make_connection(
-        provider="filesystem", metadata={"root": str(tmp_path / "exports")}
+        provider="files", metadata={"root": str(tmp_path / "exports")}
     )
 
     top = discovery.discover_remote(connection)
@@ -127,16 +119,51 @@ def test_filesystem_lists_one_level_folders_first(
     assert [i["name"] for i in below["items"]] == ["a.jsonl"]
 
 
-def test_filesystem_needs_somewhere_to_start(files_settings, make_connection):
-    connection = make_connection(provider="filesystem", metadata={})
+def test_filesystem_enters_a_folder_whose_name_looks_like_a_file(
+    source_settings, make_connection, tmp_path
+):
+    """`com.example` is a folder discovery itself listed; descending must enter it."""
+    root = tmp_path / "root"  # tmp_path itself holds dlt's scratch directories
+    write_jsonl(root / "com.example" / "inner.jsonl", [{"id": "1"}])
+    write_jsonl(root / "[2024]" / "deep.jsonl", [{"id": "2"}])
+    connection = make_connection(provider="files", metadata={"root": str(root)})
+
+    top = discovery.discover_remote(connection)
+    for folder in top["items"]:
+        below = discovery.discover_remote(connection, path=folder["path"])
+        assert [i["name"] for i in below["items"]] in (["inner.jsonl"], ["deep.jsonl"])
+
+
+def test_every_bucket_scheme_has_a_real_fsspec_accessor():
+    from dlt.common.configuration.specs import (
+        AwsCredentials,
+        AzureCredentials,
+        GcpServiceAccountCredentials,
+    )
+
+    from django_connectors.sources import filesystem as fs_source
+
+    spec_for = {
+        "s3": AwsCredentials,
+        "gs": GcpServiceAccountCredentials,
+        "gcs": GcpServiceAccountCredentials,
+        "az": AzureCredentials,
+        "abfss": AzureCredentials,
+    }
+    for scheme, method in fs_source.FSSPEC_KWARGS_METHOD.items():
+        assert callable(getattr(spec_for[scheme], method)), (scheme, method)
+
+
+def test_filesystem_needs_somewhere_to_start(source_settings, make_connection):
+    connection = make_connection(provider="files", metadata={})
     with pytest.raises(ConfigurationError, match="root"):
         discovery.discover_remote(connection)
 
 
 def test_filesystem_reports_a_missing_directory(
-    files_settings, make_connection, tmp_path
+    source_settings, make_connection, tmp_path
 ):
-    connection = make_connection(provider="filesystem", metadata={})
+    connection = make_connection(provider="files", metadata={})
     with pytest.raises(SourceError, match="does not exist"):
         discovery.discover_remote(connection, path=str(tmp_path / "nope"))
 

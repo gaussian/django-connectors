@@ -734,7 +734,8 @@ def test_discover_pages_a_folder_through_graphs_own_next_link(
         connection=connection, credentials=token, path="D1", limit=2
     )
     assert [e["name"] for e in first["items"]] == ["file0.xlsx", "file1.xlsx"]
-    assert first["next_cursor"].startswith(graph.origin)
+    # Opaque and signed: never the raw Graph link.
+    assert graph.origin not in first["next_cursor"]
 
     second = source.discover(
         connection=connection, credentials=token, cursor=first["next_cursor"]
@@ -748,21 +749,35 @@ def test_discover_pages_a_folder_through_graphs_own_next_link(
     assert third["next_cursor"] is None
 
 
-def test_discover_refuses_a_cursor_pointing_off_graph(
+def test_discover_refuses_a_cursor_it_did_not_issue(
     microsoft_settings, make_connection, graph
 ):
-    """A cursor is followed with the tenant-wide token attached."""
+    """A cursor is followed with the tenant-wide token attached, so a raw URL
+    handed in by a caller would read any same-origin Graph collection."""
+    from django_connectors.sources.base import sign_cursor
+
     connection = make_connection(
         provider="microsoft",
         auth_backend="token",
         metadata={"graph_base_url": f"{graph.origin}/v1.0", "drive_id": DRIVE_ID},
     )
-    with pytest.raises(SourceError, match="Refusing to follow"):
-        LoopbackFilesSource().discover(
+    source = LoopbackFilesSource()
+    token = {"access_token": "APP-ONLY-TOKEN"}
+
+    with pytest.raises(ConfigurationError, match="not issued"):
+        source.discover(
             connection=connection,
-            credentials={"access_token": "APP-ONLY-TOKEN"},
-            cursor="https://evil.example/v1.0/steal",
+            credentials=token,
+            cursor=f"{graph.origin}/v1.0/users",
         )
+    # Signed for another connection: still not ours.
+    foreign = sign_cursor(f"{graph.origin}/v1.0/users", scope="other-connection")
+    with pytest.raises(ConfigurationError, match="not issued"):
+        source.discover(connection=connection, credentials=token, cursor=foreign)
+    # Signed for us but off-origin: the origin check still stands behind it.
+    off = sign_cursor("https://evil.example/v1.0/steal", scope=connection.id)
+    with pytest.raises(SourceError, match="Refusing to follow"):
+        source.discover(connection=connection, credentials=token, cursor=off)
 
 
 def test_discover_searches_for_sites_when_nothing_is_configured_yet(

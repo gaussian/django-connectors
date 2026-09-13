@@ -225,13 +225,20 @@ class SqlSource(SourceDefinition):
         engine = create_engine(connection_url(config, credentials))
         try:
             inspector = sqlalchemy_inspect(engine)
+            schemas = inspector.get_schema_names()
             if path is None:
                 items = [
                     {"id": schema, "name": schema, "kind": "schema", "path": schema}
-                    for schema in inspector.get_schema_names()
+                    for schema in schemas
                 ]
             else:
-                _validate_identifier(path, "path")
+                # Membership, not the identifier regex: `my-app-prod` is a legal
+                # schema name, and the value goes to the inspector, never into
+                # SQL text.
+                if path not in schemas:
+                    raise ConfigurationError(
+                        f"schema {path!r} is not one this database lists"
+                    )
                 items = [
                     {
                         "id": f"{path}.{name}",

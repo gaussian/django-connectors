@@ -132,6 +132,23 @@ def as_config(config):
     return config
 
 
+def page_limit(limit):
+    """`limit` clamped to ``1..DISCOVERY_PAGE_SIZE``; None or non-positive is the default.
+
+    Bounded below as well as above: a negative slice returned the same page
+    forever with a cursor that never advanced, and Drive and Graph reject a
+    negative page size outright.
+    """
+    from django_connectors.conf import conf
+
+    ceiling = int(conf.DISCOVERY_PAGE_SIZE)
+    try:
+        size = int(limit) if limit is not None else ceiling
+    except (TypeError, ValueError):
+        raise ConfigurationError(f"discovery limit {limit!r} is not a number") from None
+    return ceiling if size <= 0 else min(size, ceiling)
+
+
 def discovery_page(items, *, cursor=None, limit=None, query=None, name_key="name"):
     """One page of an in-memory list, in the discovery envelope.
 
@@ -140,14 +157,13 @@ def discovery_page(items, *, cursor=None, limit=None, query=None, name_key="name
     which is opaque enough: a client that fabricates one gets a page, not an
     exception. Providers with a native page token do not use this.
     """
-    from django_connectors.conf import conf
 
     if query:
         needle = str(query).strip().lower()
         items = [
             item for item in items if needle in str(item.get(name_key, "")).lower()
         ]
-    size = int(limit or conf.DISCOVERY_PAGE_SIZE)
+    size = page_limit(limit)
     try:
         start = max(int(cursor or 0), 0)
     except (TypeError, ValueError):
@@ -157,3 +173,27 @@ def discovery_page(items, *, cursor=None, limit=None, query=None, name_key="name
     page = items[start : start + size]
     next_cursor = str(start + size) if start + size < len(items) else None
     return {"items": page, "next_cursor": next_cursor}
+
+
+def sign_cursor(value, *, scope):
+    """An opaque cursor for a continuation link a provider returned.
+
+    A raw URL as a cursor is fetched with the Connection's credentials, so a
+    caller who could hand one in could read any same-origin collection with the
+    tenant's token. Signing it proves it came from the provider's own response
+    to *this* scope, and turns it back into what the provider gave us.
+    """
+    from django.core import signing
+
+    return signing.dumps(value, salt=f"django_connectors.discover:{scope}")
+
+
+def unsign_cursor(cursor, *, scope):
+    from django.core import signing
+
+    try:
+        return signing.loads(cursor, salt=f"django_connectors.discover:{scope}")
+    except signing.BadSignature:
+        raise ConfigurationError(
+            "discovery cursor was not issued by this source for this connection"
+        ) from None

@@ -62,7 +62,12 @@ from django_connectors.exceptions import (
     CredentialsRevoked,
     SourceError,
 )
-from django_connectors.sources.base import SourceDefinition, as_config
+from django_connectors.sources.base import (
+    SourceDefinition,
+    as_config,
+    sign_cursor,
+    unsign_cursor,
+)
 from django_connectors.sources.memory import tombstone
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -425,8 +430,10 @@ class EntraFilesSource(SourceDefinition):
         session = graph_session(access_token(credentials), timeout=self.timeout(config))
         try:
             if cursor:
-                assert_same_origin(cursor, base)
-                url = cursor
+                # Signed, not merely same-origin: a raw link fetched with the
+                # tenant token would let a files-scoped caller read /users.
+                url = unsign_cursor(cursor, scope=connection.id)
+                assert_same_origin(url, base)
             elif config.get("drive_id") or config.get("site_id"):
                 self.validate_location(config)
                 if path:
@@ -464,9 +471,11 @@ class EntraFilesSource(SourceDefinition):
                 }
             )
         next_link = payload.get("@odata.nextLink")
+        next_cursor = None
         if next_link:
             assert_same_origin(next_link, base)
-        return {"items": items, "next_cursor": next_link}
+            next_cursor = sign_cursor(next_link, scope=connection.id)
+        return {"items": items, "next_cursor": next_cursor}
 
 
 # --- HTTP ------------------------------------------------------------------

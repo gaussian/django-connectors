@@ -206,8 +206,12 @@ class FilesystemSource(SourceDefinition):
             raise ConfigurationError(
                 "discovery needs a 'path' to list, or Connection.metadata['root']."
             )
+        # A discovery path is a folder by contract: it came from an item whose
+        # kind was "folder", or it is the configured root. The file-name
+        # heuristic that serves Binding specs must not run here, or a folder
+        # named `com.example` re-lists its parent and can never be entered.
         bucket_url, _ = resolve_location(
-            "root", {"path": root}, allowed=self.allowed_schemes
+            "root", {"bucket_url": root}, allowed=self.allowed_schemes
         )
         scheme = urlsplit(bucket_url).scheme
         _require_driver(
@@ -251,14 +255,29 @@ class FilesystemSource(SourceDefinition):
         return discovery_page(items, cursor=cursor, limit=limit, query=query)
 
 
+#: The method on each dlt credential spec that yields fsspec's kwargs. Named
+#: explicitly: `to_native_credentials` exists on every spec and returns an SDK
+#: object, which `fsspec.filesystem(**obj)` rejects with a TypeError.
+FSSPEC_KWARGS_METHOD = {
+    "s3": "to_s3fs_credentials",
+    "gs": "to_gcs_credentials",
+    "gcs": "to_gcs_credentials",
+    "az": "to_adlfs_credentials",
+    "abfss": "to_adlfs_credentials",
+}
+
+
 def _fsspec_for(scheme, spec):
     """An fsspec filesystem from a dlt credential spec, for listing only."""
     import fsspec
 
-    to_kwargs = getattr(spec, "to_s3fs_credentials", None) or getattr(
-        spec, "to_native_credentials", None
-    )
-    return fsspec.filesystem(scheme, **(to_kwargs() if to_kwargs else {}))
+    method = getattr(spec, FSSPEC_KWARGS_METHOD.get(scheme, ""), None)
+    if method is None:
+        raise ConfigurationError(
+            f"{scheme}:// credentials of type {type(spec).__name__} cannot be "
+            f"turned into an fsspec filesystem for listing."
+        )
+    return fsspec.filesystem(scheme, **method())
 
 
 def _rejoin(bucket_url, name):

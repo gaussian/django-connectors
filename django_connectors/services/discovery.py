@@ -17,6 +17,7 @@ from django_connectors.exceptions import LandingSchemaError
 from django_connectors.landing import access, schema
 from django_connectors.models import Projection
 from django_connectors.registry import sources
+from django_connectors.sources.base import page_limit
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ def discover_remote(
         credentials = auth_backends.get(connection.auth_backend).get_credentials(
             connection
         )
-    limit = min(int(limit or conf.DISCOVERY_PAGE_SIZE), conf.DISCOVERY_PAGE_SIZE)
+    limit = page_limit(limit)
     return definition.discover(
         connection=connection,
         credentials=credentials,
