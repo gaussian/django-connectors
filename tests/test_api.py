@@ -295,10 +295,8 @@ def test_targets_endpoint_exposes_shape_not_tenant_data(api_settings, client_for
     from django_connectors.projections.targets import (
         TargetDefinition,
         register_target,
-        unregister_all,
     )
 
-    unregister_all()
     register_target(
         TargetDefinition(
             key="events",
@@ -308,12 +306,9 @@ def test_targets_endpoint_exposes_shape_not_tenant_data(api_settings, client_for
             writer=lambda records, context: len(records),
         )
     )
-    try:
-        payload = client_for().get(reverse("django_connectors:target-list")).json()
-        assert payload[0]["key"] == "events"
-        assert payload[0]["fields"]["external_id"]["required"] is True
-    finally:
-        unregister_all()
+    payload = client_for().get(reverse("django_connectors:target-list")).json()
+    assert payload[0]["key"] == "events"
+    assert payload[0]["fields"]["external_id"]["required"] is True
 
 
 # --- cross-tenant writes ---------------------------------------------------

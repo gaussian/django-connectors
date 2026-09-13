@@ -249,3 +249,39 @@ def test_the_library_default_is_still_deny_all(connectors_settings, settings):
     assert ConfiguredPermissionsMixin.permission_classes is None
     permissions = api_views.ConnectionViewSet().get_permissions()
     assert [type(p).__name__ for p in permissions] == ["DenyAll"]
+
+
+# --- owner shapes ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["content_type_instance", "model_class", "model_instance", "bare_instance"],
+)
+def test_every_natural_owner_shape_normalises_to_the_same_answer(shape, db):
+    """A ContentType *instance* used to resolve to the content type of the
+    ContentType model itself, so every owner model collapsed onto one tenant."""
+    from django.contrib.auth.models import Group
+    from django.contrib.contenttypes.models import ContentType
+
+    from django_connectors.api.scoping import normalize_owner
+
+    group = Group.objects.create(name="g")
+    expected = (ContentType.objects.get_for_model(Group).id, str(group.pk))
+    owner = {
+        "content_type_instance": (ContentType.objects.get_for_model(Group), group.pk),
+        "model_class": (Group, group.pk),
+        "model_instance": (group, group.pk),
+        "bare_instance": group,
+    }[shape]
+    assert normalize_owner(owner) == expected
+
+
+@pytest.mark.parametrize("owner", [("Group", 1), (True, 1), "1", (1,), None])
+def test_an_owner_shape_that_cannot_be_trusted_is_refused(owner, db):
+    from django.core.exceptions import ImproperlyConfigured
+
+    from django_connectors.api.scoping import normalize_owner
+
+    with pytest.raises(ImproperlyConfigured):
+        normalize_owner(owner)

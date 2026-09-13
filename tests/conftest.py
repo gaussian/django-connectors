@@ -168,3 +168,107 @@ def server_settings(server_landing, tmp_path, settings):
     }
     warm_landing_dataset()
     return server_landing
+
+
+# --- projection helpers ----------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def clean_target_registry():
+    """The target registry is process-global; no test may see another's."""
+    from django_connectors.projections.targets import unregister_all
+
+    unregister_all()
+    yield
+    unregister_all()
+
+
+class RecordingWriter:
+    """Stands in for a host writer and records what it was handed."""
+
+    def __init__(self, *, fail_times=0):
+        self.batches = []
+        self.contexts = []
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def __call__(self, records, context):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise RuntimeError("host writer exploded")
+        self.batches.append(list(records))
+        self.contexts.append(context)
+        return len(records)
+
+    @property
+    def records(self):
+        return [record for batch in self.batches for record in batch]
+
+
+@pytest.fixture
+def writer():
+    return RecordingWriter()
+
+
+@pytest.fixture
+def events_target(writer):
+    from django_connectors.projections.fields import (
+        DateTimeField,
+        IntegerField,
+        JSONField,
+        StringField,
+    )
+    from django_connectors.projections.targets import TargetDefinition, register_target
+
+    return register_target(
+        TargetDefinition(
+            key="events",
+            fields={
+                "external_id": StringField(required=True),
+                "occurred_at": DateTimeField(required=True),
+                "type": StringField(required=True),
+                "payload": JSONField(),
+                "count": IntegerField(),
+            },
+            identity_fields=("external_id",),
+            identity_scope="owner",
+            writer=writer,
+            supports_scope_replace=True,
+        )
+    )
+
+
+BASIC_MAPPING = {
+    "external_id": {"source": "id"},
+    "occurred_at": {"source": "happened_at", "cast": "datetime"},
+    "type": {"source": "kind"},
+}
+
+
+def land_memory(make_binding, batches, *, resources=None, **kwargs):
+    """Land `batches` through a memory Binding and return (binding, run)."""
+    from django_connectors.enums import RunTrigger
+    from django_connectors.services import runs as run_services
+
+    binding = make_binding(config=memory_config(batches=batches, **kwargs))
+    if resources is not None:
+        binding.resources = resources
+        binding.save(update_fields=["resources"])
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "succeeded", run.error_message
+    return binding, run
+
+
+def make_projection(binding, mapping=None, *, filters=None, target="events"):
+    from django_connectors.enums import ProjectionStatus
+    from django_connectors.models import Projection
+
+    return Projection.objects.create(
+        binding=binding,
+        resource="events",
+        target=target,
+        name="p",
+        mapping=mapping if mapping is not None else BASIC_MAPPING,
+        filters=filters or [],
+        status=ProjectionStatus.ACTIVE,
+    )

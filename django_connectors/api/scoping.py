@@ -47,18 +47,38 @@ def resolve_owner(request):
 
 
 def normalize_owner(owner):
-    """Accept a model instance or an explicit ``(content_type, object_id)``."""
-    from django.contrib.contenttypes.models import ContentType
+    """``(content_type_id, object_id)`` from any shape a host naturally returns.
 
-    if isinstance(owner, tuple | list):
+    A model instance; or a pair whose first slot is a content type id, a
+    ``ContentType`` instance, a model class or a model instance. Anything else
+    is refused: guessing here is how two owner models that happen to share a
+    primary key collapse onto one tenant.
+    """
+    from django.contrib.contenttypes.models import ContentType
+    from django.db import models
+
+    if isinstance(owner, tuple | list) and len(owner) == 2:
         content_type, object_id = owner
-        if not isinstance(content_type, int):
-            content_type = ContentType.objects.get_for_model(
-                content_type if isinstance(content_type, type) else type(content_type)
-            ).id
+        if isinstance(content_type, ContentType):
+            content_type = content_type.id
+        elif isinstance(content_type, type) and issubclass(content_type, models.Model):
+            content_type = ContentType.objects.get_for_model(content_type).id
+        elif isinstance(content_type, models.Model):
+            content_type = ContentType.objects.get_for_model(type(content_type)).id
+        elif not isinstance(content_type, int) or isinstance(content_type, bool):
+            raise ImproperlyConfigured(
+                f"owner content type must be a ContentType, a model class, a "
+                f"model instance or a content type id, got {content_type!r}"
+            )
         return content_type, str(object_id)
 
-    return ContentType.objects.get_for_model(type(owner)).id, str(owner.pk)
+    if isinstance(owner, models.Model):
+        return ContentType.objects.get_for_model(type(owner)).id, str(owner.pk)
+
+    raise ImproperlyConfigured(
+        f"owner must be a model instance or a (content_type, object_id) pair, "
+        f"got {type(owner).__name__}"
+    )
 
 
 class OwnerScopedQuerysetMixin:
@@ -112,18 +132,8 @@ class OwnerScopedQuerysetMixin:
         return self._resolved_owner
 
     def get_queryset(self):
-        queryset = super().get_queryset()
-        owner = self.resolved_owner()
-        if owner is None:
-            return queryset.none()
-        content_type_id, object_id = owner
-
-        prefix = f"{self.owner_lookup}__" if self.owner_lookup else ""
-        return queryset.filter(
-            **{
-                f"{prefix}owner_content_type_id": content_type_id,
-                f"{prefix}owner_object_id": object_id,
-            }
+        return scope_to_owner(
+            super().get_queryset(), self.resolved_owner(), self.owner_lookup
         )
 
     def get_serializer_context(self):
@@ -136,3 +146,21 @@ class OwnerScopedQuerysetMixin:
 
 #: Serializer context key carrying the viewset's resolved owner.
 OWNER_CONTEXT_KEY = "connectors_owner"
+
+
+def scope_to_owner(queryset, owner, lookup=""):
+    """`queryset` restricted to `owner`, or empty when there is no owner.
+
+    The one expression that decides which tenant's rows a caller sees — used
+    for reads and for writable relations alike, so the two cannot drift.
+    """
+    if owner is None:
+        return queryset.none()
+    content_type_id, object_id = owner
+    prefix = f"{lookup}__" if lookup else ""
+    return queryset.filter(
+        **{
+            f"{prefix}owner_content_type_id": content_type_id,
+            f"{prefix}owner_object_id": object_id,
+        }
+    )

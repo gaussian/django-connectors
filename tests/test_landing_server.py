@@ -473,12 +473,10 @@ def test_projection_runs_end_to_end_on_every_backend(server_settings, make_bindi
     from django_connectors.projections.targets import (
         TargetDefinition,
         register_target,
-        unregister_all,
     )
     from django_connectors.services import projections as projection_services
 
     written = []
-    unregister_all()
     register_target(
         TargetDefinition(
             key="events",
@@ -494,56 +492,53 @@ def test_projection_runs_end_to_end_on_every_backend(server_settings, make_bindi
             supports_scope_replace=True,
         )
     )
-    try:
-        binding = make_binding(
-            config=memory_config(
-                batches=[
-                    [
-                        {
-                            "id": "e1",
-                            "ts": "2024-03-01T10:30:00Z",
-                            "flag": True,
-                            "meta": {"plan": "pro"},
-                        }
-                    ],
-                    [tombstone({"id": "e1"})],
-                ]
-            )
+    binding = make_binding(
+        config=memory_config(
+            batches=[
+                [
+                    {
+                        "id": "e1",
+                        "ts": "2024-03-01T10:30:00Z",
+                        "flag": True,
+                        "meta": {"plan": "pro"},
+                    }
+                ],
+                [tombstone({"id": "e1"})],
+            ]
         )
-        run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
-        assert run.status == RunStatus.SUCCEEDED, run.error_message
+    )
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
 
-        projection = Projection.objects.create(
-            binding=binding,
-            resource="events",
-            target="events",
-            name="p",
-            mapping={
-                "external_id": {"source": "id"},
-                "occurred_at": {"source": "ts", "cast": "datetime"},
-                "active": {"source": "flag", "cast": "boolean"},
-                "payload": {"source": "meta"},
-            },
-            status=ProjectionStatus.ACTIVE,
-        )
-        first = projection_services.run_projection(projection, source_run=run)
-        assert first.status == ProjectionRunStatus.SUCCEEDED, first.error_message
+    projection = Projection.objects.create(
+        binding=binding,
+        resource="events",
+        target="events",
+        name="p",
+        mapping={
+            "external_id": {"source": "id"},
+            "occurred_at": {"source": "ts", "cast": "datetime"},
+            "active": {"source": "flag", "cast": "boolean"},
+            "payload": {"source": "meta"},
+        },
+        status=ProjectionStatus.ACTIVE,
+    )
+    first = projection_services.run_projection(projection, source_run=run)
+    assert first.status == ProjectionRunStatus.SUCCEEDED, first.error_message
 
-        record = written[-1]
-        assert record.operation == "upsert"
-        assert record.identity == {"external_id": "e1"}
-        assert record.values["active"] is True
-        assert record.values["occurred_at"] == dt.datetime(
-            2024, 3, 1, 10, 30, tzinfo=dt.UTC
-        )
-        assert record.values["payload"] == {"plan": "pro"}
+    record = written[-1]
+    assert record.operation == "upsert"
+    assert record.identity == {"external_id": "e1"}
+    assert record.values["active"] is True
+    assert record.values["occurred_at"] == dt.datetime(
+        2024, 3, 1, 10, 30, tzinfo=dt.UTC
+    )
+    assert record.values["payload"] == {"plan": "pro"}
 
-        # And the delete path, which is where a tombstone's nulled columns bite.
-        second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
-        assert second.status == RunStatus.SUCCEEDED, second.error_message
-        replay = projection_services.replay_projection(projection)
-        assert replay.status == ProjectionRunStatus.SUCCEEDED, replay.error_message
-        assert written[-1].operation == "delete"
-        assert written[-1].identity == {"external_id": "e1"}
-    finally:
-        unregister_all()
+    # And the delete path, which is where a tombstone's nulled columns bite.
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == RunStatus.SUCCEEDED, second.error_message
+    replay = projection_services.replay_projection(projection)
+    assert replay.status == ProjectionRunStatus.SUCCEEDED, replay.error_message
+    assert written[-1].operation == "delete"
+    assert written[-1].identity == {"external_id": "e1"}

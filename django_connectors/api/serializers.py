@@ -14,7 +14,11 @@ Defence in depth is worth it for the one field capable of carrying a landing DSN
 
 from rest_framework import serializers
 
-from django_connectors.api.scoping import OWNER_CONTEXT_KEY, resolve_owner
+from django_connectors.api.scoping import (
+    OWNER_CONTEXT_KEY,
+    resolve_owner,
+    scope_to_owner,
+)
 from django_connectors.errors import scrub
 from django_connectors.models import (
     Binding,
@@ -47,18 +51,7 @@ class OwnerScopedPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
         super().__init__(**kwargs)
 
     def get_queryset(self):
-        queryset = super().get_queryset()
-        owner = self._owner()
-        if owner is None:
-            return queryset.none()
-        content_type_id, object_id = owner
-        prefix = f"{self.owner_lookup}__" if self.owner_lookup else ""
-        return queryset.filter(
-            **{
-                f"{prefix}owner_content_type_id": content_type_id,
-                f"{prefix}owner_object_id": object_id,
-            }
-        )
+        return scope_to_owner(super().get_queryset(), self._owner(), self.owner_lookup)
 
     def _owner(self):
         """The owner to scope on: the viewset's answer, else the setting's.
