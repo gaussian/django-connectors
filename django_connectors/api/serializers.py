@@ -14,7 +14,11 @@ Defence in depth is worth it for the one field capable of carrying a landing DSN
 
 from rest_framework import serializers
 
-from django_connectors.api.scoping import resolve_owner
+from django_connectors.api.scoping import (
+    OWNER_CONTEXT_KEY,
+    resolve_owner,
+    scope_to_owner,
+)
 from django_connectors.errors import scrub
 from django_connectors.models import (
     Binding,
@@ -47,21 +51,24 @@ class OwnerScopedPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
         super().__init__(**kwargs)
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        return scope_to_owner(super().get_queryset(), self._owner(), self.owner_lookup)
+
+    def _owner(self):
+        """The owner to scope on: the viewset's answer, else the setting's.
+
+        A viewset that mixes in ``OwnerScopedQuerysetMixin`` puts its resolved
+        owner in the serializer context, so a host overriding ``get_owner()``
+        scopes writes with the same answer it scopes reads with. The key being
+        *present and None* means "nobody" and fails closed; it being absent
+        means the serializer is used outside those viewsets, where the setting
+        is the only source of truth.
+        """
+        if OWNER_CONTEXT_KEY in self.context:
+            return self.context[OWNER_CONTEXT_KEY]
         request = self.context.get("request")
         if request is None:
-            return queryset.none()
-        owner = resolve_owner(request)
-        if owner is None:
-            return queryset.none()
-        content_type_id, object_id = owner
-        prefix = f"{self.owner_lookup}__" if self.owner_lookup else ""
-        return queryset.filter(
-            **{
-                f"{prefix}owner_content_type_id": content_type_id,
-                f"{prefix}owner_object_id": object_id,
-            }
-        )
+            return None
+        return resolve_owner(request)
 
 
 class ScrubbedCharField(serializers.CharField):
@@ -199,6 +206,7 @@ class ProjectionSerializer(serializers.ModelSerializer):
             "mapping",
             "filters",
             "enabled",
+            "on_invalid_record",
             "version",
             "status",
             "last_success_at",
@@ -237,6 +245,8 @@ class ProjectionRunSerializer(serializers.ModelSerializer):
             "records_seen",
             "records_written",
             "records_deleted",
+            "records_skipped",
+            "warnings",
             "started_at",
             "finished_at",
             "error_type",

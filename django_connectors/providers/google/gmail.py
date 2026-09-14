@@ -59,7 +59,7 @@ from django_connectors.providers.google.auth import (
     paginate,
     raise_for_google_error,
 )
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class GmailSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run, or would land wrong data."""
-        config = config or {}
+        config = as_config(config)
 
         user_id = config.get("user_id", "me")
         if not isinstance(user_id, str) or not user_id:
@@ -402,25 +402,43 @@ class GmailSource(SourceDefinition):
             f"{profile.get('messagesTotal', '?')} messages)"
         )
 
-    def discover(self, *, connection, credentials, query=None):
-        """The two resources, plus the mailbox's labels as filter candidates."""
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """The two resources at the top; the mailbox's labels under ``labels``."""
+        if path is None:
+            items = [
+                {
+                    "id": name,
+                    "name": name,
+                    "kind": "resource",
+                    "path": None,
+                    "primary_key": "id",
+                    "deletions": deletions,
+                }
+                for name, deletions in (
+                    (MESSAGES_RESOURCE, True),
+                    (LABELS_RESOURCE, False),
+                )
+            ] + [{"id": "labels", "name": "labels", "kind": "folder", "path": "labels"}]
+            return discovery_page(items, cursor=cursor, limit=limit, query=query)
+        if path != "labels":
+            raise SourceError(f"gmail discovery has no path {path!r}; only 'labels'")
         client = google_client(base_url=self.api_base_url, credentials=credentials)
         user_id = (connection.metadata or {}).get("user_id", "me")
         payload = google_json(
             client, f"users/{user_id}/labels", what="listing Gmail labels"
         )
-        labels = [
-            {"id": label.get("id"), "name": label.get("name")}
+        items = [
+            {
+                "id": label.get("id"),
+                "name": label.get("name"),
+                "kind": "label",
+                "path": None,
+            }
             for label in payload.get("labels") or ()
-            if query is None or query.lower() in (label.get("name") or "").lower()
         ]
-        return {
-            "resources": [
-                {"name": MESSAGES_RESOURCE, "primary_key": "id", "deletions": True},
-                {"name": LABELS_RESOURCE, "primary_key": "id", "deletions": False},
-            ],
-            "labels": labels,
-        }
+        return discovery_page(items, cursor=cursor, limit=limit, query=query)
 
 
 # --- the incremental plan --------------------------------------------------

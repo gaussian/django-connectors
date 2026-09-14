@@ -60,13 +60,35 @@ DEFAULTS: dict[str, Any] = {
     "DEFAULT_POLL_INTERVAL": dt.timedelta(minutes=15),
     # --- projection --------------------------------------------------------
     "PROJECTION_BATCH_SIZE": 1000,
+    # How a successful Run hands its ProjectionRuns on. None runs them inline,
+    # in the ingestion worker, while the Binding's lease is still held — so a
+    # slow writer counts against run_timeout. A dotted path to a
+    # callable(projection_run) enqueues instead; the celery extra ships
+    # "django_connectors.scheduler.celery.enqueue_projection_run". The sweeper
+    # heals whatever a queue drops, exactly as it heals a dropped inline call.
+    "PROJECTION_DISPATCH": None,
+    # A dispatched ProjectionRun still QUEUED after this long is one the queue
+    # dropped; the sweeper executes it itself. Long enough that a busy queue is
+    # not second-guessed, short enough that a lost message is not a day.
+    "PROJECTION_QUEUE_GRACE": dt.timedelta(minutes=10),
     # How far back the projection sweeper looks for un-projected loads. This is
     # the auto-heal horizon: a ProjectionRun that fails and is never retried
     # within this window is never picked up again.
     "PROJECTION_SWEEP_LOOKBACK": dt.timedelta(days=7),
+    # How many per-row reasons a ProjectionRun keeps in `warnings`. The count
+    # in `records_skipped` is always exact; only the explanations are capped.
+    "PROJECTION_MAX_WARNINGS": 100,
+    # Items per page from SourceDefinition.discover(); also the ceiling a
+    # client may ask for, so one request cannot pull a whole drive listing.
+    "DISCOVERY_PAGE_SIZE": 100,
     "PREVIEW_MAX_ROWS": 50,
     "SAMPLE_MAX_ROWS": 100,
     "PREVIEW_MAX_BYTES": 1024 * 1024,
+    # --- content -----------------------------------------------------------
+    # Ceiling on one fetch_record_content() call. A worker's memory is finite
+    # and "the customer uploaded a 4GB video into the reports folder" is a
+    # Tuesday; a host asking for more than this gets the ceiling.
+    "CONTENT_MAX_BYTES": 32 * 1024 * 1024,
     # --- webhooks ----------------------------------------------------------
     "WEBHOOK_MAX_BODY_BYTES": 64 * 1024,
     "WEBHOOK_DEDUPE_TTL": dt.timedelta(minutes=10),

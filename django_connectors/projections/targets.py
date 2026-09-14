@@ -35,6 +35,23 @@ class ProjectedRecord:
 
 
 @dataclass(frozen=True)
+class WriterResult:
+    """What a writer may return instead of a bare count.
+
+    A writer that resolves 900 of 1000 references has something to say about
+    the other 100, and a log line the operator never sees is not saying it.
+    ``skipped`` and ``warnings`` are accumulated onto the ProjectionRun.
+    ``written``/``deleted`` left as None mean "count the records you gave me",
+    which is what returning an int has always meant.
+    """
+
+    written: int | None = None
+    deleted: int | None = None
+    skipped: int = 0
+    warnings: list = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class WriterContext:
     """Everything a writer needs to scope a batch, passed once per batch.
 
@@ -45,6 +62,11 @@ class WriterContext:
 
     owner_content_type_id: int | None
     owner_object_id: str
+    #: The target's declared scope, so a writer can assert what it was
+    #: written against: a writer that scopes its lookup by owner under a
+    #: "global" target, or forgets to under an "owner" one, is the exact
+    #: cross-tenant error the field exists to prevent.
+    identity_scope: str
     connection_id: Any
     binding_id: Any
     projection_id: Any

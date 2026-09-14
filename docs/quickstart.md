@@ -77,6 +77,20 @@ register_target(TargetDefinition(
 ))
 ```
 
+A target that stores files gets the bytes on request — landed rows carry
+file *metadata*, never content. The Google Drive and Microsoft file sources
+provide it; a native Google Doc arrives exported (text by default):
+
+```python
+from django_connectors.services import content
+
+fetched = content.fetch_record_content(
+    Binding.objects.get(pk=context.binding_id), "drive_items",
+    {"id": record.values["item_id"], "drive_id": record.values["drive_id"]},
+)
+fetched.data, fetched.content_type   # under CONTENT_MAX_BYTES
+```
+
 Three rules the runner relies on:
 
 - **Be idempotent per identity.** A raised exception means the batch was not
@@ -85,9 +99,34 @@ Three rules the runner relies on:
 - **Use `context.owner_object_id`.** Ignoring it discards the multi-tenant
   guarantee at the last step.
 - **`identity_scope` has no default.** It decides whether two owners may share
-  an identity value; guessing wrong is a cross-tenant collision.
+  an identity value; guessing wrong is a cross-tenant collision. It is handed
+  back on `context.identity_scope`, so a writer can assert it.
+- **Identity stays one-to-one.** A writer may create satellite records — a
+  membership, a tag, a parent that must exist first — but one record's
+  identity must map to one host record, because a delete of that identity
+  says nothing about the satellites. Many-to-one or one-to-many shaping
+  belongs at the source (see `unpivot`), never in the writer.
 
 ## 3. Connect a customer's system
+
+Before a Binding exists, discovery shows what could be synchronized — one
+shape for every source, so a "pick what to sync" screen is one screen:
+
+```python
+from django_connectors.services import discovery
+
+page = discovery.discover_remote(connection)                 # the top level
+page = discovery.discover_remote(connection, query="orders") # narrowed by name
+page = discovery.discover_remote(connection, path=page["items"][0]["path"])
+page = discovery.discover_remote(connection, cursor=page["next_cursor"])
+# {"items": [{"id", "name", "kind", "path", ...}, ...], "next_cursor": None | str}
+```
+
+`kind` is what the item is (`folder`, `file`, `schema`, `table`,
+`spreadsheet`, `sheet`, `site`, `object`, …); `path` is what to pass back to
+descend, and is `None` on a leaf. Items also carry whatever a Binding needs
+verbatim — a `spreadsheet_id`, a `db_schema` and `table`, a bucket prefix.
+
 
 ```python
 from django_connectors.models import Binding, Connection
@@ -167,7 +206,34 @@ projection = Projection.objects.create(
     },
     filters=[{"field": "environment", "op": "eq", "value": "production"}],
 )
+```
 
+A cast takes options when the source writes values the way people do rather
+than the way databases do — a spreadsheet's `03/04/2024`, a CSV's `£1,234.56`:
+
+```python
+"occurred_at": {"source": "order_date", "cast": "datetime",
+                "format": "%d/%m/%Y", "timezone": "Europe/London"},
+"amount":      {"source": "total", "cast": "decimal", "strip": "£,"},
+```
+
+`format` and `timezone` apply to `datetime` (`format` alone to `date`);
+`strip` and `decimal_separator` to `integer`, `decimal` and `float`. A bad
+option is a validation error naming the field, not a failed run.
+
+A sheet with one row per case and one **column** per stage is reshaped at the
+source, so the mapping sees one row per stage:
+
+```python
+"ranges": {"orders": {"range": "Orders!A:F", "key_column": "order_id",
+           "unpivot": {"columns": ["received", "approved", "shipped"],
+                       "name_to": "stage", "value_to": "on"}}}
+```
+
+The merge key becomes `(order_id, stage)`; map identity from both. The same
+`unpivot` key works on the Excel, filesystem, SQL, REST and memory sources.
+
+```python
 projections.validate_projection(projection)   # errors and warnings, by field
 projections.preview_projection(projection)    # real rows, writer never called
 projections.activate_projection(projection)
@@ -208,5 +274,6 @@ admin action and `POST /webhook-subscriptions/<id>/renew/` both go through it.
 
 - [architecture.md](architecture.md) — why the pieces are shaped this way
 - [operations.md](operations.md) — MySQL, concurrency, retention, deployment
+- [api.md](api.md) — the optional REST API, and composing it with your own
 - [TESTING.md](TESTING.md) — the conformance suite your own
   `SourceDefinition` must pass

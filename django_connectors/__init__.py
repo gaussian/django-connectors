@@ -33,6 +33,7 @@ _EXPORTS = {
     "ProjectionError": "django_connectors.exceptions",
     "MappingValidationError": "django_connectors.exceptions",
     "CastError": "django_connectors.exceptions",
+    "InvalidRecordError": "django_connectors.exceptions",
     "SchemaDriftError": "django_connectors.exceptions",
     "TargetWriteError": "django_connectors.exceptions",
     "LockNotAcquired": "django_connectors.exceptions",
@@ -41,6 +42,7 @@ _EXPORTS = {
     "register_target": "django_connectors.projections.targets",
     "ProjectedRecord": "django_connectors.projections.targets",
     "WriterContext": "django_connectors.projections.targets",
+    "WriterResult": "django_connectors.projections.targets",
     # Target field types
     "BooleanField": "django_connectors.projections.fields",
     "DateField": "django_connectors.projections.fields",

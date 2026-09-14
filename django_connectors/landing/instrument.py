@@ -49,13 +49,14 @@ In-package dedup
 
 import inspect
 
-from django_connectors.exceptions import SourceError
+from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.landing.naming import (
     BINDING_ID_COLUMN,
     DELETED_COLUMN,
     RUN_ID_COLUMN,
     landing_table_name,
 )
+from django_connectors.sources.reshape import unpivot
 
 # Pinned types for the injected columns. `precision` matters: without it dlt
 # maps str to MySQL TEXT, which cannot be indexed without a prefix length
@@ -153,6 +154,10 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
         resource._hints.get("write_disposition"), resource.name, declared_primary_key
     )
 
+    reshape = _reshape_for(
+        source_definition, resource.name, binding, declared_primary_key
+    )
+
     hints = {
         "table_name": table_name,
         "write_disposition": write_disposition,
@@ -160,7 +165,15 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
     }
     if write_disposition["disposition"] == "merge":
         # Unconditional: the binding id always leads the merge identity.
-        hints["primary_key"] = (BINDING_ID_COLUMN, *declared_primary_key)
+        case_key = (BINDING_ID_COLUMN, *declared_primary_key)
+        hints["primary_key"] = case_key
+        if reshape:
+            # One wide row is now several landed rows: the stage joins the
+            # primary key so they do not merge into one, and the *case* alone
+            # becomes dlt's merge_key so a re-emitted case replaces every
+            # stage row it landed before — a cleared cell must not linger.
+            hints["primary_key"] = (*case_key, reshape["name_to"])
+            hints["merge_key"] = case_key
 
     incremental = _build_incremental(source_definition, resource.name, binding)
     if incremental is not None:
@@ -171,9 +184,39 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
 
     resource.apply_hints(**hints)
 
+    # Reshape first, then stamp: the injector must see every row that lands.
+    if reshape:
+        resource.add_yield_map(unpivot(reshape))
     resource.add_map(make_metadata_injector(str(binding.id), str(run.id)))
 
     _assert_no_hard_delete(resource)
+
+
+def _reshape_for(source_definition, resource_name, binding, primary_key):
+    """The validated unpivot for a resource, or None.
+
+    Validated *here* as well as at save time, by the same method: a Binding
+    written through the ORM or a fixture never met `validate_binding`, and a
+    bare KeyError from the middle of a Run names neither the field nor the
+    cause.
+    """
+    if source_definition is None:
+        return None
+    spec = source_definition.reshape_for(resource_name, binding)
+    if not spec:
+        return None
+    cursor = (source_definition.incremental_for(resource_name, binding) or {}).get(
+        "cursor_path"
+    )
+    try:
+        return source_definition.validate_reshape(
+            spec,
+            where=f"{resource_name}.unpivot",
+            primary_key=primary_key,
+            cursor=cursor,
+        )
+    except ConfigurationError as exc:
+        raise SourceError(str(exc)) from exc
 
 
 def _normalize_write_disposition(declared, resource_name, primary_key):

@@ -721,8 +721,103 @@ def test_filesystem_rejects_a_format_whose_extra_is_missing_at_save_time(
     assert f"django-connectors[{extra}]" in message
 
 
-def test_filesystem_refuses_a_cloud_bucket_for_now(source_settings, make_binding):
-    binding = make_binding(
+class MemoryBucketSource(filesystem_source.FilesystemSource):
+    """The shipped source plus an in-process scheme, for tests only."""
+
+    allowed_schemes = filesystem_source.FilesystemSource.allowed_schemes | {"memory"}
+
+
+class MemoryBucketBackend:
+    """Hands the source a ready fsspec filesystem, as a host backend may."""
+
+    def get_credentials(self, connection):
+        import fsspec
+
+        return fsspec.filesystem("memory")
+
+
+@pytest.fixture
+def bucket_settings(source_settings, settings):
+    settings.DJANGO_CONNECTORS = {
+        **source_settings,
+        "SOURCES": {
+            **source_settings["SOURCES"],
+            "bucket": "tests.test_sources.MemoryBucketSource",
+        },
+        "AUTH_BACKENDS": {
+            **source_settings["AUTH_BACKENDS"],
+            "memfs": "tests.test_sources.MemoryBucketBackend",
+        },
+    }
+    return settings.DJANGO_CONNECTORS
+
+
+def _memory_files(records_by_path):
+    import fsspec
+
+    fs = fsspec.filesystem("memory")
+    fs.store.clear()
+    for path, records in records_by_path.items():
+        with fs.open(path, "w") as handle:
+            handle.write("".join(json.dumps(r) + "\n" for r in records))
+    return fs
+
+
+def _bucket_binding(make_connection, make_binding, path):
+    connection = make_connection(provider="bucket", auth_backend="memfs")
+    spec = {"path": path, "format": "jsonl", "primary_key": "id"}
+    return make_binding(
+        connection=connection, source="bucket", config={"resources": {"events": spec}}
+    )
+
+
+def _landed_ids(binding):
+    from django_connectors.landing import access
+
+    rows = access.iter_rows(access.binding_relation(binding, "events"), binding=binding)
+    return sorted(row["id"] for row in rows)
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("memory://bucket/exports", ["1", "2"]),  # whole prefix
+        ("memory://bucket/exports/**/*.jsonl", ["1", "2", "3"]),  # recursive
+        ("memory://bucket/exports/one.jsonl", ["1"]),  # one file
+    ],
+    ids=["prefix", "recursive", "single-file"],
+)
+def test_bucket_addressing_prefix_recursive_and_single_file(
+    bucket_settings, make_connection, make_binding, path, expected
+):
+    _memory_files(
+        {
+            "bucket/exports/one.jsonl": [{"id": "1"}],
+            "bucket/exports/two.jsonl": [{"id": "2"}],
+            "bucket/exports/2024/three.jsonl": [{"id": "3"}],
+        }
+    )
+    binding = _bucket_binding(make_connection, make_binding, path)
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "succeeded", run.error_message
+    assert _landed_ids(binding) == expected
+
+
+def test_a_local_single_file_path_lands_that_file_only(
+    source_settings, make_binding, tmp_path
+):
+    """A file name used to be read as a directory: zero rows, status succeeded."""
+    write_jsonl(tmp_path / "in" / "one.jsonl", [{"id": "1"}])
+    write_jsonl(tmp_path / "in" / "two.jsonl", [{"id": "2"}])
+    spec = {"path": f"{tmp_path}/in/one.jsonl", "format": "jsonl", "primary_key": "id"}
+    binding = make_binding(source="files", config={"resources": {"events": spec}})
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "succeeded", run.error_message
+    assert _landed_ids(binding) == ["1"]
+
+
+def _s3_binding(make_binding):
+    return make_binding(
         source="files",
         config={
             "resources": {
@@ -730,8 +825,84 @@ def test_filesystem_refuses_a_cloud_bucket_for_now(source_settings, make_binding
             }
         },
     )
-    with pytest.raises(ConfigurationError, match="not supported in"):
-        binding_services.validate_binding(binding)
+
+
+def test_s3_is_accepted_when_its_driver_is_installed(source_settings, make_binding):
+    pytest.importorskip("s3fs")
+    binding_services.validate_binding(_s3_binding(make_binding))
+
+
+def test_s3_without_its_driver_names_the_extra_at_save_time(
+    source_settings, make_binding, monkeypatch
+):
+    monkeypatch.setattr(
+        filesystem_source, "module_available", lambda module: module != "s3fs"
+    )
+    with pytest.raises(ConfigurationError, match=r"django-connectors\[s3\]"):
+        binding_services.validate_binding(_s3_binding(make_binding))
+
+
+def test_s3_credentials_are_built_from_the_boto_names():
+    from dlt.common.configuration.specs import AwsCredentials
+
+    built = filesystem_source.bucket_credentials(
+        "s3://bucket/x",
+        {
+            "aws_access_key_id": "AKIA",
+            "aws_secret_access_key": "secret",
+            "region_name": "eu-west-2",
+            "endpoint_url": "http://minio:9000",
+            "ignored": "x",
+        },
+    )
+    assert isinstance(built, AwsCredentials)
+    assert built.aws_access_key_id == "AKIA"
+    assert built.region_name == "eu-west-2"
+    assert built.endpoint_url == "http://minio:9000"
+
+
+def test_s3_with_no_credentials_means_ambient():
+    from dlt.common.configuration.specs import AwsCredentials
+
+    assert isinstance(
+        filesystem_source.bucket_credentials("s3://b/x", None), AwsCredentials
+    )
+
+
+@pytest.mark.parametrize("credentials", ["AKIA...", {"token": "x"}, {}])
+def test_s3_refuses_a_credential_it_cannot_use(credentials):
+    """Falling back to the worker's role would use a different account than
+    the one the operator configured, silently."""
+    with pytest.raises(ConfigurationError, match="at least one of"):
+        filesystem_source.bucket_credentials("s3://b/x", credentials)
+
+
+def test_a_dotted_bucket_name_is_a_bucket_not_a_file():
+    bucket_url, file_glob = filesystem_source.resolve_location(
+        "r", {"path": "s3://my.bucket"}
+    )
+    assert (bucket_url, file_glob) == ("s3://my.bucket", "*")
+
+
+@pytest.mark.parametrize("credentials", [None, {"key": "x"}, "token"])
+def test_other_buckets_need_a_spec_or_a_filesystem(credentials):
+    with pytest.raises(ConfigurationError, match="credential spec or an fsspec"):
+        filesystem_source.bucket_credentials("gs://b/x", credentials)
+
+
+@pytest.mark.parametrize(
+    "segment, is_file",
+    [
+        ("orders.csv", True),
+        ("archive.tar.gz", True),
+        ("exports", False),
+        (".hidden", False),
+        ("v1.2", False),
+        ("data.2024", False),
+    ],
+)
+def test_file_name_heuristic(segment, is_file):
+    assert filesystem_source._looks_like_file(segment) is is_file
 
 
 def test_filesystem_refuses_a_relative_path(source_settings, make_binding):
@@ -762,6 +933,35 @@ def test_filesystem_merge_without_a_key_is_refused():
         filesystem_source.FilesystemSource().validate_config(
             {"resources": {"events": {"path": os.sep + "tmp"}}}
         )
+
+
+def test_sql_and_rest_read_a_credentials_mapping_not_only_a_dict():
+    """`Credentials` is a Mapping, not a dict; both sources used to miss it."""
+    from django_connectors.auth.base import Credentials
+    from django_connectors.sources import rest as rest_source
+    from django_connectors.sources import sql as sql_module
+
+    assert sql_module._credentials_url(Credentials(url="sqlite://")) == "sqlite://"
+    assert rest_source._token(Credentials(access_token="t")) == "t"
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("/*.jsonl", ("file:///", "*.jsonl")),
+        ("file:///*.csv", ("file:///", "*.csv")),
+        ("/one.jsonl", ("file:///", "one.jsonl")),
+    ],
+)
+def test_a_root_level_glob_or_file_lists_the_root(path, expected):
+    assert filesystem_source.resolve_location("r", {"path": path}) == expected
+
+
+def test_other_buckets_refuse_a_credentials_mapping_too():
+    from django_connectors.auth.base import Credentials
+
+    with pytest.raises(ConfigurationError, match="credential spec or an fsspec"):
+        filesystem_source.bucket_credentials("gs://b/x", Credentials(token="t"))
 
 
 # --- connector conformance ---------------------------------------------------
@@ -824,3 +1024,53 @@ def test_filesystem_conformance(source_settings, make_binding, tmp_path):
     binding = make_binding(source="files", config=files_config(directory))
     _assert_conformant("files", binding, ["events"])
     assert len(access.sample_rows(binding, "events", limit=10)) == 2
+
+
+def test_a_local_recursive_glob_is_accepted_at_save_and_lands(
+    source_settings, make_binding, tmp_path
+):
+    """The documented form: the split happens at the first glob segment."""
+    write_jsonl(tmp_path / "exports" / "a.jsonl", [{"id": "1"}])
+    write_jsonl(tmp_path / "exports" / "2024" / "b.jsonl", [{"id": "2"}])
+    assert filesystem_source.resolve_location(
+        "r", {"path": f"{tmp_path}/exports/**/*.jsonl"}
+    ) == (f"file://{tmp_path}/exports", "**/*.jsonl")
+    spec = {
+        "path": f"{tmp_path}/exports/**/*.jsonl",
+        "format": "jsonl",
+        "primary_key": "id",
+    }
+    binding = make_binding(source="files", config={"resources": {"events": spec}})
+    binding_services.validate_binding(binding)
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "succeeded", run.error_message
+    assert _landed_ids(binding) == ["1", "2"]
+
+
+@pytest.mark.parametrize(
+    "spec, message",
+    [
+        pytest.param({"bucket_url": "ftp://x/y"}, "not supported", id="ftp"),
+        pytest.param({"bucket_url": "http://x/y"}, "not supported", id="http"),
+        pytest.param(
+            {"bucket_url": "memory://x/y"}, "not supported", id="memory-not-in-prod"
+        ),
+        pytest.param({"bucket_url": "s3:///prefix"}, "names no bucket", id="no-bucket"),
+        pytest.param({"path": "orders.csv"}, "absolute", id="bare-name-is-relative"),
+        pytest.param({"path": "*.csv"}, "absolute", id="bare-glob-is-relative"),
+        pytest.param(
+            {"path": "{tmp}/release.v2"}, "is a directory", id="dotted-directory"
+        ),
+        pytest.param({"path": "{tmp}/nope"}, "not a directory", id="missing-directory"),
+    ],
+)
+def test_files_bindings_refused_at_save_time(
+    source_settings, make_binding, tmp_path, spec, message
+):
+    (tmp_path / "release.v2").mkdir()
+    spec = {k: v.replace("{tmp}", str(tmp_path)) for k, v in spec.items()}
+    binding = make_binding(
+        source="files", config={"resources": {"events": {**spec, "primary_key": "id"}}}
+    )
+    with pytest.raises(ConfigurationError, match=message):
+        binding_services.validate_binding(binding)

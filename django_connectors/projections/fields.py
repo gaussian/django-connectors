@@ -10,6 +10,8 @@ tell you that (MySQL yields NULL plus a session warning).
 import datetime as dt
 import decimal
 import json
+import re
+import zoneinfo
 
 from django_connectors.exceptions import CastError
 
@@ -27,6 +29,9 @@ class Field:
 
     #: dlt data types that coerce into this field without complaint.
     compatible_dlt_types = frozenset()
+    #: Keyword options a mapping may pass when using this type as a cast, e.g.
+    #: ``{"cast": "datetime", "format": "%d/%m/%Y"}``. Empty means none.
+    cast_options = frozenset()
 
     def __init__(self, *, required=False, help_text=""):
         self.required = required
@@ -81,7 +86,45 @@ class StringField(Field):
         return {**super().describe(), "max_length": self.max_length}
 
 
-class IntegerField(Field):
+class NumberField(Field):
+    """Shared text handling for the numeric types.
+
+    Spreadsheets and CSV exports hand over numbers the way people write them:
+    ``"£1,234.56"``, ``"1.234,56"``, ``"12 500"``. ``strip`` names the
+    characters to drop first (currency symbols, thousands separators, spaces);
+    ``decimal_separator=","`` then treats the comma as the decimal point. Both
+    apply to text only — a number that already is one is left alone.
+    """
+
+    cast_options = frozenset({"strip", "decimal_separator"})
+
+    def __init__(
+        self, *, required=False, help_text="", strip="", decimal_separator="."
+    ):
+        super().__init__(required=required, help_text=help_text)
+        if not isinstance(strip, str):
+            raise ValueError("'strip' must be a string of characters to remove")
+        if decimal_separator not in (".", ","):
+            raise ValueError("'decimal_separator' must be '.' or ','")
+        if decimal_separator in strip:
+            raise ValueError(
+                f"'strip' removes {decimal_separator!r}, which is also the "
+                f"'decimal_separator'; '1,5' would silently become 15"
+            )
+        self.strip = strip
+        self.decimal_separator = decimal_separator
+        self._strip_table = str.maketrans("", "", strip) if strip else None
+
+    def _text(self, value):
+        text = str(value).strip()
+        if self._strip_table:
+            text = text.translate(self._strip_table)
+        if self.decimal_separator == ",":
+            text = text.replace(",", ".")
+        return text
+
+
+class IntegerField(NumberField):
     compatible_dlt_types = frozenset({"bigint", "double", "bool", "text", "decimal"})
 
     def _coerce(self, value):
@@ -93,21 +136,27 @@ class IntegerField(Field):
             if not value.is_integer():
                 raise CastError(f"{value!r} is not a whole number")
             return int(value)
-        return int(str(value).strip())
+        return int(self._text(value))
 
 
-class DecimalField(Field):
+class DecimalField(NumberField):
     compatible_dlt_types = frozenset({"decimal", "bigint", "double", "text"})
 
     def _coerce(self, value):
-        return decimal.Decimal(str(value).strip())
+        if isinstance(value, int | float | decimal.Decimal) and not isinstance(
+            value, bool
+        ):
+            return decimal.Decimal(str(value))
+        return decimal.Decimal(self._text(value))
 
 
-class FloatField(Field):
+class FloatField(NumberField):
     compatible_dlt_types = frozenset({"double", "bigint", "decimal", "text"})
 
     def _coerce(self, value):
-        return float(value)
+        if isinstance(value, int | float):
+            return float(value)
+        return float(self._text(value))
 
 
 class BooleanField(Field):
@@ -131,32 +180,61 @@ class BooleanField(Field):
 
 
 class DateTimeField(Field):
+    """A timezone-aware datetime.
+
+    Without ``format``, text must be ISO 8601 — which is what a landed
+    timestamp column reads back as. With ``format`` (a ``strptime`` pattern),
+    text is parsed the way the customer wrote it: ``"%d/%m/%Y"`` for a
+    spreadsheet's ``03/04/2024``, because a date a person typed is almost never
+    ISO and guessing between day-first and month-first silently corrupts a
+    third of a year's rows. ``timezone`` (an IANA name) says which wall clock
+    naive *text* is on. It never applies to a native datetime: that came from
+    a landed timestamp column, which dlt already converted to UTC.
+    """
+
     compatible_dlt_types = frozenset({"timestamp", "date", "text", "bigint"})
+    cast_options = frozenset({"format", "timezone"})
+
+    def __init__(self, *, required=False, help_text="", format=None, timezone=None):
+        super().__init__(required=required, help_text=help_text)
+        self.format = _validated_format(format)
+        self.tzinfo = _validated_timezone(timezone)
 
     def _coerce(self, value):
+        # A native datetime came from a landed timestamp column: dlt converted
+        # it to UTC and dropped the offset, so naive means UTC — `timezone`
+        # must not relabel it. Only text is the customer's own rendering.
         if isinstance(value, dt.datetime):
-            return _as_aware(value)
+            return _as_aware(value, dt.UTC)
         if isinstance(value, dt.date):
-            return _as_aware(dt.datetime.combine(value, dt.time.min))
+            return _as_aware(dt.datetime.combine(value, dt.time.min), dt.UTC)
         if isinstance(value, int | float):
             return dt.datetime.fromtimestamp(value, tz=dt.UTC)
         text = str(value).strip()
-        # dlt stores timestamps as MySQL datetime(6) with the offset dropped
-        # after conversion to UTC, so a naive value read back is UTC.
+        if self.format:
+            return _as_aware(dt.datetime.strptime(text, self.format), self.tzinfo)
         if text.endswith("Z"):
             text = f"{text[:-1]}+00:00"
-        return _as_aware(dt.datetime.fromisoformat(text))
+        return _as_aware(dt.datetime.fromisoformat(text), self.tzinfo)
 
 
 class DateField(Field):
     compatible_dlt_types = frozenset({"date", "timestamp", "text"})
+    cast_options = frozenset({"format"})
+
+    def __init__(self, *, required=False, help_text="", format=None):
+        super().__init__(required=required, help_text=help_text)
+        self.format = _validated_format(format)
 
     def _coerce(self, value):
         if isinstance(value, dt.datetime):
             return value.date()
         if isinstance(value, dt.date):
             return value
-        return dt.date.fromisoformat(str(value).strip())
+        text = str(value).strip()
+        if self.format:
+            return dt.datetime.strptime(text, self.format).date()
+        return dt.date.fromisoformat(text)
 
 
 class JSONField(Field):
@@ -170,26 +248,77 @@ class JSONField(Field):
         raise CastError(f"{type(value).__name__} is not JSON-compatible")
 
 
-def _as_aware(value):
-    """Attach UTC to a naive datetime.
+#: Directives ``strptime`` understands. Checked up front because neither
+#: ``strftime`` (glibc passes an unknown ``%Q`` straight through) nor
+#: ``strptime`` (which only fails on the first row) reports a bad pattern at
+#: the time the mapping is written.
+STRPTIME_DIRECTIVES = frozenset("aAbBcdfGHIjmMpSuUVwWxXyYzZ%")
+_DIRECTIVE_RE = re.compile(r"%(.|$)")
 
-    Landed timestamps are UTC by construction — dlt converts to UTC and drops
-    the offset — so a naive value is UTC rather than local time, and guessing
-    local time here would shift every event by the server's offset.
-    """
+
+def _as_aware(value, tzinfo):
+    """Attach `tzinfo` (or UTC) to a naive datetime; leave an aware one alone."""
     if value.tzinfo is None:
-        return value.replace(tzinfo=dt.UTC)
+        return value.replace(tzinfo=tzinfo or dt.UTC)
     return value
 
 
-#: Named casts available in the mapping DSL.
-CASTS = {
-    "string": StringField(),
-    "integer": IntegerField(),
-    "decimal": DecimalField(),
-    "float": FloatField(),
-    "boolean": BooleanField(),
-    "datetime": DateTimeField(),
-    "date": DateField(),
-    "json": JSONField(),
+def _validated_format(pattern):
+    """A ``strptime`` pattern, checked now rather than on the first row."""
+    if pattern is None:
+        return None
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError("'format' must be a non-empty strptime pattern")
+    for directive in _DIRECTIVE_RE.findall(pattern):
+        if directive not in STRPTIME_DIRECTIVES:
+            raise ValueError(
+                f"'format' {pattern!r} is not a valid strptime pattern: "
+                f"%{directive} is not a directive"
+            )
+    return pattern
+
+
+def _validated_timezone(name):
+    if name is None:
+        return None
+    if not isinstance(name, str) or not name:
+        raise ValueError("'timezone' must be an IANA name such as 'Europe/London'")
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"'timezone' {name!r} is not a known IANA zone") from exc
+
+
+#: Cast names available in the mapping DSL, and the field type each builds.
+CAST_TYPES = {
+    "string": StringField,
+    "integer": IntegerField,
+    "decimal": DecimalField,
+    "float": FloatField,
+    "boolean": BooleanField,
+    "datetime": DateTimeField,
+    "date": DateField,
+    "json": JSONField,
 }
+
+
+def make_cast(name, options=None):
+    """A field instance for ``{"cast": name, **options}``.
+
+    Raises ``ValueError`` — the compiler turns it into a
+    ``MappingValidationError`` naming the field — for an unknown cast, an
+    option the cast does not take, or an option value the type rejects.
+    """
+    cls = CAST_TYPES.get(name) if isinstance(name, str) else None
+    if cls is None:
+        raise ValueError(
+            f"unknown cast {name!r}; available: {', '.join(sorted(CAST_TYPES))}"
+        )
+    options = dict(options or {})
+    unknown = sorted(set(options) - cls.cast_options)
+    if unknown:
+        accepted = ", ".join(sorted(cls.cast_options)) or "none"
+        raise ValueError(
+            f"cast {name!r} does not take option(s) {unknown}; accepted: {accepted}"
+        )
+    return cls(**options)

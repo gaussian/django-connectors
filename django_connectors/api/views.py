@@ -13,6 +13,7 @@ the whole module so a viewset added later cannot skip it.
 from django.core.exceptions import ImproperlyConfigured
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
 
@@ -43,17 +44,50 @@ from django_connectors.services import projections as projection_services
 from django_connectors.services import runs as run_services
 
 
-class BaseViewSet(OwnerScopedQuerysetMixin, viewsets.ModelViewSet):
-    abstract_scope = True
+class ConfiguredPermissionsMixin:
+    """Deny-all by default; a subclass that names its own classes wins.
+
+    ``permission_classes = None`` is the sentinel meaning "not declared": the
+    host's ``API_PERMISSION_CLASSES`` setting applies, and when that is unset
+    every request is denied. A subclass that sets ``permission_classes`` — the
+    ordinary DRF way — gets ordinary DRF behaviour, so a host with its own
+    permission model composes these viewsets without touching the setting.
+    """
+
+    permission_classes = None
 
     def get_permissions(self):
-        return [permission() for permission in configured_permission_classes()]
+        if self.permission_classes is None:
+            return [permission() for permission in configured_permission_classes()]
+        return super().get_permissions()
+
+
+class BaseViewSet(
+    ConfiguredPermissionsMixin, OwnerScopedQuerysetMixin, viewsets.ModelViewSet
+):
+    abstract_scope = True
 
 
 class ConnectionViewSet(BaseViewSet):
     owner_lookup = ""
     queryset = Connection.objects.all()
     serializer_class = ConnectionSerializer
+
+    def perform_create(self, serializer):
+        """Stamp the new Connection with the caller's owner.
+
+        The owner columns are deliberately absent from the serializer — a
+        client must not choose its tenant — so they are supplied here from the
+        same answer that scopes every read. No owner means no create: the
+        alternative was an IntegrityError, i.e. a 500 for a well-formed request.
+        """
+        owner = self.resolved_owner()
+        if owner is None:
+            raise PermissionDenied("no owner resolved for this request")
+        content_type_id, object_id = owner
+        serializer.save(
+            owner_content_type_id=content_type_id, owner_object_id=object_id
+        )
 
     @action(detail=True, methods=["post"])
     def test(self, request, pk=None):
@@ -69,11 +103,17 @@ class ConnectionViewSet(BaseViewSet):
 
     @action(detail=True, methods=["get"])
     def discover(self, request, pk=None):
+        """``?q=`` narrows, ``?path=`` descends, ``?cursor=`` pages, ``?limit=``."""
         connection = self.get_object()
+        params = request.query_params
         try:
             return Response(
                 discovery.discover_remote(
-                    connection, query=request.query_params.get("q")
+                    connection,
+                    query=params.get("q"),
+                    path=params.get("path"),
+                    cursor=params.get("cursor"),
+                    limit=params.get("limit"),
                 )
             )
         except ConnectorError as exc:
@@ -217,15 +257,12 @@ class WebhookSubscriptionViewSet(BaseViewSet):
         return Response(WebhookSubscriptionSerializer(subscription).data)
 
 
-class TargetViewSet(viewsets.ViewSet):
+class TargetViewSet(ConfiguredPermissionsMixin, viewsets.ViewSet):
     """Registered target shapes. Host-declared metadata, not tenant data.
 
     The only unscoped viewset in the API, and safe precisely because it contains
     no customer data — just the schema a mapping UI needs to render.
     """
-
-    def get_permissions(self):
-        return [permission() for permission in configured_permission_classes()]
 
     def list(self, request):
         return Response([target.describe() for target in all_targets().values()])
@@ -239,11 +276,8 @@ class TargetViewSet(viewsets.ViewSet):
         return Response(targets[pk].describe())
 
 
-class SourceViewSet(viewsets.ViewSet):
+class SourceViewSet(ConfiguredPermissionsMixin, viewsets.ViewSet):
     """Registered source definitions. Also host/library metadata, not tenant data."""
-
-    def get_permissions(self):
-        return [permission() for permission in configured_permission_classes()]
 
     def list(self, request):
         from django_connectors.registry import sources

@@ -50,7 +50,7 @@ DJANGO_CONNECTORS = {
 ```
 
 Extras: `mysql`, `postgres`, `drf`, `celery`, `allauth`, `secrets`, `sql`, `csv`,
-`parquet`, `s3`, `google`, `microsoft`. Installing one never enables behaviour by itself —
+`parquet`, `s3`, `gs`, `az`, `google`, `microsoft`. Installing one never enables behaviour by itself —
 the corresponding source or backend must also be named in the setting.
 
 ## Declare a target
@@ -107,8 +107,9 @@ python manage.py demo
 
 Built in: `memory` (a test driver with injectable failure modes), `rest`
 (config-driven, over `dlt.sources.rest_api`), `sql` (warehouses and databases),
-`filesystem` (JSONL/CSV/Parquet). Provider connectors for Gmail, Google Sheets,
-Microsoft/Entra files and Excel, and Salesforce ship under
+`filesystem` (JSONL/CSV/Parquet on local disk, S3, GCS or Azure — one file, a
+prefix, or a recursive glob). Provider connectors for Gmail, Google Sheets,
+Google Drive, Microsoft/Entra files and Excel, and Salesforce ship under
 `django_connectors.providers` — see their module docstrings for what is and is
 not verified against a live provider.
 
@@ -119,6 +120,7 @@ Writing your own means subclassing `SourceDefinition` and returning a dlt source
 - [docs/quickstart.md](docs/quickstart.md) — end to end in ten minutes
 - [docs/architecture.md](docs/architecture.md) — why the pieces are shaped as they are
 - [docs/operations.md](docs/operations.md) — deploying on MySQL or PostgreSQL, concurrency, retention
+- [docs/api.md](docs/api.md) — the optional REST API, and composing it with your own
 - [docs/TESTING.md](docs/TESTING.md) — the conformance suite every source must pass, and how to test a connector against the real thing
 - [AGENTS.md](AGENTS.md) — development workflow and test tiers
 

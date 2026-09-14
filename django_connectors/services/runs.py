@@ -73,7 +73,7 @@ def run_binding(binding, *, trigger=RunTrigger.MANUAL, run=None, actor=None):
     try:
         _ensure_runnable(binding)
         source_definition = sources.get(binding.source)
-        credentials = _credentials_for(binding.connection)
+        credentials = credentials_for(binding.connection)
 
         _drain_pending_if_needed(binding, source_definition)
 
@@ -297,7 +297,7 @@ def _block_for_credentials(binding, exc):
     binding.save(update_fields=["status", "last_error"])
 
 
-def _credentials_for(connection):
+def credentials_for(connection):
     """Resolve credentials via the configured auth backend, if any."""
     from django_connectors.registry import auth_backends
 

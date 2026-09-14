@@ -73,6 +73,10 @@ from django_connectors.providers.microsoft.files import EntraFilesSource  # noqa
 from django_connectors.secrets import SecretStore  # noqa: E402
 from django_connectors.services import bindings as binding_services  # noqa: E402
 from django_connectors.services import runs as run_services  # noqa: E402
+from django_connectors.services.content import (  # noqa: E402
+    FetchedContent,
+    fetch_record_content,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -310,11 +314,7 @@ class FakeGraph:
         if path.endswith("/content"):
             return self._content(start_response, path)
         if path.endswith("/children"):
-            return self._respond(
-                start_response,
-                200,
-                {"value": [item for item in self.items.values() if "root" not in item]},
-            )
+            return self._children(start_response, path, query)
         if "/items/" in path:
             item_id = path.split("/items/", 1)[1].split("/")[0]
             item = self.items.get(item_id)
@@ -342,6 +342,24 @@ class FakeGraph:
                 {"value": [{"id": SITE_ID, "displayName": "Contoso"}]},
             )
         return self._respond(start_response, 404, {"error": {"code": "unknownRoute"}})
+
+    def _children(self, start_response, path, query):
+        """``/root/children`` or ``/items/<id>/children``, paged by ``$top``."""
+        parent = (
+            path.split("/items/", 1)[1].split("/")[0] if "/items/" in path else None
+        )
+        results = [
+            item
+            for item in self.items.values()
+            if "root" not in item
+            and (parent is None or item["parentReference"].get("id") == parent)
+        ]
+        top = int(query.get("$top", [str(self.page_size)])[0])
+        page = int(query.get("_page", ["0"])[0])
+        body = {"value": results[page * top : (page + 1) * top]}
+        if (page + 1) * top < len(results):
+            body["@odata.nextLink"] = f"{self.origin}{path}?$top={top}&_page={page + 1}"
+        return self._respond(start_response, 200, body)
 
     def _delta(self, start_response, path, query):
         token = query.get("token", [None])[0]
@@ -677,7 +695,12 @@ def test_discover_lists_a_drives_children_when_one_is_configured(
     microsoft_settings, make_connection, graph
 ):
     """Discovery runs before any Binding exists, so it reads Connection.metadata."""
-    graph.seed(ROOT_ITEM, drive_item("F1", "budget.xlsx"), drive_item("F2", "a.docx"))
+    graph.seed(
+        ROOT_ITEM,
+        drive_item("F1", "budget.xlsx"),
+        drive_item("F2", "a.docx"),
+        drive_item("D1", "Archive", is_folder=True),
+    )
     connection = make_connection(
         provider="microsoft",
         auth_backend="token",
@@ -687,10 +710,79 @@ def test_discover_lists_a_drives_children_when_one_is_configured(
     result = LoopbackFilesSource().discover(
         connection=connection, credentials={"access_token": "APP-ONLY-TOKEN"}
     )
-    assert sorted(entry["name"] for entry in result["items"]) == [
-        "a.docx",
-        "budget.xlsx",
+    assert sorted((e["name"], e["kind"]) for e in result["items"]) == [
+        ("Archive", "folder"),
+        ("a.docx", "file"),
+        ("budget.xlsx", "file"),
     ]
+    folder = next(e for e in result["items"] if e["kind"] == "folder")
+    assert folder["path"] == "D1"
+    assert result["next_cursor"] is None
+
+
+def test_discover_pages_a_folder_through_graphs_own_next_link(
+    microsoft_settings, make_connection, graph
+):
+    items = [drive_item(f"F{i}", f"file{i}.xlsx") for i in range(5)]
+    for item in items:
+        item["parentReference"]["id"] = "D1"
+    graph.seed(ROOT_ITEM, drive_item("D1", "Reports", is_folder=True), *items)
+    connection = make_connection(
+        provider="microsoft",
+        auth_backend="token",
+        metadata={"graph_base_url": f"{graph.origin}/v1.0", "drive_id": DRIVE_ID},
+    )
+    source = LoopbackFilesSource()
+    token = {"access_token": "APP-ONLY-TOKEN"}
+
+    first = source.discover(
+        connection=connection, credentials=token, path="D1", limit=2
+    )
+    assert [e["name"] for e in first["items"]] == ["file0.xlsx", "file1.xlsx"]
+    # Opaque and signed: never the raw Graph link.
+    assert graph.origin not in first["next_cursor"]
+
+    second = source.discover(
+        connection=connection, credentials=token, cursor=first["next_cursor"]
+    )
+    assert [e["name"] for e in second["items"]] == ["file2.xlsx", "file3.xlsx"]
+
+    third = source.discover(
+        connection=connection, credentials=token, cursor=second["next_cursor"]
+    )
+    assert [e["name"] for e in third["items"]] == ["file4.xlsx"]
+    assert third["next_cursor"] is None
+
+
+def test_discover_refuses_a_cursor_it_did_not_issue(
+    microsoft_settings, make_connection, graph
+):
+    """A cursor is followed with the tenant-wide token attached, so a raw URL
+    handed in by a caller would read any same-origin Graph collection."""
+    from django_connectors.sources.base import sign_cursor
+
+    connection = make_connection(
+        provider="microsoft",
+        auth_backend="token",
+        metadata={"graph_base_url": f"{graph.origin}/v1.0", "drive_id": DRIVE_ID},
+    )
+    source = LoopbackFilesSource()
+    token = {"access_token": "APP-ONLY-TOKEN"}
+
+    with pytest.raises(ConfigurationError, match="not issued"):
+        source.discover(
+            connection=connection,
+            credentials=token,
+            cursor=f"{graph.origin}/v1.0/users",
+        )
+    # Signed for another connection: still not ours.
+    foreign = sign_cursor(f"{graph.origin}/v1.0/users", scope="other-connection")
+    with pytest.raises(ConfigurationError, match="not issued"):
+        source.discover(connection=connection, credentials=token, cursor=foreign)
+    # Signed for us but off-origin: the origin check still stands behind it.
+    off = sign_cursor("https://evil.example/v1.0/steal", scope=connection.id)
+    with pytest.raises(SourceError, match="Refusing to follow"):
+        source.discover(connection=connection, credentials=token, cursor=off)
 
 
 def test_discover_searches_for_sites_when_nothing_is_configured_yet(
@@ -707,7 +799,9 @@ def test_discover_searches_for_sites_when_nothing_is_configured_yet(
         credentials={"access_token": "APP-ONLY-TOKEN"},
         query="contoso",
     )
-    assert [entry["id"] for entry in result["sites"]] == [SITE_ID]
+    assert [(entry["id"], entry["kind"]) for entry in result["items"]] == [
+        (SITE_ID, "site")
+    ]
     assert graph.requests[0]["query"] == {"search": ["contoso"]}
 
 
@@ -1304,7 +1398,7 @@ def test_excel_refuses_a_positional_merge_configuration():
 
 
 def test_excel_item_id_and_folder_narrowing_are_mutually_exclusive():
-    with pytest.raises(ConfigurationError, match="one workbook"):
+    with pytest.raises(ConfigurationError, match="one item"):
         EntraExcelSource().validate_config(
             {"drive_id": DRIVE_ID, "item_id": "X1", "folder_path": "/Finance"}
         )
@@ -1792,6 +1886,147 @@ def test_the_registry_can_resolve_every_shipped_microsoft_class(microsoft_settin
     else:  # pragma: no cover - guards the assertion above from being vacuous
         raise AssertionError("import_string did not fail for a missing name")
     assert ImproperlyConfigured  # imported for the registry contract above
+
+
+# --- content, and one item by id ----------------------------------------------
+
+
+def test_the_file_source_fetches_a_landed_items_bytes(
+    microsoft_settings, make_graph_binding, graph
+):
+    graph.seed(ROOT_ITEM, drive_item("F1", "report.pdf"))
+    graph.files["F1"] = b"%PDF-1.7 hello"
+    binding = make_graph_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    row = access.sample_rows(binding, "drive_items", limit=1)[0]
+
+    fetched = fetch_record_content(
+        binding, "drive_items", {"id": row["id"], "drive_id": row["drive_id"]}
+    )
+    assert isinstance(fetched, FetchedContent)
+    assert fetched.data == b"%PDF-1.7 hello"
+    assert fetched.size == 14
+    assert fetched.content_type == "application/octet-stream"
+
+
+def test_the_ceiling_holds_whatever_the_host_asks_for(
+    microsoft_settings, make_graph_binding, graph, settings
+):
+    graph.seed(ROOT_ITEM, drive_item("F1", "big.bin"))
+    graph.files["F1"] = b"x" * 100
+    settings.DJANGO_CONNECTORS = {**settings.DJANGO_CONNECTORS, "CONTENT_MAX_BYTES": 50}
+    binding = make_graph_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    for asked in (None, 0, 10_000):
+        with pytest.raises(SourceError, match="limit"):
+            fetch_record_content(
+                binding,
+                "drive_items",
+                {"id": "F1", "drive_id": DRIVE_ID},
+                max_bytes=asked,
+            )
+
+
+def test_content_is_fetched_only_for_a_row_this_binding_landed(
+    microsoft_settings, make_graph_binding, graph
+):
+    """A host will build a reference from request input sooner or later."""
+    graph.seed(ROOT_ITEM, drive_item("F1", "mine.pdf"), drive_item("F2", "theirs.pdf"))
+    graph.files["F2"] = b"secret"
+    binding = make_graph_binding(name_glob="mine*")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+
+    with pytest.raises(
+        SourceError, match="fetched only for records this binding landed"
+    ):
+        fetch_record_content(binding, "drive_items", {"id": "F2", "drive_id": DRIVE_ID})
+    with pytest.raises(SourceError, match="merge key column"):
+        fetch_record_content(binding, "drive_items", {"drive_id": DRIVE_ID})
+
+
+def test_content_before_any_run_is_a_named_error(
+    microsoft_settings, make_graph_binding
+):
+    binding = make_graph_binding()
+    with pytest.raises(SourceError, match="not landed"):
+        fetch_record_content(binding, "drive_items", {"id": "F1"})
+
+
+def test_a_malformed_reference_is_a_source_error(
+    microsoft_settings, make_graph_binding, graph
+):
+    """Bad reference data, not bad Binding config: the documented exception."""
+    graph.seed(ROOT_ITEM, drive_item("F1", "one.pdf"))
+    binding = make_graph_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    with pytest.raises(SourceError):
+        fetch_record_content(binding, "drive_items", {"id": "F1", "drive_id": "bad/id"})
+
+
+def test_a_missing_single_item_on_first_sight_is_a_failed_run(
+    microsoft_settings, make_graph_binding, graph
+):
+    """A wrong id on a new Binding must not land a dead row and report success."""
+    graph.seed(ROOT_ITEM)
+    binding = make_graph_binding(item_id="NOPE")
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.FAILED
+    assert "could not find" in run.error_message
+
+
+def test_a_single_item_that_is_a_folder_is_refused(
+    microsoft_settings, make_graph_binding, graph
+):
+    graph.seed(ROOT_ITEM, drive_item("D1", "Reports", is_folder=True))
+    binding = make_graph_binding(item_id="D1")
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.FAILED
+    assert "folder_item_id" in run.error_message
+
+
+def test_a_single_item_binding_lands_that_item_only(
+    microsoft_settings, make_graph_binding, graph
+):
+    graph.seed(ROOT_ITEM, drive_item("F1", "one.pdf"), drive_item("F2", "two.pdf"))
+    binding = make_graph_binding(item_id="F1")
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "succeeded", run.error_message
+    rows = access.sample_rows(binding, "drive_items", limit=10)
+    assert [r["id"] for r in rows] == ["F1"]
+
+
+def test_a_deleted_single_item_lands_as_a_tombstone(
+    microsoft_settings, make_graph_binding, graph
+):
+    graph.seed(ROOT_ITEM, drive_item("F1", "one.pdf"))
+    binding = make_graph_binding(item_id="F1")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    del graph.items["F1"]
+    second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert second.status == "succeeded", second.error_message
+    rows = access.sample_rows(binding, "drive_items", limit=10)
+    assert len(rows) == 1 and bool(rows[0][DELETED_COLUMN]) is True
+
+
+def test_content_refuses_a_graph_host_off_the_allow_list(
+    microsoft_settings, make_graph_binding, graph
+):
+    """A base URL edited after landing must not receive the tenant token."""
+    from django_connectors.providers.microsoft.files import EntraFilesSource
+
+    graph.seed(ROOT_ITEM, drive_item("F1", "one.pdf"))
+    binding = make_graph_binding()
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    binding.config["graph_base_url"] = "https://evil.example/v1.0"
+    binding.save(update_fields=["config"])
+    with pytest.raises(ConfigurationError, match="refusing to send"):
+        EntraFilesSource().fetch_content(
+            binding=binding,
+            credentials={"access_token": "t"},
+            resource="drive_items",
+            reference={"id": "F1", "drive_id": DRIVE_ID},
+            max_bytes=10,
+        )
 
 
 # --- connector conformance ---------------------------------------------------

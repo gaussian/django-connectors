@@ -17,7 +17,6 @@ pytest.importorskip("rest_framework")
 
 from rest_framework import viewsets
 from rest_framework.generics import GenericAPIView
-from rest_framework.test import APIClient
 
 from django_connectors.api import views as api_views
 from django_connectors.api.scoping import OwnerScopedQuerysetMixin
@@ -59,20 +58,6 @@ def reset_owner():
     CURRENT_OWNER["object_id"] = "1"
     yield
     CURRENT_OWNER["object_id"] = "1"
-
-
-@pytest.fixture
-def client_for():
-    from django.contrib.auth.models import User
-
-    def factory(username=None):
-        username = username or f"apiuser{User.objects.count()}"
-        user = User.objects.create_user(username=username, password="x")
-        client = APIClient()
-        client.force_authenticate(user=user)
-        return client
-
-    return factory
 
 
 # --- structural guarantees -------------------------------------------------
@@ -295,10 +280,8 @@ def test_targets_endpoint_exposes_shape_not_tenant_data(api_settings, client_for
     from django_connectors.projections.targets import (
         TargetDefinition,
         register_target,
-        unregister_all,
     )
 
-    unregister_all()
     register_target(
         TargetDefinition(
             key="events",
@@ -308,12 +291,9 @@ def test_targets_endpoint_exposes_shape_not_tenant_data(api_settings, client_for
             writer=lambda records, context: len(records),
         )
     )
-    try:
-        payload = client_for().get(reverse("django_connectors:target-list")).json()
-        assert payload[0]["key"] == "events"
-        assert payload[0]["fields"]["external_id"]["required"] is True
-    finally:
-        unregister_all()
+    payload = client_for().get(reverse("django_connectors:target-list")).json()
+    assert payload[0]["key"] == "events"
+    assert payload[0]["fields"]["external_id"]["required"] is True
 
 
 # --- cross-tenant writes ---------------------------------------------------

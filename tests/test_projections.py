@@ -16,78 +16,26 @@ from django_connectors.exceptions import (
     MappingValidationError,
     ProjectionError,
 )
-from django_connectors.models import Projection
 from django_connectors.projections.compiler import compile_mapping
 from django_connectors.projections.fields import (
-    DateTimeField,
-    IntegerField,
     JSONField,
     StringField,
 )
 from django_connectors.projections.targets import (
     TargetDefinition,
     register_target,
-    unregister_all,
 )
 from django_connectors.services import projections as projection_services
 from django_connectors.services import runs as run_services
-from tests.conftest import memory_config
+from tests.conftest import (
+    BASIC_MAPPING,
+    RecordingWriter,
+    land_memory,
+    make_projection,
+    memory_config,
+)
 
 pytestmark = pytest.mark.django_db
-
-
-class RecordingWriter:
-    """Stands in for a host writer and records what it was handed."""
-
-    def __init__(self, *, fail_times=0):
-        self.batches = []
-        self.contexts = []
-        self.fail_times = fail_times
-        self.calls = 0
-
-    def __call__(self, records, context):
-        self.calls += 1
-        if self.calls <= self.fail_times:
-            raise RuntimeError("host writer exploded")
-        self.batches.append(list(records))
-        self.contexts.append(context)
-        return len(records)
-
-    @property
-    def records(self):
-        return [record for batch in self.batches for record in batch]
-
-
-@pytest.fixture(autouse=True)
-def clean_target_registry():
-    unregister_all()
-    yield
-    unregister_all()
-
-
-@pytest.fixture
-def writer():
-    return RecordingWriter()
-
-
-@pytest.fixture
-def events_target(writer):
-    return register_target(
-        TargetDefinition(
-            key="events",
-            fields={
-                "external_id": StringField(required=True),
-                "occurred_at": DateTimeField(required=True),
-                "type": StringField(required=True),
-                "payload": JSONField(),
-                "count": IntegerField(),
-            },
-            identity_fields=("external_id",),
-            identity_scope="owner",
-            writer=writer,
-            supports_scope_replace=True,
-        )
-    )
 
 
 @pytest.fixture
@@ -109,32 +57,6 @@ def contacts_target(writer):
 
 
 CONTACT_MAPPING = {"email": {"source": "email"}, "name": {"source": "name"}}
-
-
-BASIC_MAPPING = {
-    "external_id": {"source": "id"},
-    "occurred_at": {"source": "happened_at", "cast": "datetime"},
-    "type": {"source": "kind"},
-}
-
-
-def _land(make_binding, batches, **kwargs):
-    binding = make_binding(config=memory_config(batches=batches, **kwargs))
-    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
-    assert run.status == "succeeded", run.error_message
-    return binding, run
-
-
-def _projection(binding, mapping=None, *, filters=None, target="events"):
-    return Projection.objects.create(
-        binding=binding,
-        resource="events",
-        target=target,
-        name="p",
-        mapping=mapping if mapping is not None else BASIC_MAPPING,
-        filters=filters or [],
-        status=ProjectionStatus.ACTIVE,
-    )
 
 
 RECORD = {"id": "e1", "happened_at": "2024-03-01T10:00:00Z", "kind": "created"}
@@ -275,8 +197,8 @@ def test_invalid_filters_are_rejected(filters, message):
 def test_validation_requires_identity_and_required_fields(
     connectors_settings, make_binding, events_target
 ):
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(binding, {"type": {"source": "kind"}})
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding, {"type": {"source": "kind"}})
 
     result = projection_services.validate_projection(projection)
     assert not result.ok
@@ -288,8 +210,8 @@ def test_validation_requires_identity_and_required_fields(
 def test_validation_rejects_unknown_source_columns(
     connectors_settings, make_binding, events_target
 ):
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(
         binding, {**BASIC_MAPPING, "type": {"source": "does_not_exist"}}
     )
     result = projection_services.validate_projection(projection)
@@ -300,8 +222,8 @@ def test_validation_rejects_unknown_source_columns(
 def test_validation_rejects_fields_the_target_does_not_declare(
     connectors_settings, make_binding, events_target
 ):
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(binding, {**BASIC_MAPPING, "nope": {"constant": 1}})
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding, {**BASIC_MAPPING, "nope": {"constant": 1}})
     result = projection_services.validate_projection(projection)
     assert not result.ok
     assert "nope" in "; ".join(result.errors)
@@ -310,8 +232,8 @@ def test_validation_rejects_fields_the_target_does_not_declare(
 def test_a_valid_projection_validates_clean(
     connectors_settings, make_binding, events_target
 ):
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(binding)
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding)
     result = projection_services.validate_projection(projection)
     assert result.ok, result.errors
 
@@ -320,7 +242,7 @@ def test_activation_is_refused_before_the_binding_has_landed_anything(
     connectors_settings, make_binding, events_target
 ):
     binding = make_binding(config=memory_config(batches=[[RECORD]]))
-    projection = _projection(binding)
+    projection = make_projection(binding)
     with pytest.raises(ProjectionError, match="has not landed anything"):
         projection_services.activate_projection(projection)
 
@@ -342,7 +264,7 @@ def test_incremental_run_projects_only_the_scoped_loads(
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
 
-    projection = _projection(binding)
+    projection = make_projection(binding)
     projection_run = projection_services.run_projection(projection, source_run=second)
 
     assert projection_run.status == ProjectionRunStatus.SUCCEEDED
@@ -353,8 +275,8 @@ def test_the_incremental_window_uses_load_ids_not_the_run_id(
     connectors_settings, make_binding, events_target
 ):
     """A run id is stamped at extract time and is wrong for a pending package."""
-    binding, run = _land(make_binding, [[RECORD]])
-    projection = _projection(binding)
+    binding, run = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding)
     projection_run = projection_services.run_projection(projection, source_run=run)
     assert projection_run.load_ids == run.dlt_load_ids
 
@@ -373,7 +295,7 @@ def test_full_replay_projects_every_landed_row(
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
 
-    projection = _projection(binding)
+    projection = make_projection(binding)
     projection_run = projection_services.replay_projection(projection)
 
     assert projection_run.mode == ProjectionRunMode.FULL
@@ -394,8 +316,8 @@ def test_replay_is_refused_for_a_target_that_cannot_replace_a_scope(
             supports_scope_replace=False,
         )
     )
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(binding, {"external_id": {"source": "id"}})
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding, {"external_id": {"source": "id"}})
 
     with pytest.raises(ProjectionError, match="supports_scope_replace"):
         projection_services.replay_projection(projection)
@@ -412,7 +334,7 @@ def test_a_tombstone_produces_a_delete_record(
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
 
-    projection = _projection(binding)
+    projection = make_projection(binding)
     projection_run = projection_services.replay_projection(projection)
 
     assert projection_run.status == ProjectionRunStatus.SUCCEEDED
@@ -426,8 +348,8 @@ def test_writer_context_carries_the_owner(
     connectors_settings, make_binding, events_target, writer
 ):
     """Otherwise the tenant guarantee is discarded at the final step."""
-    binding, run = _land(make_binding, [[RECORD]])
-    projection = _projection(binding)
+    binding, run = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding)
     projection_services.run_projection(projection, source_run=run)
 
     context = writer.contexts[0]
@@ -440,15 +362,15 @@ def test_writer_context_carries_the_owner(
 def test_two_owners_with_the_same_remote_id_produce_distinct_contexts(
     connectors_settings, make_binding, events_target, writer
 ):
-    first, first_run = _land(make_binding, [[RECORD]])
+    first, first_run = land_memory(make_binding, [[RECORD]])
     second_binding = make_binding(
         config=memory_config(batches=[[RECORD]]), owner_id="2"
     )
     second_run = run_services.run_binding(second_binding, trigger=RunTrigger.INITIAL)
 
-    projection_services.run_projection(_projection(first), source_run=first_run)
+    projection_services.run_projection(make_projection(first), source_run=first_run)
     projection_services.run_projection(
-        _projection(second_binding), source_run=second_run
+        make_projection(second_binding), source_run=second_run
     )
 
     owners = {context.owner_object_id for context in writer.contexts}
@@ -459,7 +381,7 @@ def test_two_owners_with_the_same_remote_id_produce_distinct_contexts(
 def test_filters_exclude_rows_before_the_writer_sees_them(
     connectors_settings, make_binding, events_target, writer
 ):
-    binding, run = _land(
+    binding, run = land_memory(
         make_binding,
         [
             [
@@ -468,7 +390,7 @@ def test_filters_exclude_rows_before_the_writer_sees_them(
             ]
         ],
     )
-    projection = _projection(
+    projection = make_projection(
         binding, filters=[{"field": "kind", "op": "eq", "value": "keep"}]
     )
     projection_run = projection_services.run_projection(projection, source_run=run)
@@ -481,10 +403,10 @@ def test_filters_exclude_rows_before_the_writer_sees_them(
 def test_a_cast_failure_fails_the_run_and_names_the_field(
     connectors_settings, make_binding, events_target
 ):
-    binding, run = _land(
+    binding, run = land_memory(
         make_binding, [[{"id": "e1", "happened_at": "not-a-date", "kind": "a"}]]
     )
-    projection = _projection(binding)
+    projection = make_projection(binding)
     projection_run = projection_services.run_projection(projection, source_run=run)
 
     assert projection_run.status == ProjectionRunStatus.FAILED
@@ -505,8 +427,8 @@ def test_a_writer_failure_fails_the_run_without_losing_the_landed_data(
             writer=failing,
         )
     )
-    binding, run = _land(make_binding, [[RECORD]])
-    projection = _projection(binding, {"external_id": {"source": "id"}})
+    binding, run = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding, {"external_id": {"source": "id"}})
 
     first = projection_services.run_projection(projection, source_run=run)
     assert first.status == ProjectionRunStatus.FAILED
@@ -521,8 +443,8 @@ def test_a_writer_failure_fails_the_run_without_losing_the_landed_data(
 def test_retrying_is_idempotent_for_the_host(
     connectors_settings, make_binding, events_target, writer
 ):
-    binding, run = _land(make_binding, [[RECORD]])
-    projection = _projection(binding)
+    binding, run = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding)
 
     first = projection_services.run_projection(projection, source_run=run)
     assert first.status == ProjectionRunStatus.SUCCEEDED
@@ -539,8 +461,8 @@ def test_a_superseded_projection_run_is_refused_not_executed(
     """A stale queued run would revert rows a newer replay already corrected."""
     from django_connectors.models import ProjectionRun
 
-    binding, run = _land(make_binding, [[RECORD]])
-    projection = _projection(binding)
+    binding, run = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding)
 
     stale = ProjectionRun.objects.create(
         projection=projection,
@@ -563,8 +485,8 @@ def test_changing_an_identity_mapping_requires_acknowledgement(
     connectors_settings, make_binding, events_target
 ):
     """The library cannot clean up records written under the old identity."""
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(binding)
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding)
 
     with pytest.raises(ProjectionError, match="acknowledge_identity_change"):
         projection_services.update_mapping(
@@ -582,8 +504,8 @@ def test_changing_an_identity_mapping_requires_acknowledgement(
 def test_a_non_identity_mapping_change_just_bumps_the_version(
     connectors_settings, make_binding, events_target
 ):
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(binding)
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding)
     updated = projection_services.update_mapping(
         projection, mapping={**BASIC_MAPPING, "type": {"constant": "fixed"}}
     )
@@ -595,8 +517,8 @@ def test_the_sweeper_heals_a_dropped_dispatch(
 ):
     """A per-Run flag would heal this; only a set difference also heals a
     ProjectionRun that failed and was never retried."""
-    binding, _ = _land(make_binding, [[RECORD]])
-    _projection(binding)
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    make_projection(binding)
 
     dispatched = projection_services.dispatch_pending_projections()
     assert len(dispatched) == 1
@@ -614,8 +536,8 @@ def test_batches_are_bounded_and_ordered(
         {"id": f"e{index}", "happened_at": "2024-03-01T10:00:00Z", "kind": "a"}
         for index in range(5)
     ]
-    binding, run = _land(make_binding, [records])
-    projection = _projection(binding)
+    binding, run = land_memory(make_binding, [records])
+    projection = make_projection(binding)
     projection_services.run_projection(projection, source_run=run)
 
     assert [len(batch) for batch in writer.batches] == [2, 2, 1]
@@ -653,8 +575,8 @@ def test_a_delete_and_an_upsert_for_one_identity_collapse_to_the_delete(
 def test_preview_never_invokes_the_writer(
     connectors_settings, make_binding, events_target, writer
 ):
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(binding)
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding)
 
     result = projection_services.preview_projection(projection)
     assert result["ok_count"] == 1
@@ -665,7 +587,7 @@ def test_preview_never_invokes_the_writer(
 def test_preview_reports_filtered_rows_and_cast_errors(
     connectors_settings, make_binding, events_target
 ):
-    binding, _ = _land(
+    binding, _ = land_memory(
         make_binding,
         [
             [
@@ -675,7 +597,7 @@ def test_preview_reports_filtered_rows_and_cast_errors(
             ]
         ],
     )
-    projection = _projection(
+    projection = make_projection(
         binding, filters=[{"field": "kind", "op": "eq", "value": "keep"}]
     )
     result = projection_services.preview_projection(projection)
@@ -690,8 +612,8 @@ def test_preview_reports_filtered_rows_and_cast_errors(
 def test_preview_hides_internal_columns(
     connectors_settings, make_binding, events_target
 ):
-    binding, _ = _land(make_binding, [[RECORD]])
-    result = projection_services.preview_projection(_projection(binding))
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    result = projection_services.preview_projection(make_projection(binding))
     assert not any(
         key.startswith(("_connector_", "_dlt_")) for key in result["rows"][0]["source"]
     )
@@ -705,8 +627,8 @@ def test_preview_is_bounded_server_side(
         {"id": f"e{index}", "happened_at": "2024-03-01T10:00:00Z", "kind": "a"}
         for index in range(10)
     ]
-    binding, _ = _land(make_binding, [records])
-    result = projection_services.preview_projection(_projection(binding), limit=100)
+    binding, _ = land_memory(make_binding, [records])
+    result = projection_services.preview_projection(make_projection(binding), limit=100)
     assert result["row_count"] == 2
 
 
@@ -781,12 +703,12 @@ def test_identity_mapped_off_a_non_key_column_is_refused(
     Left unchecked this validates clean, runs green for as long as nothing is
     deleted, and then fails every run forever from the first tombstone on.
     """
-    binding, _ = _land(
+    binding, _ = land_memory(
         make_binding,
         [[{"id": "1", "email": "a@example.com", "name": "Ada"}]],
         primary_key="id",
     )
-    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+    projection = make_projection(binding, CONTACT_MAPPING, target="contacts")
 
     result = projection_services.validate_projection(projection)
     assert not result.ok
@@ -801,12 +723,12 @@ def test_identity_mapped_off_the_merge_key_validates_clean(
     connectors_settings, make_binding, contacts_target
 ):
     """The obverse: the check must not refuse the configuration that works."""
-    binding, _ = _land(
+    binding, _ = land_memory(
         make_binding,
         [[{"id": "1", "email": "a@example.com", "name": "Ada"}]],
         primary_key="email",
     )
-    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+    projection = make_projection(binding, CONTACT_MAPPING, target="contacts")
     result = projection_services.validate_projection(projection)
     assert result.ok, result.errors
     assert result.warnings == []
@@ -816,12 +738,12 @@ def test_a_lowercased_key_column_is_still_the_key(
     connectors_settings, make_binding, contacts_target
 ):
     """Deriving identity is fine; reading a column outside the key is not."""
-    binding, _ = _land(
+    binding, _ = land_memory(
         make_binding,
         [[{"id": "1", "email": "A@Example.com", "name": "Ada"}]],
         primary_key="email",
     )
-    projection = _projection(
+    projection = make_projection(
         binding,
         {
             "email": {"function": "lower", "args": [{"source": "email"}]},
@@ -836,12 +758,12 @@ def test_the_merge_key_comes_from_the_landed_schema_not_the_table(
     connectors_settings, make_binding, contacts_target
 ):
     """The landed tables carry no primary key: create_primary_keys is False."""
-    binding, _ = _land(
+    binding, _ = land_memory(
         make_binding,
         [[{"id": "1", "email": "a@example.com", "name": "Ada"}]],
         primary_key="id",
     )
-    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+    projection = make_projection(binding, CONTACT_MAPPING, target="contacts")
 
     from django_connectors.landing import access
 
@@ -857,12 +779,12 @@ def test_an_identity_coarser_than_the_merge_key_is_flagged_for_review(
     connectors_settings, make_binding, contacts_target
 ):
     """Two landed records then share one target identity; the host should know."""
-    binding, _ = _land(
+    binding, _ = land_memory(
         make_binding,
         [[{"id": "1", "email": "a@example.com", "name": "Ada"}]],
         primary_key=["id", "email"],
     )
-    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+    projection = make_projection(binding, CONTACT_MAPPING, target="contacts")
 
     result = projection_services.validate_projection(projection)
     assert result.ok, result.errors
@@ -907,7 +829,7 @@ def test_a_delete_wins_over_an_upsert_in_a_later_batch(
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
 
-    projection = _projection(binding, CONTACT_MAPPING, target="contacts")
+    projection = make_projection(binding, CONTACT_MAPPING, target="contacts")
     projection_run = projection_services.replay_projection(projection)
 
     assert projection_run.status == ProjectionRunStatus.SUCCEEDED
@@ -954,8 +876,8 @@ def test_an_object_valued_identity_is_refused_by_validation(
     connectors_settings, make_binding, events_target
 ):
     """It used to validate clean, preview clean, then die with a raw TypeError."""
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(
         binding,
         {**BASIC_MAPPING, "external_id": {"object": {"id": {"source": "id"}}}},
     )
@@ -967,8 +889,8 @@ def test_an_object_valued_identity_is_refused_by_validation(
 def test_a_json_cast_identity_is_refused_by_validation(
     connectors_settings, make_binding, events_target
 ):
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(
         binding, {**BASIC_MAPPING, "external_id": {"source": "id", "cast": "json"}}
     )
     result = projection_services.validate_projection(projection)
@@ -1032,7 +954,7 @@ def test_identity_is_coerced_by_the_declared_target_field_on_both_paths(
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
 
-    projection = _projection(binding, {"external_id": {"source": "id"}})
+    projection = make_projection(binding, {"external_id": {"source": "id"}})
     projection_run = projection_services.replay_projection(projection)
 
     assert projection_run.status == ProjectionRunStatus.SUCCEEDED
@@ -1045,7 +967,7 @@ def test_identity_is_coerced_by_the_declared_target_field_on_both_paths(
 
 @pytest.mark.parametrize("cast", [["datetime"], {}, {"name": "datetime"}])
 def test_a_non_string_cast_is_a_validation_error_not_a_type_error(cast):
-    """`cast not in CASTS` hashes the value: a list raised TypeError, i.e. a 500."""
+    """A dict lookup hashes the value: a list raised TypeError, i.e. a 500."""
     with pytest.raises(MappingValidationError, match="unknown cast"):
         compile_mapping({"a": {"source": "x", "cast": cast}})
 
@@ -1063,8 +985,8 @@ def test_a_rejected_mapping_leaves_the_projection_invalid_not_active(
     connectors_settings, make_binding, events_target
 ):
     """A bumped version plus a still-ACTIVE status queues runs that all fail."""
-    binding, _ = _land(make_binding, [[RECORD]])
-    projection = _projection(binding)
+    binding, _ = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding)
 
     updated = projection_services.update_mapping(
         projection, mapping={**BASIC_MAPPING, "type": {"source": "kind", "cast": ["x"]}}
@@ -1098,8 +1020,8 @@ def test_a_writer_raising_a_base_exception_does_not_leave_the_run_running(
             writer=interrupt,
         )
     )
-    binding, run = _land(make_binding, [[RECORD]])
-    projection = _projection(binding, {"external_id": {"source": "id"}})
+    binding, run = land_memory(make_binding, [[RECORD]])
+    projection = make_projection(binding, {"external_id": {"source": "id"}})
 
     with pytest.raises(KeyboardInterrupt):
         projection_services.run_projection(projection, source_run=run)
@@ -1123,3 +1045,11 @@ def test_a_writer_raising_a_base_exception_does_not_leave_the_run_running(
     )
     retry = projection_services.retry_projection_run(projection_run)
     assert retry.status == ProjectionRunStatus.SUCCEEDED
+
+
+def test_the_writer_is_told_the_targets_identity_scope(
+    connectors_settings, make_binding, events_target, writer
+):
+    binding, run = land_memory(make_binding, [[RECORD]])
+    projection_services.run_projection(make_projection(binding), source_run=run)
+    assert writer.contexts[0].identity_scope == "owner"

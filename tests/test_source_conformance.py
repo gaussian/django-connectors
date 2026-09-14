@@ -34,12 +34,14 @@ import pytest
 from django_connectors.enums import RunStatus, RunTrigger
 from django_connectors.exceptions import ConfigurationError
 from django_connectors.landing.naming import DELETED_COLUMN
+from django_connectors.providers.google.drive import GoogleDriveSource
 from django_connectors.providers.google.gmail import GmailSource
 from django_connectors.providers.google.sheets import GoogleSheetsSource
 from django_connectors.providers.microsoft.excel import EntraExcelSource
 from django_connectors.providers.microsoft.files import EntraFilesSource
 from django_connectors.providers.salesforce.source import SalesforceSource
 from django_connectors.services import runs as run_services
+from django_connectors.sources.base import SourceDefinition
 from django_connectors.sources.filesystem import FilesystemSource
 from django_connectors.sources.memory import MemorySource, tombstone
 from django_connectors.sources.rest import RestSource
@@ -87,6 +89,10 @@ CASES = [
         ],
     ),
     Case(GoogleSheetsSource(), invalid_configs=[{}, {"spreadsheet_id": "s"}]),
+    Case(
+        GoogleDriveSource(),
+        invalid_configs=[{"file_id": "a", "folder_id": "b"}, {"page_size": 0}],
+    ),
     Case(EntraFilesSource(), invalid_configs=[{}, {"drive_id": ""}]),
     Case(EntraExcelSource(), invalid_configs=[{}, {"drive_id": ""}]),
     Case(SalesforceSource(), invalid_configs=[{}, {"objects": {}}]),
@@ -104,6 +110,7 @@ LANDING_SUITES = {
     "filesystem": "tests/test_sources.py",
     "gmail": "tests/test_providers_google.py",
     "google_sheets": "tests/test_providers_google.py",
+    "google_drive": "tests/test_providers_google.py",
     "entra_files": "tests/test_providers_microsoft.py",
     "entra_excel": "tests/test_providers_microsoft.py",
     "salesforce": "tests/test_providers_salesforce.py",
@@ -213,12 +220,17 @@ def test_the_suite_notices_a_source_that_breaks_the_contract():
         def validate_config(self, config):
             return None  # accepts anything
 
-    failures = conformance.check_definition(Sloppy(), invalid_configs=[{}])
-    assert len(failures) == 4, failures
-    assert any("required_extras" in failure for failure in failures)
-    assert any("emits_tombstones" in failure for failure in failures)
-    assert any("supported_auth_backends" in failure for failure in failures)
-    assert any("accepted a config" in failure for failure in failures)
+    failures = "\n".join(conformance.check_definition(Sloppy(), invalid_configs=[{}]))
+    for expected in (
+        "required_extras",
+        "emits_tombstones",
+        "supported_auth_backends",
+        "accepted a config",
+        "provides_content",
+        "no `discover` method",
+        "no `reshape_for` method",
+    ):
+        assert expected in failures, (expected, failures)
 
 
 def test_a_source_with_no_invalid_configs_is_reported_rather_than_passing():
@@ -456,3 +468,54 @@ def test_the_landing_half_notices_a_missing_tenant_column(
 
     failures = conformance.check_landing_invariants(binding)
     assert any("_connector_run_id" in failure for failure in failures), failures
+
+
+# --- the checks the integration review added -------------------------------
+
+
+def test_a_validate_config_that_crashes_on_a_non_object_is_caught():
+    """`Binding.config` is a JSON field; a string or a number is a stored value."""
+
+    class Crashing(SourceDefinition):
+        key = "crashing"
+        provider = "test"
+
+        def validate_config(self, config):
+            return config.get("resources")  # AttributeError on "x"
+
+    failures = "\n".join(conformance.check_definition(Crashing(), invalid_configs=[{}]))
+    assert "AttributeError" in failures
+    assert "must return None" in failures
+
+
+def test_a_discover_without_the_browsing_keywords_is_caught():
+    class OldStyle(SourceDefinition):
+        key = "old_style"
+        provider = "test"
+
+        def discover(self, *, connection, credentials, query=None):
+            return {"resources": []}
+
+    failures = "\n".join(conformance.check_definition(OldStyle(), invalid_configs=[{}]))
+    assert "['path', 'cursor', 'limit']" in failures
+
+
+def test_a_reshape_for_that_returns_the_wrong_thing_is_caught():
+    class Odd(SourceDefinition):
+        key = "odd"
+        provider = "test"
+
+        def reshape_for(self, resource_name, binding):
+            return ["received_at"]
+
+    failures = "\n".join(conformance.check_definition(Odd(), invalid_configs=[{}]))
+    assert "unpivot spec dict" in failures
+
+
+def test_a_key_dlt_would_rewrite_is_caught():
+    class BadKey(SourceDefinition):
+        key = "Bad Key"
+        provider = "test"
+
+    failures = "\n".join(conformance.check_definition(BadKey(), invalid_configs=[{}]))
+    assert "naming convention" in failures

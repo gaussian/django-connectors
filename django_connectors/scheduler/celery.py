@@ -44,6 +44,7 @@ TASK_ATTRIBUTES = (
     "reap_stale_runs_task",
     "renew_due_webhooks_task",
     "dispatch_pending_projections_task",
+    "execute_projection_run_task",
     "tick_task",
 )
 
@@ -120,6 +121,17 @@ def register_tasks():
 
         return len(base.dispatch_pending_projections())
 
+    @shared_task(name=f"{TASK_NAME_PREFIX}.execute_projection_run")
+    def execute_projection_run_task(projection_run_id):
+        """Execute one queued ProjectionRun.
+
+        Safe to deliver twice: a run that is no longer QUEUED is returned as it
+        is, so at-least-once delivery cannot project the same loads twice.
+        """
+        from django_connectors.services import projections
+
+        return str(projections.execute_projection_run(projection_run_id).id)
+
     @shared_task(name=f"{TASK_NAME_PREFIX}.tick")
     def tick_task(limit=None):
         """One full scheduler pass, for deployments that want a single beat entry."""
@@ -134,36 +146,42 @@ def register_tasks():
         reap_stale_runs_task=reap_stale_runs_task,
         renew_due_webhooks_task=renew_due_webhooks_task,
         dispatch_pending_projections_task=dispatch_pending_projections_task,
+        execute_projection_run_task=execute_projection_run_task,
         tick_task=tick_task,
     )
     return dict(_tasks)
 
 
-def beat_schedule(*, poll=60, reap=300, webhooks=300, projections=300):
+def beat_schedule(*, poll=60, reap=300, webhooks=300, projections=300, queue=None):
     """A ready-made ``CELERY_BEAT_SCHEDULE`` fragment, in seconds.
 
     Offered because the failure mode of *not* scheduling these is invisible:
     nothing errors, Runs simply stop happening, webhook subscriptions quietly
-    expire, and failed projections are never healed.
+    expire, and failed projections are never healed. `queue` names the Celery
+    queue every entry is sent to, for hosts that route each task explicitly —
+    ingestion is long-running and should not compete with interactive work.
     """
-    return {
-        "django-connectors-run-due-bindings": {
-            "task": f"{TASK_NAME_PREFIX}.run_due_bindings",
-            "schedule": poll,
-        },
-        "django-connectors-reap-stale-runs": {
-            "task": f"{TASK_NAME_PREFIX}.reap_stale_runs",
-            "schedule": reap,
-        },
-        "django-connectors-renew-due-webhooks": {
-            "task": f"{TASK_NAME_PREFIX}.renew_due_webhooks",
-            "schedule": webhooks,
-        },
-        "django-connectors-dispatch-pending-projections": {
-            "task": f"{TASK_NAME_PREFIX}.dispatch_pending_projections",
-            "schedule": projections,
-        },
+    entries = {
+        "django-connectors-run-due-bindings": ("run_due_bindings", poll),
+        "django-connectors-reap-stale-runs": ("reap_stale_runs", reap),
+        "django-connectors-renew-due-webhooks": ("renew_due_webhooks", webhooks),
+        "django-connectors-dispatch-pending-projections": (
+            "dispatch_pending_projections",
+            projections,
+        ),
     }
+    schedule = {}
+    for name, (task, seconds) in entries.items():
+        entry = {"task": f"{TASK_NAME_PREFIX}.{task}", "schedule": seconds}
+        if queue:
+            entry["options"] = {"queue": queue}
+        schedule[name] = entry
+    return schedule
+
+
+def enqueue_projection_run(projection_run):
+    """A ``PROJECTION_DISPATCH`` callable: hand a queued ProjectionRun to a worker."""
+    register_tasks()["execute_projection_run_task"].delay(str(projection_run.id))
 
 
 def _shared_task():

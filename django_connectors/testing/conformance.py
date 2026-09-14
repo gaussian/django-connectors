@@ -142,10 +142,137 @@ def check_definition(definition, *, invalid_configs=()):
             f"keys (empty means any), got {backends!r}"
         )
 
+    if not isinstance(getattr(definition, "provides_content", None), bool):
+        failures.append(
+            f"{label}: `provides_content` must be a bool; the content service "
+            f"reads it to refuse a fetch from a row-shaped source."
+        )
+
+    failures += _check_key_survives_naming(definition)
     failures += _check_module_imports(definition)
     failures += _check_resource_calls_state_a_disposition(definition)
     failures += _check_rejects_garbage(definition, invalid_configs)
+    failures += _check_config_shape_safety(definition)
+    failures += _check_discover_signature(definition)
+    failures += _check_reshape_for(definition)
     return failures
+
+
+#: Values a host could store in ``Binding.config`` — a JSON field — that a
+#: source must survive: refuse with ``ConfigurationError`` or accept, never
+#: crash. A bare ``AttributeError`` from ``"x".get`` is a 500 in the editor.
+CONFIG_SHAPES = (
+    None,
+    {},
+    [],
+    "not an object",
+    7,
+    {"resources": "not a mapping"},
+    {"resources": {"x": "not a mapping"}},
+    {"resources": {"x": {}}},
+    {"resources": {}},
+)
+
+DISCOVER_KWARGS = ("connection", "credentials", "query", "path", "cursor", "limit")
+
+
+def _check_key_survives_naming(definition):
+    """The key is part of every landing table name for the source."""
+    from django_connectors.landing.naming import normalize_identifier
+
+    key = getattr(definition, "key", "")
+    if not isinstance(key, str) or not key:
+        return []
+    try:
+        normalized = normalize_identifier(key)
+    except ValueError:
+        normalized = ""
+    if normalized != key:
+        return [
+            f"{_label(definition)}: `key` {key!r} is rewritten by dlt's naming "
+            f"convention to {normalized!r}, so the table the library computes "
+            f"is not the table dlt creates. Use lowercase letters, digits and "
+            f"underscores."
+        ]
+    return []
+
+
+def _check_config_shape_safety(definition):
+    """Unlike :func:`_check_rejects_garbage`, accepting is fine here.
+
+    A source with no required keys legitimately accepts ``{}``. What no source
+    may do is raise anything but ``ConfigurationError`` — and every shape here
+    is one a JSON field will store.
+    """
+    label = _label(definition)
+    failures = []
+    for config in CONFIG_SHAPES:
+        try:
+            result = definition.validate_config(config)
+        except ConfigurationError:
+            continue
+        except Exception as exc:
+            failures.append(
+                f"{label}: validate_config({config!r}) raised "
+                f"{type(exc).__name__}: {exc}; only ConfigurationError may "
+                f"escape, or the Binding editor shows a 500 instead of a form "
+                f"error. sources.base.as_config() handles the non-object case."
+            )
+            continue
+        if result is not None:
+            failures.append(
+                f"{label}: validate_config({config!r}) returned {result!r}; it "
+                f"must return None on success"
+            )
+    return failures
+
+
+def _check_discover_signature(definition):
+    """``discover`` takes the browsing keywords, or one UI cannot page or descend."""
+    import inspect
+
+    discover = getattr(definition, "discover", None)
+    if not callable(discover):
+        return [f"{_label(definition)}: no `discover` method"]
+    try:
+        parameters = inspect.signature(discover).parameters
+    except (TypeError, ValueError):
+        return [f"{_label(definition)}: `discover` is not introspectable"]
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return []
+    missing = [name for name in DISCOVER_KWARGS if name not in parameters]
+    if missing:
+        return [
+            f"{_label(definition)}: `discover` does not accept {missing}; every "
+            f"source takes {list(DISCOVER_KWARGS)} as keyword arguments so one "
+            f"UI can browse them all"
+        ]
+    return []
+
+
+def _check_reshape_for(definition):
+    """``reshape_for`` returns None or an unpivot spec, and never raises on nothing."""
+    from types import SimpleNamespace
+
+    binding = SimpleNamespace(
+        config={}, source=getattr(definition, "key", ""), resources=[]
+    )
+    reshape_for = getattr(definition, "reshape_for", None)
+    if not callable(reshape_for):
+        return [f"{_label(definition)}: no `reshape_for` method"]
+    try:
+        result = reshape_for("resource", binding)
+    except Exception as exc:
+        return [
+            f"{_label(definition)}: reshape_for() raised {type(exc).__name__} on "
+            f"an empty config: {exc}"
+        ]
+    if result is not None and not isinstance(result, dict):
+        return [
+            f"{_label(definition)}: reshape_for() must return None or an unpivot "
+            f"spec dict, got {type(result).__name__}"
+        ]
+    return []
 
 
 def _check_module_imports(definition):

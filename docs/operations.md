@@ -48,7 +48,19 @@ It is **not** a Django `DATABASES` alias. A router's `allow_migrate=False` does
 not stop `.using("landing")`, `migrate --database=landing` would create
 `django_migrations` there, and the test runner would create a test database for
 it. Keeping it out of `DATABASES` makes routing an ORM model there impossible
-rather than discouraged.
+rather than discouraged. A host that already runs `DATABASE_ROUTERS` should
+take this more seriously, not less: a router will happily route a model at a
+landing alias if one ever exists.
+
+### Pick the landing engine for what will land, not for what the app runs on
+
+The landing database is reached only through SQLAlchemy, so it need not match
+the application's engine. That matters when the landed data includes long
+text — document bodies, free-text fields, large JSON. On MySQL a `str` column
+is `TEXT`, capped at 65,535 bytes, and a longer value is accepted at normalize
+time and rejected at load time — which wedges the pipeline (see below). On
+PostgreSQL `text` is unbounded. **If anything you land can exceed 64KB, run
+the landing database on PostgreSQL**, even alongside a MySQL application.
 
 The database (MySQL) or schema (PostgreSQL) must exist before first use; dlt
 creates the tables inside it, plus a `<dataset>_staging` sibling. The application
@@ -67,6 +79,43 @@ dataset race on the shared `_dlt_version`, `_dlt_loads` and staging objects —
 `Table '_dlt_version' already exists` — no matter how well the landing tables
 themselves are isolated. Warm steady-state concurrency is clean; only the cold
 start is not.
+
+## Scheduling
+
+Four beat entries, and not scheduling them fails silently — nothing errors,
+Runs simply stop happening and failed projections are never healed:
+
+```python
+from django_connectors.scheduler.celery import beat_schedule, register_tasks
+
+register_tasks()                       # in the worker's Celery app module
+CELERY_BEAT_SCHEDULE.update(beat_schedule(queue="connectors"))
+```
+
+`register_tasks()` belongs in the **worker's** app module; a separate beat
+process only sends task names and needs no library import. Hosts that route
+every task explicitly pass `queue=`, so ingestion — long-running — does not
+share a queue with interactive work.
+
+### Projections: inline, or on a queue
+
+By default a successful Run executes its projections **inline**, in the
+ingestion worker, while the Binding's lease is still held — so a writer that
+does real work per record (permissions, a second database, an analysis job)
+counts against `run_timeout`, and `reap_stale_runs()` will fail the Run from
+underneath it. To hand them to a queue instead:
+
+```python
+DJANGO_CONNECTORS = {
+    "PROJECTION_DISPATCH": "django_connectors.scheduler.celery.enqueue_projection_run",
+}
+```
+
+Runs are then recorded as `queued` and executed by the `execute_projection_run`
+task after the lease is released. Delivery may be at-least-once: a run that is
+no longer queued is not executed again. A run the queue drops is executed by
+`dispatch_pending_projections` once it is older than `PROJECTION_QUEUE_GRACE`.
+Any `callable(projection_run)` works in place of the Celery one.
 
 ## Concurrency
 

@@ -3,7 +3,9 @@
 import logging
 
 from django.db import transaction
+from django.utils import timezone
 
+from django_connectors.conf import conf
 from django_connectors.enums import (
     BindingStatus,
     ProjectionRunMode,
@@ -11,8 +13,7 @@ from django_connectors.enums import (
     ProjectionStatus,
 )
 from django_connectors.exceptions import ConfigurationError, ProjectionError
-from django_connectors.landing import access
-from django_connectors.landing.naming import landing_table_name
+from django_connectors.landing import access, schema
 from django_connectors.models import Projection, ProjectionRun
 from django_connectors.projections import preview as preview_module
 from django_connectors.projections import runner as projection_runner
@@ -35,35 +36,12 @@ def landing_columns_for(projection):
 
 
 def merge_key_columns_for(projection):
-    """The merge identity the landed resource carries, or None if unknowable.
-
-    Read from the landed dlt schema rather than from ``Binding.config``: where
-    the key is declared is source-specific — per resource for the memory, REST
-    and filesystem sources, top-level for sql, hard-coded for every provider —
-    while ``instrument_source`` writes exactly one merge identity into the
-    schema for all of them. The landed *tables* cannot answer this at all,
-    because the destination is configured with ``create_primary_keys=False``.
-
-    None means the resource has not landed, or landed under append/replace and
-    so has no merge key.
-    """
-    binding = projection.binding
-    if binding.landing_schema_at is None:
-        return None
+    """The merge identity the landed resource carries, or None if unknowable."""
     try:
-        schema = access.binding_dataset(binding).schema
-        table = schema.tables[
-            landing_table_name(binding.source, projection.resource, binding.landing_key)
-        ]
-        columns = {
-            name
-            for name, column in (table.get("columns") or {}).items()
-            if (column or {}).get("primary_key")
-        }
+        return schema.merge_key_for(projection.binding, projection.resource)
     except Exception as exc:
         logger.debug("landing merge key unavailable: %s", type(exc).__name__)
         return None
-    return columns or None
 
 
 def validate_projection(projection, *, save=True):
@@ -157,28 +135,53 @@ def preview_projection(projection, *, limit=None):
 
 
 def sample_resource(projection_or_binding, resource=None, *, limit=None):
-    from django_connectors.conf import conf
-
     binding = getattr(projection_or_binding, "binding", projection_or_binding)
     resource = resource or getattr(projection_or_binding, "resource", None)
     limit = min(limit or conf.SAMPLE_MAX_ROWS, conf.SAMPLE_MAX_ROWS)
     return access.sample_rows(binding, resource, limit=limit)
 
 
-def run_projection(projection, *, source_run=None, load_ids=None, mode=None):
-    """Execute a Projection over a scope of landed loads."""
+def queue_projection(projection, *, source_run=None, load_ids=None, mode=None):
+    """Record a ProjectionRun over a scope of landed loads, without executing it."""
     mode = mode or ProjectionRunMode.INCREMENTAL
     if load_ids is None:
         load_ids = list(source_run.dlt_load_ids or []) if source_run else []
-
-    projection_run = ProjectionRun.objects.create(
+    return ProjectionRun.objects.create(
         projection=projection,
         source_run=source_run,
         mode=mode,
         projection_version=projection.version,
         load_ids=list(load_ids),
     )
+
+
+def run_projection(projection, *, source_run=None, load_ids=None, mode=None):
+    """Execute a Projection over a scope of landed loads."""
+    return projection_runner.execute(
+        queue_projection(
+            projection, source_run=source_run, load_ids=load_ids, mode=mode
+        )
+    )
+
+
+def execute_projection_run(projection_run_id):
+    """Execute a queued ProjectionRun by id — the target of a dispatch callable."""
+    projection_run = ProjectionRun.objects.select_related(
+        "projection__binding__connection"
+    ).get(pk=projection_run_id)
+    # The runner claims the row atomically; a run delivered twice, or already
+    # swept up, comes back as the row says.
     return projection_runner.execute(projection_run)
+
+
+def dispatcher():
+    """The configured ``PROJECTION_DISPATCH`` callable, or None for inline."""
+    from django.utils.module_loading import import_string
+
+    path = conf.PROJECTION_DISPATCH
+    if not path:
+        return None
+    return import_string(path) if isinstance(path, str) else path
 
 
 def replay_projection(projection):
@@ -204,23 +207,83 @@ def dispatch_after_run(run):
     """Queue incremental ProjectionRuns for the resources a Run touched.
 
     The low-latency path. `dispatch_pending_projections` is the safety net that
-    heals whatever this drops.
+    heals whatever this drops. With ``PROJECTION_DISPATCH`` unset the runs
+    execute here, inline, while the Binding's lease is held; with it set they
+    are recorded as QUEUED and handed to the configured callable.
     """
     if not run.dlt_load_ids:
         return []
+    dispatch = dispatcher()
     dispatched = []
     for projection in Projection.objects.filter(
         binding=run.binding, enabled=True, status=ProjectionStatus.ACTIVE
     ):
-        dispatched.append(
-            run_projection(projection, source_run=run, load_ids=run.dlt_load_ids)
+        projection_run = queue_projection(
+            projection, source_run=run, load_ids=run.dlt_load_ids
         )
+        if dispatch is None:
+            projection_run = projection_runner.execute(projection_run)
+        else:
+            # Handed to a queue after the row is committed — under
+            # ATOMIC_REQUESTS a worker would otherwise look it up before it
+            # exists. Outside a transaction this runs at once. It executes
+            # after the Binding's lease is released; the sweeper heals a drop.
+            transaction.on_commit(lambda run=projection_run: dispatch(run))
+        dispatched.append(projection_run)
     return dispatched
 
 
+def reap_stale_projection_runs():
+    """Answer the two claims that stop being credible with age.
+
+    A run still QUEUED past ``PROJECTION_QUEUE_GRACE`` is one the queue
+    dropped: it is executed here. A run still RUNNING past
+    ``DEFAULT_RUN_TIMEOUT`` is one a killed worker left behind — the
+    ``except BaseException`` in the runner cannot see a SIGKILL — and is
+    marked FAILED so it is visible, retryable, and its loads outstanding
+    again. Returns ``{"executed": [...], "failed": [...]}``. Called by the
+    sweeper before it computes what is outstanding, so ``dispatch_pending``
+    can treat every QUEUED and RUNNING row as in flight with no clock in it.
+    """
+    now = timezone.now()
+    executed = [
+        projection_runner.execute(dropped)
+        for dropped in ProjectionRun.objects.filter(
+            status=ProjectionRunStatus.QUEUED,
+            created_at__lt=now - conf.PROJECTION_QUEUE_GRACE,
+            projection__enabled=True,
+            projection__status=ProjectionStatus.ACTIVE,
+        )
+        .exclude(projection__binding__status=BindingStatus.PURGING)
+        .select_related("projection__binding__connection")
+        .order_by("created_at")
+    ]
+    abandoned = list(
+        ProjectionRun.objects.filter(
+            status=ProjectionRunStatus.RUNNING,
+            started_at__lt=now - conf.DEFAULT_RUN_TIMEOUT,
+        )
+    )
+    for run in abandoned:
+        run.status = ProjectionRunStatus.FAILED
+        run.finished_at = now
+        run.error_type = "abandoned"
+        run.error_message = (
+            f"still running after {conf.DEFAULT_RUN_TIMEOUT}; the worker was "
+            f"killed without finishing. Retry it, or let the sweeper re-project."
+        )
+        run.save(update_fields=["status", "finished_at", "error_type", "error_message"])
+    return {"executed": executed, "failed": abandoned}
+
+
 def dispatch_pending_projections(*, lookback=None):
-    """Sweep every active Projection for landed loads it has not projected."""
-    dispatched = []
+    """Sweep every active Projection for landed loads it has not projected.
+
+    Reaps first: a dropped queued run is executed and an abandoned running
+    run is failed before outstanding loads are computed, so neither is counted
+    as in flight forever nor queued a second time.
+    """
+    dispatched = list(reap_stale_projection_runs()["executed"])
     for projection in Projection.objects.filter(
         enabled=True, status=ProjectionStatus.ACTIVE
     ).select_related("binding"):

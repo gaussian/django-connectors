@@ -43,6 +43,7 @@ from functools import cache
 from typing import ClassVar
 from urllib.parse import urljoin, urlsplit
 
+from django_connectors.auth.base import first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import (
     AuthError,
@@ -50,7 +51,7 @@ from django_connectors.exceptions import (
     ConnectorError,
     SourceError,
 )
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config
 
 # Only these two reach a network the way a customer expects. `file:`, `ftp:` and
 # friends turn a "call an API" feature into "read the worker's filesystem".
@@ -156,7 +157,7 @@ class RestSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration the Binding editor should never be able to save."""
-        config = config or {}
+        config = as_config(config)
 
         base_url = config.get("base_url")
         if not isinstance(base_url, str) or not base_url:
@@ -174,6 +175,13 @@ class RestSource(SourceDefinition):
             )
 
         for name, spec in resources.items():
+            if isinstance(spec, dict) and "unpivot" in spec:
+                self.validate_reshape(
+                    spec["unpivot"],
+                    where=f"resources.{name}.unpivot",
+                    primary_key=spec.get("primary_key") or (),
+                    cursor=(spec.get("incremental") or {}).get("cursor_path"),
+                )
             self._validate_resource(name, spec)
 
         self._validate_auth(config.get("auth"))
@@ -276,7 +284,7 @@ class RestSource(SourceDefinition):
 
     def incremental_for(self, resource_name, binding):
         """Cursor kwargs only. See ``SourceDefinition.incremental_for``."""
-        spec = ((binding.config or {}).get("resources") or {}).get(resource_name) or {}
+        spec = self.resource_spec(binding, resource_name)
         incremental = spec.get("incremental")
         return _incremental_kwargs(incremental) if incremental else None
 
@@ -583,15 +591,7 @@ def _token(credentials):
         return None
     if isinstance(credentials, str):
         return credentials
-    for key in _TOKEN_KEYS:
-        value = (
-            credentials.get(key)
-            if isinstance(credentials, dict)
-            else getattr(credentials, key, None)
-        )
-        if value:
-            return value
-    return None
+    return first_credential_value(credentials, _TOKEN_KEYS)
 
 
 # --- error readability -----------------------------------------------------

@@ -36,7 +36,7 @@ import logging
 import time
 from typing import ClassVar
 
-from django_connectors.auth.base import AuthBackend
+from django_connectors.auth.base import AuthBackend, first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import (
     AuthError,
@@ -59,7 +59,11 @@ GOOGLE_EXTRA = "google"
 DEFAULT_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
+    # drive.readonly, not drive.metadata.readonly: listing and the changes feed
+    # work with metadata alone, but fetch_content (download, export) does not,
+    # and a Connection that lists fine and then 403s on the first download is a
+    # worse experience than one broad read-only scope.
+    "https://www.googleapis.com/auth/drive.readonly",
 )
 
 # OAuth 2 error codes that mean "this grant is gone". `invalid_grant` covers the
@@ -160,14 +164,9 @@ def bearer_token(credentials):
             )
         return token
 
-    for key in ("access_token", "token", "api_key"):
-        value = (
-            credentials.get(key)
-            if hasattr(credentials, "get")
-            else getattr(credentials, key, None)
-        )
-        if value:
-            return value
+    value = first_credential_value(credentials, ("access_token", "token", "api_key"))
+    if value:
+        return value
 
     raise AuthError(
         f"could not find an access token on the credentials the auth backend "
@@ -317,7 +316,9 @@ def google_client(*, base_url, credentials):
     return RESTClient(base_url=base_url, session=session, auth=authorize)
 
 
-def google_request(client, path, *, params=None, method="GET", json_body=None):
+def google_request(
+    client, path, *, params=None, method="GET", json_body=None, stream=False
+):
     """One request, with throttling absorbed. Returns the raw ``Response``.
 
     Nothing is raised for an error status: callers need to see a 404 before it
@@ -328,7 +329,7 @@ def google_request(client, path, *, params=None, method="GET", json_body=None):
     for attempt in range(1, MAX_THROTTLE_ATTEMPTS + 1):
         try:
             response = client.request(
-                path, method=method, params=params, json=json_body
+                path, method=method, params=params, json=json_body, stream=stream
             )
         except Exception as exc:
             # dlt's session already retried transport failures; reaching here

@@ -17,7 +17,7 @@ and byte caps below are server-side, not hints.
 import json
 
 from django_connectors.conf import conf
-from django_connectors.exceptions import CastError, ProjectionError
+from django_connectors.exceptions import ProjectionError
 from django_connectors.landing import access
 from django_connectors.landing.naming import DELETED_COLUMN, is_internal_column
 from django_connectors.projections.compiler import compile_mapping
@@ -54,7 +54,7 @@ def preview_projection(projection, *, limit=None):
         else:
             try:
                 record = _project(row, compiled, target)
-            except (CastError, ProjectionError) as exc:
+            except ProjectionError as exc:
                 entry["status"] = "error"
                 entry["error"] = str(exc)
             else:

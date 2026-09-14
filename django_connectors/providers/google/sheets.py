@@ -59,14 +59,21 @@ from django_connectors.providers.google.auth import (
     google_client,
     google_json,
 )
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.providers.google.drive import (
+    DRIVE_API_BASE_URL,
+    SPREADSHEET_MIME,
+    assert_drive_id,
+    list_drive,
+    parse_drive_path,
+)
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 
 logger = logging.getLogger(__name__)
 
 SHEETS_API_BASE_URL = "https://sheets.googleapis.com/v4/"
-DRIVE_API_BASE_URL = "https://www.googleapis.com/drive/v3/"
 
 MODIFIED_TIME_STATE_KEY = "sheets_drive_modified_time"
+
 
 # UNFORMATTED_VALUE keeps numbers numeric instead of handing back the locale's
 # display string, which is what makes a currency column land as a number.
@@ -149,7 +156,7 @@ class GoogleSheetsSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run, or would land wrong data."""
-        config = config or {}
+        config = as_config(config)
 
         spreadsheet_id = config.get("spreadsheet_id")
         if not isinstance(spreadsheet_id, str) or not spreadsheet_id:
@@ -196,6 +203,12 @@ class GoogleSheetsSource(SourceDefinition):
                 spec["key_column"], str
             ):
                 raise ConfigurationError(f"ranges.{name}.key_column must be a string")
+            if spec["unpivot"] is not None:
+                self.validate_reshape(
+                    spec["unpivot"],
+                    where=f"ranges.{name}.unpivot",
+                    primary_key=spec["key_column"] or (),
+                )
             # Without a header row the columns are named column_1..N, which a
             # key_column could legitimately name — but a customer who wrote a
             # business name here has made a mistake worth catching at save time.
@@ -229,6 +242,13 @@ class GoogleSheetsSource(SourceDefinition):
                     f"Declare a key_column, or leave skip_unchanged off."
                 )
         return None
+
+    def reshape_for(self, resource_name, binding):
+        config = binding.config or {}
+        raw = (config.get("ranges") or {}).get(resource_name)
+        if raw is None:
+            return None
+        return range_spec(resource_name, raw, config)["unpivot"]
 
     def incremental_for(self, resource_name, binding):
         """Always ``None``. Sheets exposes no per-row cursor of any kind.
@@ -327,40 +347,75 @@ class GoogleSheetsSource(SourceDefinition):
         title = (payload.get("properties") or {}).get("title", "untitled")
         return f"ok ({title})"
 
-    def discover(self, *, connection, credentials, query=None):
-        """Every tab in the spreadsheet, as a candidate range."""
-        config = connection.metadata or {}
-        spreadsheet_id = config.get("spreadsheet_id")
-        if not spreadsheet_id:
-            raise ConfigurationError(
-                "discovery needs Connection.metadata['spreadsheet_id']."
-            )
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """Find a spreadsheet in Drive, then its tabs.
+
+        Three levels, each an item's ``path`` from the level above:
+
+        * ``None`` — every spreadsheet the credential can see, across shared
+          drives, newest first; ``query`` matches the name. This is the "pick
+          your spreadsheet" screen, and it needs the Drive scope
+          (``drive.metadata.readonly``) that ``skip_unchanged`` also needs.
+        * ``folder/<id>`` — that folder's sub-folders and spreadsheets.
+        * ``spreadsheet/<id>`` — the tabs, as candidate ranges. Sheets API
+          only; no Drive scope needed.
+
+        The two kinds of id are prefixed because a Drive file id says nothing
+        about what it is, and a UI must be able to hand a ``path`` back without
+        knowing. ``cursor`` is Drive's own ``nextPageToken``.
+        """
+        kind, target = parse_drive_path(path, kinds=("folder", "spreadsheet"))
+        if kind == "spreadsheet":
+            return self._discover_tabs(credentials, target, query, cursor, limit)
+        parent = target
+        return self._discover_drive(credentials, parent, query, cursor, limit)
+
+    def _discover_drive(self, credentials, parent, query, cursor, limit):
+        client = google_client(
+            base_url=self.drive_api_base_url, credentials=credentials
+        )
+        return list_drive(
+            client,
+            parent=parent,
+            query=query,
+            cursor=cursor,
+            limit=limit,
+            mime_types=[SPREADSHEET_MIME],
+            spreadsheet_paths=True,
+        )
+
+    def _discover_tabs(self, credentials, spreadsheet_id, query, cursor, limit):
+        assert_drive_id(spreadsheet_id)
         client = google_client(base_url=self.api_base_url, credentials=credentials)
         payload = google_json(
             client,
             f"spreadsheets/{spreadsheet_id}",
-            params={"fields": "sheets.properties"},
+            params={"fields": "properties.title,sheets.properties"},
             what="listing the spreadsheet's tabs",
         )
-        resources = []
+        items = []
         for sheet in payload.get("sheets") or ():
             properties = (sheet or {}).get("properties") or {}
             title = properties.get("title")
             if not title:
                 continue
-            if query and query.lower() not in title.lower():
-                continue
-            resources.append(
+            grid = properties.get("gridProperties") or {}
+            items.append(
                 {
-                    "name": normalize_identifier(title),
-                    "range": f"{title}",
-                    "rows": (properties.get("gridProperties") or {}).get("rowCount"),
-                    "columns": (properties.get("gridProperties") or {}).get(
-                        "columnCount"
-                    ),
+                    "id": str(properties.get("sheetId")),
+                    "name": title,
+                    "kind": "sheet",
+                    "path": None,
+                    # What a Binding's `ranges` entry needs.
+                    "resource": normalize_identifier(title),
+                    "range": title,
+                    "rows": grid.get("rowCount"),
+                    "columns": grid.get("columnCount"),
                 }
             )
-        return {"resources": resources}
+        return discovery_page(items, cursor=cursor, limit=limit, query=query)
 
 
 # --- configuration helpers -------------------------------------------------
@@ -405,6 +460,7 @@ def range_spec(name, raw_spec, config):
         "key_column": raw_spec.get("key_column", config.get("key_column")),
         "header_row": bool(raw_spec.get("header_row", config.get("header_row", True))),
         "missing_key": raw_spec.get("missing_key", config.get("missing_key", "error")),
+        "unpivot": raw_spec.get("unpivot", config.get("unpivot")),
     }
 
 

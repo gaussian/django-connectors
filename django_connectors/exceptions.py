@@ -64,7 +64,18 @@ class MappingValidationError(ProjectionError):
     """The customer's mapping is not valid against the source or the target."""
 
 
-class CastError(ProjectionError):
+class InvalidRecordError(ProjectionError):
+    """One landed row cannot become a record.
+
+    Distinct from :class:`MappingValidationError` on purpose. This is about
+    *one row's data*; that is about the mapping itself — a column that is not
+    there — and a policy that skips rows must never skip a broken mapping, or
+    every row is dropped and the run reports success. Every per-row failure
+    subclasses this, so skip semantics come by inheritance.
+    """
+
+
+class CastError(InvalidRecordError):
     """A value could not be cast to the type the target field declares."""
 
 

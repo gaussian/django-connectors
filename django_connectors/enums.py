@@ -82,6 +82,20 @@ class ProjectionStatus(models.TextChoices):
     INVALID = "invalid", _("Invalid")
 
 
+class InvalidRecordPolicy(models.TextChoices):
+    """What a ProjectionRun does with a landed row it cannot turn into a record.
+
+    A row fails when a required field or an identity field evaluates to None,
+    or a cast rejects a value. ``FAIL`` stops the run on the first one — the
+    safe default when every row must land. ``SKIP`` counts the row, records
+    why on the run, and carries on: customer spreadsheets are full of
+    half-typed rows, and one blank cell must not stop 40,000 others.
+    """
+
+    FAIL = "fail", _("Fail the run")
+    SKIP = "skip", _("Skip the row and report it")
+
+
 class ProjectionRunMode(models.TextChoices):
     INCREMENTAL = "incremental", _("Incremental")
     FULL = "full", _("Full replay")

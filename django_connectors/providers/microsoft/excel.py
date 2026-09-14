@@ -65,14 +65,12 @@ from django_connectors.providers.microsoft.files import (
     DEFAULT_TIMEOUT_SECONDS,
     EntraFilesSource,
     access_token,
-    assert_graph_id,
-    download_item_content,
-    drive_address,
-    graph_request,
+    assert_single_item,
+    download_item,
     graph_session,
     item_record,
-    raise_for_graph_error,
 )
+from django_connectors.sources.base import as_config
 
 DEFAULT_RESOURCE = "worksheet_rows"
 
@@ -151,12 +149,12 @@ class EntraExcelSource(EntraFilesSource):
     # --- configuration -----------------------------------------------------
 
     def validate_config(self, config):
-        config = config or {}
+        config = as_config(config)
         self.validate_location(config)
 
         item_id = config.get("item_id")
         if item_id:
-            assert_single_workbook(config)
+            assert_single_item(config)
 
         resource = config.get("resource", DEFAULT_RESOURCE)
         if not isinstance(resource, str) or not resource:
@@ -238,7 +236,17 @@ class EntraExcelSource(EntraFilesSource):
         glob = config.get("name_glob")
         if glob is not None and not isinstance(glob, str):
             raise ConfigurationError("'name_glob' must be a string like '*.xlsx'.")
+        if "unpivot" in config:
+            self.validate_reshape(
+                config["unpivot"], primary_key=self.landed_key(config)
+            )
         return None
+
+    def reshape_for(self, resource_name, binding):
+        config = binding.config or {}
+        if resource_name != config.get("resource", DEFAULT_RESOURCE):
+            return None
+        return config.get("unpivot")
 
     # --- extraction --------------------------------------------------------
 
@@ -265,7 +273,7 @@ class EntraExcelSource(EntraFilesSource):
                 # business key legitimately appears in two workbooks and in two
                 # tabs of one workbook; merging those together would have one
                 # sheet's rows quietly overwrite the other's.
-                primary_key=(FILE_ID_COLUMN, SHEET_NAME_COLUMN, *key_columns),
+                primary_key=self.landed_key(config),
                 write_disposition="merge",
             )()
         else:
@@ -280,6 +288,15 @@ class EntraExcelSource(EntraFilesSource):
             normalize_identifier(str(column))
             for column in (config or {}).get("key_columns") or ()
         )
+
+    def landed_key(self, config):
+        """The merge key as it lands: the file and sheet lead the customer's columns.
+
+        The same business key legitimately appears in two workbooks and in two
+        tabs of one workbook; merging those together would have one sheet's
+        rows quietly overwrite the other's.
+        """
+        return (FILE_ID_COLUMN, SHEET_NAME_COLUMN, *self.key_columns(config))
 
     def iter_rows(self, config, token):
         """Yield one record per worksheet row of every workbook in scope."""
@@ -299,12 +316,13 @@ class EntraExcelSource(EntraFilesSource):
                         f"addressed. This is a Graph response shape this source "
                         f"does not understand rather than a configuration error."
                     )
-                data = download_item_content(
+                data, _ = download_item(
                     session,
                     base_url=base,
                     drive_id=drive_id,
                     item_id=item["id"],
                     max_bytes=max_bytes,
+                    limit_hint="Raise 'max_file_bytes' if the worker can genuinely hold it.",
                 )
                 yield from self.rows_for_workbook(data, item, config)
         finally:
@@ -321,7 +339,20 @@ class EntraExcelSource(EntraFilesSource):
         downloaded and re-parsed for nothing.
         """
         if config.get("item_id"):
-            item = self.single_item(config, session=session)
+            item = item_record(
+                self.single_item(config, session=session),
+                drive_id=config.get("drive_id") or "",
+            )
+            name = item.get("name") or ""
+            if not is_parsable_workbook(name):
+                # Explicitly named, so silence would mean "synced nothing,
+                # reported success" — the worst possible answer.
+                raise SourceError(
+                    f"driveItem {config['item_id']!r} is named {name!r}, which "
+                    f"openpyxl cannot read. Supported: "
+                    f"{', '.join(SUPPORTED_EXTENSIONS)}; legacy .xls and binary "
+                    f".xlsb are not, and would have to be re-saved."
+                )
             # Replace mode always re-reads: the table is being rebuilt, so
             # skipping an unchanged workbook would empty it instead.
             if keyed and not self.content_changed(item):
@@ -338,25 +369,6 @@ class EntraExcelSource(EntraFilesSource):
                 continue
             if is_parsable_workbook(record.get("name")):
                 yield record
-
-    def single_item(self, config, *, session):
-        """Metadata for the one workbook a Binding names with ``item_id``."""
-        base = self.base_url(config)
-        url = f"{base}/{drive_address(config)}/items/{config['item_id']}"
-        response = graph_request(session, "GET", url)
-        raise_for_graph_error(response, what=f"workbook {config['item_id']!r}")
-        item = item_record(response.json(), drive_id=config.get("drive_id") or "")
-        name = item.get("name") or ""
-        if not is_parsable_workbook(name):
-            # Explicitly named, so silence would mean "synced nothing, reported
-            # success" — the worst possible answer.
-            raise SourceError(
-                f"driveItem {config['item_id']!r} is named {name!r}, which "
-                f"openpyxl cannot read. Supported: "
-                f"{', '.join(SUPPORTED_EXTENSIONS)}; legacy .xls and binary "
-                f".xlsb are not, and would have to be re-saved."
-            )
-        return item
 
     def content_changed(self, item):
         """Whether this workbook's content differs from the last run's.
@@ -734,20 +746,6 @@ def normalized_sheets(config):
             "'sheets' must be a list of worksheet names (or use 'sheet' for one)."
         )
     return sheets
-
-
-def assert_single_workbook(config):
-    """``item_id`` names one workbook, so folder narrowing is meaningless."""
-    assert_graph_id("item_id", config["item_id"])
-    conflicting = sorted(
-        key for key in ("folder_path", "folder_item_id", "name_glob") if config.get(key)
-    )
-    if conflicting:
-        raise ConfigurationError(
-            f"'item_id' names one workbook, so {conflicting} cannot also apply. "
-            f"Drop 'item_id' to sync a folder, or drop {conflicting} to sync "
-            f"that one file."
-        )
 
 
 def _fit(row, width):

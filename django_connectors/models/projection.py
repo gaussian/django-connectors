@@ -7,6 +7,7 @@ from django.utils.translation import gettext_lazy as _
 
 from django_connectors._uuid import uuid7
 from django_connectors.enums import (
+    InvalidRecordPolicy,
     ProjectionRunMode,
     ProjectionRunStatus,
     ProjectionStatus,
@@ -42,6 +43,12 @@ class Projection(models.Model):
     filters = models.JSONField(default=list, blank=True)
 
     enabled = models.BooleanField(default=True)
+    # See InvalidRecordPolicy.
+    on_invalid_record = models.CharField(
+        max_length=8,
+        choices=InvalidRecordPolicy,
+        default=InvalidRecordPolicy.FAIL,
+    )
     # Bumped on every mapping/filter change. A ProjectionRun records the version
     # it ran, and one queued against a superseded version is refused rather than
     # executed — otherwise a stale run reverts rows a newer replay corrected.
@@ -117,6 +124,11 @@ class ProjectionRun(models.Model):
     records_seen = models.PositiveBigIntegerField(default=0)
     records_written = models.PositiveBigIntegerField(default=0)
     records_deleted = models.PositiveBigIntegerField(default=0)
+    # Rows the run could not project (under on_invalid_record="skip") plus
+    # records the writer reported skipping. `warnings` holds the reasons, capped
+    # at PROJECTION_MAX_WARNINGS so a wholly broken column cannot bloat a row.
+    records_skipped = models.PositiveBigIntegerField(default=0)
+    warnings = models.JSONField(default=list, blank=True)
 
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)

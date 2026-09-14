@@ -7,20 +7,17 @@ from django_connectors.landing import schema as landing_schema
 from django_connectors.models import Projection
 from django_connectors.services import discovery, retention
 from django_connectors.services import runs as run_services
-from tests.conftest import memory_config
+from tests.conftest import land_memory, memory_config
+
+
+def _land(make_binding, batches, **kwargs):
+    """Discovery reads `Binding.resources`, so every landing here declares it."""
+    return land_memory(make_binding, batches, resources=["events"], **kwargs)
+
 
 pytestmark = pytest.mark.django_db
 
 RECORD = {"id": "e1", "amount": 10, "kind": "created"}
-
-
-def _land(make_binding, batches, **kwargs):
-    binding = make_binding(config=memory_config(batches=batches, **kwargs))
-    binding.resources = ["events"]
-    binding.save(update_fields=["resources"])
-    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
-    assert run.status == "succeeded", run.error_message
-    return binding, run
 
 
 # --- schema discovery ------------------------------------------------------

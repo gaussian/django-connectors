@@ -31,9 +31,10 @@ no ``sql_database`` reflection
 import re
 from typing import ClassVar
 
+from django_connectors.auth.base import first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import ConfigurationError, SourceError
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 
 # Bare identifiers only. Anything interpolated into a statement must match this;
 # everything else travels as a bound parameter.
@@ -71,7 +72,7 @@ class SqlSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run, or would land wrong data."""
-        config = config or {}
+        config = as_config(config)
 
         backend = config.get("backend", "sqlalchemy")
         if backend != "sqlalchemy":
@@ -130,12 +131,24 @@ class SqlSource(SourceDefinition):
             raise ConfigurationError("'chunk_size' must be a positive integer")
 
         _validate_identifier(_resource_name(config), "resource")
+        if "unpivot" in config:
+            self.validate_reshape(
+                config["unpivot"],
+                primary_key=config.get("primary_key") or (),
+                cursor=(config.get("incremental") or {}).get("cursor_path"),
+            )
         # Cheap and worth doing at save time whenever the DSN is known here.
         if config.get("url"):
             create_engine(config["url"]).dispose()
         return None
 
     # --- extraction --------------------------------------------------------
+
+    def reshape_for(self, resource_name, binding):
+        config = binding.config or {}
+        if resource_name != _resource_name(config):
+            return None
+        return config.get("unpivot")
 
     def incremental_for(self, resource_name, binding):
         """Cursor kwargs only. See ``SourceDefinition.incremental_for``."""
@@ -207,6 +220,61 @@ class SqlSource(SourceDefinition):
         finally:
             engine.dispose()
         return "ok"
+
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """Schemas at the top; a schema's tables and views one level down.
+
+        Reflection through SQLAlchemy's inspector, never a hand-written query
+        against the catalog: every dialect names its catalog differently, and
+        the inspector already knows them all.
+        """
+        from sqlalchemy import inspect as sqlalchemy_inspect
+        from sqlalchemy.exc import SQLAlchemyError
+
+        config = connection.metadata or {}
+        engine = create_engine(connection_url(config, credentials))
+        try:
+            inspector = sqlalchemy_inspect(engine)
+            schemas = inspector.get_schema_names()
+            if path is None:
+                items = [
+                    {"id": schema, "name": schema, "kind": "schema", "path": schema}
+                    for schema in schemas
+                ]
+            else:
+                # Membership, not the identifier regex: `my-app-prod` is a legal
+                # schema name, and the value goes to the inspector, never into
+                # SQL text.
+                if path not in schemas:
+                    raise ConfigurationError(
+                        f"schema {path!r} is not one this database lists"
+                    )
+                listed = (
+                    ("table", inspector.get_table_names(schema=path)),
+                    ("view", inspector.get_view_names(schema=path)),
+                )
+                items = [
+                    {
+                        "id": f"{path}.{name}",
+                        "name": name,
+                        "kind": kind,
+                        "path": None,
+                        "db_schema": path,
+                        "table": name,
+                    }
+                    for kind, names in listed
+                    for name in names
+                ]
+        except SQLAlchemyError as exc:
+            raise SourceError(
+                f"could not list the source database: {scrub(exc)}"
+            ) from exc
+        finally:
+            engine.dispose()
+        items.sort(key=lambda item: item["name"])
+        return discovery_page(items, cursor=cursor, limit=limit, query=query)
 
 
 # --- helpers ---------------------------------------------------------------
@@ -288,15 +356,7 @@ def _credentials_url(credentials):
         return None
     if isinstance(credentials, str):
         return credentials
-    for key in ("url", "dsn", "connection_string"):
-        value = (
-            credentials.get(key)
-            if isinstance(credentials, dict)
-            else getattr(credentials, key, None)
-        )
-        if value:
-            return value
-    return None
+    return first_credential_value(credentials, ("url", "dsn", "connection_string"))
 
 
 def create_engine(url):

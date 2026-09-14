@@ -1,32 +1,54 @@
-"""Files on disk, landed as records.
+"""Files on disk or in a bucket, landed as records.
 
 JSONL costs nothing: ``fsspec`` and dlt's ``read_jsonl`` are both core dlt, so
 this source works on a bare ``pip install django-connectors``. CSV and Parquet
 do not — ``read_csv`` imports pandas and ``read_parquet`` imports pyarrow, and
 both do it **lazily, inside the reader**, which means a Binding configured for
 Parquet on a host without pyarrow saves cleanly, schedules cleanly, and then
-dies with a bare ``ModuleNotFoundError`` inside a customer's Run at 3am. So the
-format's dependency is checked in :meth:`FilesystemSource.validate_config`,
-i.e. when the Binding is saved, and the error names the extra to install.
+dies with a bare ``ModuleNotFoundError`` inside a customer's Run at 3am. The
+same is true of the bucket drivers: ``s3fs``, ``gcsfs`` and ``adlfs`` are all
+imported by fsspec on first use. So the format's dependency *and* the scheme's
+are checked in :meth:`FilesystemSource.validate_config`, i.e. when the Binding
+is saved, and the error names the extra to install.
 
-Only ``file://`` is supported in v0.1. The config shape is dlt's own
-``bucket_url`` + ``file_glob``, so adding S3/GCS/Azure later is a matter of
-allowing more schemes and passing credentials through — no Binding needs
-rewriting.
+Three ways to address what to read, all through one ``path``::
 
-The path is host-filesystem access driven by Binding configuration, so it is
-only as safe as the people who can edit Bindings: a worker that can read
-``/etc`` will read ``/etc`` if asked. Relative paths are refused outright
+    "/data/exports"                one directory, every file in it
+    "/data/exports/**/*.csv"       a glob, recursive with ``**``
+    "/data/exports/orders.csv"     one file — a name with an extension and
+                                   no wildcard is taken as a file, not a
+                                   directory, because a directory glob over a
+                                   file lands nothing and reports success
+
+dlt's own two-part shape, ``bucket_url`` + ``file_glob``, is accepted as well
+and is the way to be explicit when a directory name happens to contain a dot.
+
+Bucket credentials come from the Connection's auth backend, never from
+``Binding.config``: a DSN or a key pair in config is rendered in the admin and
+returned by the API. For ``s3://`` the backend returns the boto names
+(``aws_access_key_id``, ``aws_secret_access_key``, optionally
+``aws_session_token``, ``region_name``, ``endpoint_url`` for S3-compatible
+stores); returning nothing means "use the worker's ambient credentials" — an
+IAM role, an instance profile. For any scheme the backend may instead return a
+ready ``fsspec`` filesystem, which is also how the test suite drives this
+source through ``memory://`` with no network.
+
+Local paths are host-filesystem access driven by Binding configuration, so
+they are only as safe as the people who can edit Bindings: a worker that can
+read ``/etc`` will read ``/etc`` if asked. Relative paths are refused outright
 because they would resolve against whatever working directory the worker
 happened to start in.
 """
 
 import os
+from collections.abc import Mapping
 from typing import ClassVar
 from urllib.parse import urlsplit
 
-from django_connectors.exceptions import ConfigurationError
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.auth.base import credential_value
+from django_connectors.errors import scrub
+from django_connectors.exceptions import ConfigurationError, SourceError
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 
 # format -> (module it needs at read time, the extra that installs it).
 # None means "core dlt is enough".
@@ -38,12 +60,36 @@ FORMAT_REQUIREMENTS = {
 
 GLOB_CHARACTERS = "*?["
 
+#: Bucket schemes, mapped to (fsspec driver module, extra that installs it).
+#: ``file`` needs nothing. Anything absent here is refused at save time.
+SCHEME_REQUIREMENTS = {
+    "file": None,
+    "s3": ("s3fs", "s3"),
+    "gs": ("gcsfs", "gs"),
+    "gcs": ("gcsfs", "gs"),
+    "az": ("adlfs", "az"),
+    "abfss": ("adlfs", "az"),
+}
+
+#: Credential keys the S3 spec takes, as the boto names a host already knows.
+AWS_CREDENTIAL_KEYS = (
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+    "region_name",
+    "endpoint_url",
+)
+
 
 class FilesystemSource(SourceDefinition):
     """Local files matched by a glob, parsed into records."""
 
     key = "filesystem"
     provider = "filesystem"
+    #: Schemes a Binding may use. A subclass widens this — the test suite adds
+    #: ``memory`` — so that an in-process filesystem never becomes something a
+    #: customer can point a production Binding at.
+    allowed_schemes = frozenset(SCHEME_REQUIREMENTS)
     # Deliberately empty: what this source needs depends on the *format* each
     # Binding declares, and a static declaration would make the W005 check warn
     # about pyarrow at every host that only ever reads JSONL. The per-format
@@ -55,7 +101,7 @@ class FilesystemSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run — including a missing extra."""
-        resources = (config or {}).get("resources")
+        resources = as_config(config).get("resources")
         if not isinstance(resources, dict) or not resources:
             raise ConfigurationError(
                 "filesystem source config needs a non-empty 'resources' mapping "
@@ -72,20 +118,22 @@ class FilesystemSource(SourceDefinition):
                     f"resources.{name}.format must be one of "
                     f"{sorted(FORMAT_REQUIREMENTS)}, got {file_format!r}."
                 )
-            requirement = FORMAT_REQUIREMENTS[file_format]
-            if requirement is not None:
-                module, extra = requirement
-                if not module_available(module):
-                    raise ConfigurationError(
-                        f"resources.{name} reads {file_format} files, which "
-                        f"needs {module!r}. dlt imports it lazily inside the "
-                        f"reader, so without this check the failure would land "
-                        f"inside a Run instead of here. Install it with: "
-                        f"pip install 'django-connectors[{extra}]'"
-                    )
+            _require_driver(
+                name, FORMAT_REQUIREMENTS[file_format], f"reads {file_format} files"
+            )
 
-            # Raises on a cloud scheme or a relative local path.
-            resolve_location(name, spec)
+            # Raises on an unknown scheme or a relative local path.
+            bucket_url, file_glob = resolve_location(
+                name, spec, allowed=self.allowed_schemes
+            )
+            scheme = urlsplit(bucket_url).scheme
+            if scheme == "file":
+                # The heuristic that tells a file from a dotted directory is
+                # only a heuristic; on local disk the answer is one stat away.
+                _check_local_location(name, bucket_url, file_glob)
+            _require_driver(
+                name, SCHEME_REQUIREMENTS.get(scheme), f"reads from {bucket_url!r}"
+            )
 
             disposition = spec.get("write_disposition", "merge")
             if disposition == "merge" and not spec.get("primary_key"):
@@ -94,13 +142,20 @@ class FilesystemSource(SourceDefinition):
                     f"'primary_key'. Without a stable key, re-reading a file "
                     f"appends every row again instead of updating it."
                 )
+            if "unpivot" in spec:
+                self.validate_reshape(
+                    spec["unpivot"],
+                    where=f"resources.{name}.unpivot",
+                    primary_key=spec.get("primary_key") or (),
+                    cursor=spec.get("cursor"),
+                )
         return None
 
     # --- extraction --------------------------------------------------------
 
     def incremental_for(self, resource_name, binding):
         """Cursor kwargs only. See ``SourceDefinition.incremental_for``."""
-        spec = ((binding.config or {}).get("resources") or {}).get(resource_name) or {}
+        spec = self.resource_spec(binding, resource_name)
         cursor = spec.get("cursor")
         return {"cursor_path": cursor} if cursor else None
 
@@ -111,18 +166,25 @@ class FilesystemSource(SourceDefinition):
         self.validate_config(config)
 
         resources = [
-            self._build_resource(name, spec)
+            self._build_resource(name, spec, credentials)
             for name, spec in config["resources"].items()
         ]
         # dlt.source() as a function, not a decorator: the decorator takes the
         # source name from __name__ and cannot produce a runtime-chosen one.
         return dlt.source(lambda: resources, name=self.key, section=self.key)()
 
-    def _build_resource(self, name, spec):
+    def _build_resource(self, name, spec, credentials):
         from dlt.sources.filesystem import filesystem
 
-        bucket_url, file_glob = resolve_location(name, spec)
-        files = filesystem(bucket_url=bucket_url, file_glob=file_glob)
+        bucket_url, file_glob = resolve_location(
+            name, spec, allowed=self.allowed_schemes
+        )
+        kwargs = {"bucket_url": bucket_url, "file_glob": file_glob}
+        # Local files take no credentials; passing None would make dlt look for
+        # its own configured secret and fail the Run on a missing setting.
+        if urlsplit(bucket_url).scheme != "file":
+            kwargs["credentials"] = bucket_credentials(bucket_url, credentials)
+        files = filesystem(**kwargs)
         # `with_name` renames the piped resource; without it every Binding's
         # resource would be called "filesystem" and the landing table name
         # would carry no hint of what is in it.
@@ -133,6 +195,99 @@ class FilesystemSource(SourceDefinition):
             hints["primary_key"] = spec["primary_key"]
         resource.apply_hints(**hints)
         return resource
+
+    # --- operations --------------------------------------------------------
+
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """List a directory or bucket prefix: folders and files, one level.
+
+        ``path`` is the location to list, in the same forms a Binding's
+        ``path`` takes; with none given, ``Connection.metadata["root"]`` is the
+        starting point. A local root is required to be absolute for the same
+        reason a Binding's is. Listing is not recursive — a UI descends by
+        passing an item's ``path`` back — so a bucket with a million objects
+        costs one page, not one walk.
+        """
+        root = path or (connection.metadata or {}).get("root")
+        if not root:
+            raise ConfigurationError(
+                "discovery needs a 'path' to list, or Connection.metadata['root']."
+            )
+        # A discovery path is a folder by contract: it came from an item whose
+        # kind was "folder", or it is the configured root. The file-name
+        # heuristic that serves Binding specs must not run here, or a folder
+        # named `com.example` re-lists its parent and can never be entered.
+        bucket_url, _ = resolve_location(
+            "root", {"bucket_url": root}, allowed=self.allowed_schemes
+        )
+        scheme = urlsplit(bucket_url).scheme
+        _require_driver(
+            "root", SCHEME_REQUIREMENTS.get(scheme), f"lists {bucket_url!r}"
+        )
+
+        import fsspec
+        from fsspec.spec import AbstractFileSystem
+
+        if scheme == "file":
+            fs = fsspec.filesystem("file")
+        else:
+            opened = bucket_credentials(bucket_url, credentials)
+            fs = (
+                opened
+                if isinstance(opened, AbstractFileSystem)
+                else _fsspec_for(bucket_url, opened)
+            )
+        try:
+            entries = fs.ls(bucket_url, detail=True)
+        except FileNotFoundError as exc:
+            raise SourceError(
+                f"{bucket_url!r} does not exist or is not readable"
+            ) from exc
+        except Exception as exc:
+            # PermissionError locally; botocore, gcsfs and adlfs each raise
+            # their own on a denied or unreachable bucket. All are the
+            # caller's configuration or access, not a bug, so all become the
+            # error the API turns into a 400 rather than a 500.
+            raise SourceError(f"could not list {bucket_url!r}: {scrub(exc)}") from exc
+        items = []
+        for entry in entries:
+            full = entry.get("name") or ""
+            name = full.rstrip("/").rpartition("/")[2]
+            is_folder = entry.get("type") == "directory"
+            location = _rejoin(bucket_url, name)
+            items.append(
+                {
+                    "id": location,
+                    "name": name,
+                    "kind": "folder" if is_folder else "file",
+                    "path": location if is_folder else None,
+                    "size": None if is_folder else entry.get("size"),
+                }
+            )
+        items.sort(key=lambda item: (item["kind"] != "folder", item["name"]))
+        return discovery_page(items, cursor=cursor, limit=limit, query=query)
+
+
+def _fsspec_for(bucket_url, spec):
+    """An fsspec filesystem from a dlt credential spec, for listing only.
+
+    dlt's own factory knows which method each spec exposes (``to_s3fs_...``,
+    ``to_gcs_...``, ``to_adlfs_...``) and the listing-cache settings it uses
+    itself; hand-rolling that table once produced a TypeError for GCS. It
+    takes the bucket URL, not the bare scheme — its docstring says otherwise,
+    and a bare scheme quietly becomes a relative local path.
+    """
+    from dlt.common.storages.fsspec_filesystem import fsspec_filesystem
+
+    fs, _ = fsspec_filesystem(bucket_url, spec)
+    return fs
+
+
+def _rejoin(bucket_url, name):
+    """`bucket_url` + one path segment, in the form a Binding would accept."""
+    return f"{bucket_url.removeprefix('file://').rstrip('/')}/{name}"
 
 
 def _reader(spec):
@@ -148,12 +303,15 @@ def _reader(spec):
     return readers[spec.get("format", "jsonl")]()
 
 
-def resolve_location(name, spec):
+def resolve_location(name, spec, *, allowed=frozenset(SCHEME_REQUIREMENTS)):
     """Return ``(bucket_url, file_glob)`` for a resource, or explain what is wrong.
 
     Accepts either dlt's own two-part shape (``bucket_url`` + ``file_glob``) or
-    a single ``path`` that may end in a glob — ``/data/events/*.jsonl`` splits
-    into a directory and a pattern.
+    a single ``path``. The path's last segment decides how it is read: a glob
+    (``*.jsonl``) is split off; a name with an extension (``orders.csv``) is
+    taken as one file and becomes an exact glob; anything else is a directory.
+    A directory glob over a file matches nothing and reports success, which is
+    why a file name is recognised rather than left to chance.
     """
     bucket_url = spec.get("bucket_url")
     file_glob = spec.get("file_glob")
@@ -162,22 +320,32 @@ def resolve_location(name, spec):
         path = spec.get("path")
         if not path or not isinstance(path, str):
             raise ConfigurationError(
-                f"resources.{name} needs a 'path' (a directory or a glob) or a "
-                f"'bucket_url'."
+                f"resources.{name} needs a 'path' (a directory, a glob or one "
+                f"file) or a 'bucket_url'."
             )
-        head, _, tail = path.rpartition("/")
-        if any(character in tail for character in GLOB_CHARACTERS):
-            bucket_url, file_glob = head or "/", file_glob or tail
+        head, tail = _split_glob(path)
+        # A leading slash is the filesystem root (`/*.jsonl` lists `/`), and
+        # dlt's own `file:///x` spelling leaves `file://` as the head. A bare
+        # name with no slash at all is relative and is refused below; `head`
+        # ending in `:/` means the tail is the bucket itself (`s3://my.bucket`).
+        if not head and path.startswith("/"):
+            head = "/"
+        elif head == "file://":
+            head = "file:///"
+        below_root = bool(head) and not head.endswith(":/")
+        if below_root and (
+            any(character in tail for character in GLOB_CHARACTERS)
+            or _looks_like_file(tail)
+        ):
+            bucket_url, file_glob = head, file_glob or tail
         else:
             bucket_url = path
 
     scheme = urlsplit(bucket_url).scheme
-    if scheme and scheme != "file":
+    if scheme and scheme not in allowed:
         raise ConfigurationError(
-            f"resources.{name}: bucket scheme {scheme!r} is not supported in "
-            f"v0.1; only local files ('file://' or an absolute path) are. The "
-            f"config shape is dlt's own, so cloud buckets need no Binding "
-            f"changes when they land."
+            f"resources.{name}: bucket scheme {scheme!r} is not supported; "
+            f"supported: {sorted(allowed)}."
         )
     if not scheme:
         if not os.path.isabs(bucket_url):
@@ -187,8 +355,116 @@ def resolve_location(name, spec):
                 f"worker started in, which is not the same on every machine."
             )
         bucket_url = f"file://{bucket_url}"
+    elif scheme != "file" and not urlsplit(bucket_url).netloc:
+        raise ConfigurationError(f"resources.{name}: {bucket_url!r} names no bucket.")
 
     return bucket_url, file_glob or "*"
+
+
+def _require_driver(name, requirement, what):
+    """Refuse at save time a format or scheme whose driver is not installed.
+
+    dlt's readers and fsspec's drivers both import lazily on first use, so
+    without this the failure lands inside a customer's Run instead of here.
+    """
+    if requirement is None:
+        return
+    module, extra = requirement
+    if not module_available(module):
+        raise ConfigurationError(
+            f"resources.{name} {what}, which needs {module!r}. It is imported "
+            f"lazily on first use, so without this check the failure would "
+            f"land inside a Run instead of here. Install it with: "
+            f"pip install 'django-connectors[{extra}]'"
+        )
+
+
+def _check_local_location(name, bucket_url, file_glob):
+    """A local directory must exist, and a single-file glob must name a file."""
+    directory = bucket_url.removeprefix("file://")
+    if not os.path.isdir(directory):
+        raise ConfigurationError(
+            f"resources.{name}: {directory!r} is not a directory on this "
+            f"worker. If it is a file, give its directory as 'bucket_url' and "
+            f"its name as 'file_glob'."
+        )
+    if not any(character in file_glob for character in GLOB_CHARACTERS):
+        target = os.path.join(directory, file_glob)
+        if os.path.isdir(target):
+            raise ConfigurationError(
+                f"resources.{name}: {target!r} is a directory, but its name "
+                f"looks like a file. Give it as 'bucket_url' with a "
+                f"'file_glob' to read what is inside it."
+            )
+
+
+def _split_glob(path):
+    """``(directory, rest)`` split at the *first* segment holding a glob.
+
+    ``/data/exports/**/*.csv`` is the directory ``/data/exports`` and the glob
+    ``**/*.csv`` — dlt's ``file_glob`` takes the recursive form — not the
+    directory ``/data/exports/**``, which nothing can stat.
+    """
+    parts = path.split("/")
+    for index, part in enumerate(parts):
+        if any(character in part for character in GLOB_CHARACTERS):
+            return "/".join(parts[:index]), "/".join(parts[index:])
+    head, _, tail = path.rpartition("/")
+    return head, tail
+
+
+def _looks_like_file(segment):
+    """``orders.csv`` yes; ``exports``, ``.hidden`` and ``v1.2`` no."""
+    stem, dot, extension = segment.rpartition(".")
+    return bool(dot and stem and extension.isalnum() and not extension.isdigit())
+
+
+def bucket_credentials(bucket_url, credentials):
+    """What dlt's filesystem source needs to open `bucket_url`.
+
+    A ready ``fsspec`` filesystem is passed through for any scheme. For
+    ``s3://`` a mapping of boto names becomes an ``AwsCredentials``; an empty
+    one means the worker's ambient credentials. Other schemes need the backend
+    to return a dlt credential spec or a filesystem, because their key shapes
+    (a service-account JSON, a service-principal triple) do not reduce to a
+    flat mapping without guessing.
+    """
+    from fsspec.spec import AbstractFileSystem
+
+    if isinstance(credentials, AbstractFileSystem):
+        return credentials
+    scheme = urlsplit(bucket_url).scheme
+    if scheme == "s3":
+        from dlt.common.configuration.specs import AwsCredentials
+
+        if isinstance(credentials, AwsCredentials):
+            return credentials
+        if credentials is None:
+            # Nothing at all means the worker's own role, deliberately.
+            return AwsCredentials()
+        values = {}
+        if not isinstance(credentials, str):
+            for key in AWS_CREDENTIAL_KEYS:
+                value = credential_value(credentials, key)
+                if value:
+                    values[key] = value
+        if not values:
+            # A credential was supplied and none of it is usable. Falling back
+            # to the worker's role here would use a different account than the
+            # one the operator configured, silently.
+            raise ConfigurationError(
+                f"s3:// credentials must be a mapping with at least one of "
+                f"{list(AWS_CREDENTIAL_KEYS)}, or nothing for the worker's own "
+                f"role; got {type(credentials).__name__}."
+            )
+        return AwsCredentials(**values)
+    if credentials is None or isinstance(credentials, str | Mapping):
+        raise ConfigurationError(
+            f"{scheme}:// needs the Connection's auth backend to return a dlt "
+            f"credential spec or an fsspec filesystem; a bare mapping is not "
+            f"enough to build one without guessing its shape."
+        )
+    return credentials
 
 
 def module_available(module_name):

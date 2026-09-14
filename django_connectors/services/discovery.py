@@ -17,6 +17,7 @@ from django_connectors.exceptions import LandingSchemaError
 from django_connectors.landing import access, schema
 from django_connectors.models import Projection
 from django_connectors.registry import sources
+from django_connectors.sources.base import page_limit
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +48,22 @@ def sample_resource(binding, resource, *, limit=None):
     ]
 
 
-def discover_remote(connection, *, query=None, source_key=None, credentials=None):
-    """Ask the provider what is available to synchronize.
+def discover_remote(
+    connection,
+    *,
+    query=None,
+    path=None,
+    cursor=None,
+    limit=None,
+    source_key=None,
+    credentials=None,
+):
+    """Ask the provider what is available to synchronize, one page at a time.
 
     Distinct from :func:`get_landing_schema`, which describes what has already
-    landed. This one talks to the provider and is the expensive call.
+    landed. This one talks to the provider and is the expensive call. See
+    ``SourceDefinition.discover`` for the envelope and what `path` means.
+    `limit` is clamped to ``DISCOVERY_PAGE_SIZE``.
     """
     key = source_key or connection.provider
     if key not in sources:
@@ -60,14 +72,18 @@ def discover_remote(connection, *, query=None, source_key=None, credentials=None
             f"{sources.keys()}"
         )
     definition = sources.get(key)
-    if credentials is None and connection.auth_backend:
-        from django_connectors.registry import auth_backends
+    if credentials is None:
+        from django_connectors.services.runs import credentials_for
 
-        credentials = auth_backends.get(connection.auth_backend).get_credentials(
-            connection
-        )
+        credentials = credentials_for(connection)
+    limit = page_limit(limit)
     return definition.discover(
-        connection=connection, credentials=credentials, query=query
+        connection=connection,
+        credentials=credentials,
+        query=query,
+        path=path,
+        cursor=cursor,
+        limit=limit,
     )
 
 

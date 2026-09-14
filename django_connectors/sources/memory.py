@@ -30,7 +30,7 @@ batch yields nothing, which is what an unchanged remote source looks like.
 
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.landing.naming import DELETED_COLUMN
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
 
 BATCH_INDEX_STATE_KEY = "memory_batch_index"
 
@@ -43,7 +43,7 @@ class MemorySource(SourceDefinition):
     emits_tombstones = True
 
     def validate_config(self, config):
-        resources = (config or {}).get("resources")
+        resources = as_config(config).get("resources")
         if not isinstance(resources, dict) or not resources:
             raise ConfigurationError(
                 "memory source config needs a non-empty 'resources' mapping"
@@ -64,10 +64,17 @@ class MemorySource(SourceDefinition):
                     f"resource {name!r} uses merge disposition and must declare "
                     f"'primary_key'"
                 )
+            if "unpivot" in spec:
+                self.validate_reshape(
+                    spec["unpivot"],
+                    where=f"resources.{name}.unpivot",
+                    primary_key=spec.get("primary_key") or (),
+                    cursor=spec.get("cursor"),
+                )
         return None
 
     def incremental_for(self, resource_name, binding):
-        spec = (binding.config or {}).get("resources", {}).get(resource_name) or {}
+        spec = self.resource_spec(binding, resource_name)
         cursor = spec.get("cursor")
         return {"cursor_path": cursor} if cursor else None
 
@@ -119,8 +126,15 @@ class MemorySource(SourceDefinition):
     def check_connection(self, *, connection, credentials):
         return "ok"
 
-    def discover(self, *, connection, credentials, query=None):
-        return {"resources": []}
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """The resources named in ``Connection.metadata["resources"]``, if any."""
+        names = (connection.metadata or {}).get("resources") or []
+        items = [
+            {"id": name, "name": name, "kind": "table", "path": None} for name in names
+        ]
+        return discovery_page(items, cursor=cursor, limit=limit, query=query)
 
 
 def tombstone(primary_key_values):

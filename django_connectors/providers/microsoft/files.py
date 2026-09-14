@@ -31,7 +31,7 @@ the wrong place for a 40MB spreadsheet — it makes every merge rewrite the blob
 it exceeds MySQL's ``TEXT`` limits and wedges the load package, and it puts
 customer document content in a table whose whole purpose is to be sampled and
 previewed in a UI. Content download is available as a separate, explicit call:
-:func:`download_item_content`, which is what
+:func:`download_item`, which is what
 :mod:`django_connectors.providers.microsoft.excel` is built on.
 
 **Unverified against a live provider.** Written against Microsoft's published
@@ -47,13 +47,13 @@ drive root.
 """
 
 import datetime as dt
-import fnmatch
 import re
 import time
 from email.utils import parsedate_to_datetime
 from typing import ClassVar
 from urllib.parse import quote, unquote, urlsplit
 
+from django_connectors.auth.base import first_credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import (
     AuthError,
@@ -61,7 +61,14 @@ from django_connectors.exceptions import (
     CredentialsRevoked,
     SourceError,
 )
-from django_connectors.sources.base import SourceDefinition
+from django_connectors.sources.base import (
+    SourceDefinition,
+    as_config,
+    name_matches,
+    read_capped,
+    sign_cursor,
+    unsign_cursor,
+)
 from django_connectors.sources.memory import tombstone
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -88,6 +95,9 @@ DEFAULT_TIMEOUT_SECONDS = 60
 
 #: Where the delta link lives in dlt's resource state.
 DELTA_STATE_KEY = "graph_delta"
+#: Set once a single-item Binding has landed its item, so a later 404 is a
+#: deletion rather than a misconfiguration.
+SINGLE_ITEM_SEEN_KEY = "single_item_seen"
 
 #: Statuses worth retrying in place. 429 is Graph's normal operating mode under
 #: load; 503/504 are its normal operating mode during a service update.
@@ -146,6 +156,9 @@ class EntraFilesSource(SourceDefinition):
 
     #: Delta reports deletions, which is what makes tombstones honest here.
     emits_tombstones = True
+    #: ``fetch_content`` downloads a driveItem; `reference` needs the landed
+    #: ``id`` and ``drive_id`` columns.
+    provides_content = True
 
     #: Opt-in escape hatch for a non-Microsoft Graph endpoint — a recorded-proxy
     #: test harness, or a cloud Microsoft has not shipped yet. A class attribute
@@ -156,8 +169,10 @@ class EntraFilesSource(SourceDefinition):
 
     def validate_config(self, config):
         """Reject a configuration that could not run, at Binding save time."""
-        config = config or {}
+        config = as_config(config)
         self.validate_location(config)
+        if config.get("item_id"):
+            assert_single_item(config)
 
         resource = config.get("resource", DEFAULT_RESOURCE)
         if not isinstance(resource, str) or not resource:
@@ -276,9 +291,20 @@ class EntraFilesSource(SourceDefinition):
         Excel source downloads every changed workbook — reuse one connection
         pool and one token rather than opening a second session per item.
         """
-        state = self.delta_state() if use_state else None
         owned = session is None
         session = session or graph_session(token, timeout=self.timeout(config))
+        if config.get("item_id"):
+            # One file, by id. No delta: the item's own metadata is the whole
+            # feed, and a 404 is the deletion — emitted as a tombstone so the
+            # row does not outlive the file.
+            try:
+                yield self.single_item_record(config, session=session)
+            finally:
+                if owned:
+                    session.close()
+            return
+
+        state = self.delta_state() if use_state else None
         base = self.base_url(config)
         scope = delta_scope(config)
         first_url = self.initial_delta_url(config, base=base, scope=scope)
@@ -364,6 +390,72 @@ class EntraFilesSource(SourceDefinition):
 
         return item_record(item, drive_id=config.get("drive_id") or "")
 
+    def single_item(self, config, *, session):
+        """The raw Graph driveItem a Binding names with ``item_id``."""
+        base = self.base_url(config)
+        url = f"{base}/{drive_address(config)}/items/{config['item_id']}"
+        response = graph_request(session, "GET", url)
+        raise_for_graph_error(response, what=f"driveItem {config['item_id']!r}")
+        return response.json()
+
+    def single_item_record(self, config, *, session):
+        """The single item's record; its tombstone only once it has been seen.
+
+        A 404 on an item no run has landed is a wrong id or a wrong drive, and
+        landing a dead row for it would report success on a misconfiguration.
+        Whether the item was ever seen lives in dlt's resource state, which
+        only persists on a successful load.
+        """
+        state = self.delta_state()
+        try:
+            item = self.single_item(config, session=session)
+        except SourceError as exc:
+            if "could not find" not in str(exc) or not state.get(SINGLE_ITEM_SEEN_KEY):
+                raise
+            return tombstone({"id": config["item_id"]})
+        record = self.record_for(item, config)
+        if record is None:
+            # record_for skips the drive root and, without include_folders,
+            # folders. Explicitly named, silence would mean "synced nothing".
+            raise SourceError(
+                f"driveItem {config['item_id']!r} is the drive root or a "
+                f"folder; name a file, or use 'folder_item_id' to sync a "
+                f"folder's contents."
+            )
+        state[SINGLE_ITEM_SEEN_KEY] = True
+        return record
+
+    def fetch_content(self, *, binding, credentials, resource, reference, max_bytes):
+        """Download one driveItem. `reference` carries the landed ``id`` and
+        ``drive_id``; the Binding's configured drive is the fallback."""
+        config = binding.config or {}
+        item_id = reference.get("id")
+        drive_id = reference.get("drive_id") or config.get("drive_id")
+        if not item_id or not drive_id:
+            raise SourceError(
+                "fetch_content needs the landed 'id' and 'drive_id' columns in "
+                "`reference` to address a driveItem"
+            )
+        try:
+            assert_graph_id("id", str(item_id))
+            assert_graph_id("drive_id", str(drive_id))
+        except ConfigurationError as exc:
+            # The reference is the caller's data, not the Binding's config.
+            raise SourceError(str(exc)) from exc
+        base = self.base_url(config)
+        assert_graph_url(base, allow_custom=self.allow_custom_graph_base_url)
+        session = graph_session(access_token(credentials), timeout=self.timeout(config))
+        try:
+            return download_item(
+                session,
+                base_url=base,
+                drive_id=drive_id,
+                item_id=item_id,
+                max_bytes=max_bytes,
+            )
+        finally:
+            session.close()
+
     def delta_state(self):
         """dlt's per-resource state dict, which only persists on a good load."""
         import dlt
@@ -407,41 +499,69 @@ class EntraFilesSource(SourceDefinition):
             session.close()
         return f"ok: {drive.get('driveType', 'drive')} {drive.get('name', '')}".strip()
 
-    def discover(self, *, connection, credentials, query=None):
-        """List what could be synchronized: sites, drives, or a folder's children.
+    def discover(
+        self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
+    ):
+        """Sites at the top when no drive is configured; otherwise a folder.
 
-        Driven by ``Connection.metadata`` because discovery happens *before* any
-        Binding exists to carry a config.
+        Driven by ``Connection.metadata`` because discovery happens *before*
+        any Binding exists to carry a config. ``path`` is a folder's driveItem
+        id (the root when None). ``cursor`` is Graph's own ``@odata.nextLink``,
+        held to the same origin before it is followed, since it is followed
+        with the tenant-wide token attached.
         """
         config = connection.metadata or {}
         base = self.base_url(config)
         assert_graph_url(base, allow_custom=self.allow_custom_graph_base_url)
         session = graph_session(access_token(credentials), timeout=self.timeout(config))
         try:
-            if config.get("drive_id") or config.get("site_id"):
+            if cursor:
+                # Signed, not merely same-origin: a raw link fetched with the
+                # tenant token would let a files-scoped caller read /users.
+                url = unsign_cursor(cursor, scope=connection.id)
+                assert_same_origin(url, base)
+            elif config.get("drive_id") or config.get("site_id"):
                 self.validate_location(config)
-                url = f"{base}/{drive_address(config)}/root/children?$top=200"
-                key = "items"
+                if path:
+                    assert_graph_id("path", path)
+                    parent = f"items/{path}"
+                else:
+                    parent = "root"
+                top = int(limit or DEFAULT_PAGE_SIZE)
+                url = f"{base}/{drive_address(config)}/{parent}/children?$top={top}"
             else:
                 url = f"{base}/sites?search={quote(str(query or ''), safe='')}"
-                key = "sites"
             response = graph_request(session, "GET", url)
             raise_for_graph_error(response, what="discovery")
             payload = response.json()
         finally:
             session.close()
 
-        return {
-            key: [
+        items = []
+        for entry in payload.get("value") or []:
+            is_site = (
+                "displayName" in entry and "folder" not in entry and "file" not in entry
+            )
+            is_folder = "folder" in entry
+            name = entry.get("name") or entry.get("displayName")
+            if query and not is_site and query.lower() not in (name or "").lower():
+                continue
+            items.append(
                 {
                     "id": entry.get("id"),
-                    "name": entry.get("name") or entry.get("displayName"),
+                    "name": name,
+                    "kind": "site" if is_site else "folder" if is_folder else "file",
+                    "path": entry.get("id") if is_folder else None,
                     "web_url": entry.get("webUrl"),
-                    "is_folder": "folder" in entry,
+                    "size": entry.get("size"),
                 }
-                for entry in payload.get("value") or []
-            ]
-        }
+            )
+        next_link = payload.get("@odata.nextLink")
+        next_cursor = None
+        if next_link:
+            assert_same_origin(next_link, base)
+            next_cursor = sign_cursor(next_link, scope=connection.id)
+        return {"items": items, "next_cursor": next_cursor}
 
 
 # --- HTTP ------------------------------------------------------------------
@@ -632,10 +752,16 @@ def raise_for_graph_error(response, *, what):
     raise SourceError(f"Graph failed the {what}. {detail}")
 
 
-def download_item_content(
-    session, *, base_url, drive_id, item_id, max_bytes, chunk_size=1 << 16
+def download_item(
+    session,
+    *,
+    base_url,
+    drive_id,
+    item_id,
+    max_bytes,
+    limit_hint="",
 ):
-    """Return the bytes of one ``driveItem``. The documented content hook.
+    """Return ``(bytes, content_type)`` of one ``driveItem``. The content hook.
 
     Deliberately *not* wired into the resource: file bytes must never become a
     landing column (see the module docstring). Callers that need content — the
@@ -652,26 +778,12 @@ def download_item_content(
     response = graph_request(session, "GET", url, stream=True)
     try:
         raise_for_graph_error(response, what=f"content of item {item_id!r}")
-
-        declared = response.headers.get("Content-Length")
-        if declared and declared.isdigit() and int(declared) > max_bytes:
-            raise SourceError(
-                f"driveItem {item_id!r} is {declared} bytes, over the "
-                f"{max_bytes}-byte limit for this binding. Raise "
-                f"'max_file_bytes' if the worker can genuinely hold it."
-            )
-
-        chunks = []
-        total = 0
-        for chunk in response.iter_content(chunk_size):
-            total += len(chunk)
-            if total > max_bytes:
-                raise SourceError(
-                    f"driveItem {item_id!r} exceeded the {max_bytes}-byte limit "
-                    f"while downloading; the transfer was abandoned."
-                )
-            chunks.append(chunk)
-        return b"".join(chunks)
+        return read_capped(
+            response,
+            max_bytes=max_bytes,
+            what=f"driveItem {item_id!r}",
+            limit_hint=limit_hint,
+        )
     finally:
         response.close()
 
@@ -716,19 +828,6 @@ def item_record(item, *, drive_id=""):
         "created_by": identity_name(item.get("createdBy")),
         "last_modified_by": identity_name(item.get("lastModifiedBy")),
     }
-
-
-def name_matches(name, glob):
-    """Case-insensitive glob match, because SharePoint file names are.
-
-    ``fnmatch.fnmatch`` follows the *host* filesystem's rules, so on Linux
-    ``*.xlsx`` silently fails to match ``Budget.XLSX`` while on macOS it
-    matches — a Binding that works on a developer's laptop and drops half the
-    documents in production. Neither of those is the provider's rule: SharePoint
-    and OneDrive treat names case-insensitively, so the comparison is folded
-    explicitly rather than inherited from wherever the worker happens to run.
-    """
-    return fnmatch.fnmatchcase(name.lower(), glob.lower())
 
 
 def identity_name(identity_set):
@@ -804,6 +903,20 @@ def assert_graph_id(field, value):
             f"characters and may not contain '/', '\\', '?', '#', '%' or "
             f"whitespace — those would change which resource the request "
             f"addresses rather than which item."
+        )
+
+
+def assert_single_item(config):
+    """``item_id`` names one item, so folder narrowing is meaningless."""
+    assert_graph_id("item_id", config["item_id"])
+    conflicting = sorted(
+        key for key in ("folder_path", "folder_item_id", "name_glob") if config.get(key)
+    )
+    if conflicting:
+        raise ConfigurationError(
+            f"'item_id' names one item, so {conflicting} cannot also apply. "
+            f"Drop 'item_id' to sync a folder, or drop {conflicting} to sync "
+            f"that one item."
         )
 
 
@@ -888,15 +1001,9 @@ def access_token(credentials):
     """
     if isinstance(credentials, str) and credentials:
         return credentials
-    if credentials is not None:
-        for key in _TOKEN_KEYS:
-            value = (
-                credentials.get(key)
-                if hasattr(credentials, "get")
-                else getattr(credentials, key, None)
-            )
-            if value:
-                return value
+    value = first_credential_value(credentials, _TOKEN_KEYS)
+    if value:
+        return value
     raise AuthError(
         "no Microsoft Graph access token was available for this Binding. The "
         "Connection needs an auth backend that returns one — "

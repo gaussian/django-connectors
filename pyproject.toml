@@ -39,6 +39,8 @@ sql = ["dlt[sql-database]>=1.30"]
 csv = ["pandas>=2.2"]
 parquet = ["dlt[parquet]>=1.30"]
 s3 = ["dlt[s3]>=1.30"]
+gs = ["dlt[gs]>=1.30"]
+az = ["dlt[az]>=1.30"]
 # Provider SDKs are pulled in for *credential acquisition only* — never for data
 # access. Token signing (service-account JWTs, Entra client assertions) is the
 # one thing we must not hand-roll; the API calls themselves go through dlt's
