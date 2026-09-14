@@ -80,9 +80,18 @@ def execute(projection_run):
             ),
         )
 
+    # An atomic claim, not a save: the sweeper rescues stale queued runs and a
+    # backed-up queue may deliver the same one meanwhile. Whichever claims the
+    # row runs it; the other returns what the row already says.
+    started_at = timezone.now()
+    claimed = ProjectionRun.objects.filter(
+        pk=projection_run.pk, status=ProjectionRunStatus.QUEUED
+    ).update(status=ProjectionRunStatus.RUNNING, started_at=started_at)
+    if not claimed:
+        projection_run.refresh_from_db()
+        return projection_run
     projection_run.status = ProjectionRunStatus.RUNNING
-    projection_run.started_at = timezone.now()
-    projection_run.save(update_fields=["status", "started_at"])
+    projection_run.started_at = started_at
 
     try:
         counts = _run(projection_run, projection)
@@ -369,10 +378,13 @@ def dispatch_pending(projection, *, lookback=None):
     ).order_by("created_at"):
         landed.extend(run.dlt_load_ids or [])
 
-    # Succeeded runs have projected their loads; queued and running ones hold
-    # theirs in flight. A queued run the queue dropped is executed by the
-    # sweeper once it is older than the grace period, *before* this is
-    # computed, so counting it here would only queue a duplicate.
+    # Succeeded runs have projected their loads. Queued and running ones hold
+    # theirs in flight — but only for as long as that claim is credible: a
+    # queued run past the grace period is one the queue dropped (the sweeper
+    # executes it before calling this), and a running run past the run
+    # timeout is one a killed worker left behind, which no reaper answers.
+    # Counting either forever would lose its loads for good.
+    now = timezone.now()
     projected = set()
     for previous in ProjectionRun.objects.filter(
         projection=projection,
@@ -382,6 +394,15 @@ def dispatch_pending(projection, *, lookback=None):
             ProjectionRunStatus.RUNNING,
         ),
     ):
+        if previous.status == ProjectionRunStatus.QUEUED and (
+            previous.created_at < now - conf.PROJECTION_QUEUE_GRACE
+        ):
+            continue
+        if previous.status == ProjectionRunStatus.RUNNING and (
+            (previous.started_at or previous.created_at)
+            < now - conf.DEFAULT_RUN_TIMEOUT
+        ):
+            continue
         projected.update(previous.load_ids or [])
 
     outstanding = [load_id for load_id in landed if load_id not in projected]

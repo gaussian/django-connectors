@@ -227,9 +227,11 @@ def dispatch_after_run(run):
         if dispatch is None:
             projection_run = projection_runner.execute(projection_run)
         else:
-            # Handed to a queue. It runs after the Binding's lease is released,
-            # in whatever worker picks it up; the sweeper heals a dropped one.
-            dispatch(projection_run)
+            # Handed to a queue after the row is committed — under
+            # ATOMIC_REQUESTS a worker would otherwise look it up before it
+            # exists. Outside a transaction this runs at once. It executes
+            # after the Binding's lease is released; the sweeper heals a drop.
+            transaction.on_commit(lambda run=projection_run: dispatch(run))
         dispatched.append(projection_run)
     return dispatched
 

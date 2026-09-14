@@ -404,12 +404,20 @@ class GoogleDriveSource(SourceDefinition):
                 item = change.get("file") or {}
                 gone = change.get("removed") or item.get("trashed")
                 if file_id in folders:
-                    if gone or (
-                        folder_scoped
-                        and item.get("parents")
-                        and (item.get("parents") or [None])[0] not in folders
-                    ):
+                    parent = (item.get("parents") or [None])[0]
+                    is_root = folders[file_id] is None
+                    if gone:
                         yield from drop_subtree(file_id)
+                    elif is_root or parent is None:
+                        # The root's own parent is never in scope; a rename or
+                        # a starring of the root must not read as a move out.
+                        pass
+                    elif parent not in folders:
+                        yield from drop_subtree(file_id)
+                    else:
+                        # Moved within scope: record the new parent, or a later
+                        # drop of the old one would take this subtree with it.
+                        folders[file_id] = parent
                     continue
                 if gone:
                     if tracking:

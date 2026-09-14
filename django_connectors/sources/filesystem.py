@@ -338,7 +338,7 @@ def resolve_location(name, spec, *, allowed=frozenset(SCHEME_REQUIREMENTS)):
                 f"resources.{name} needs a 'path' (a directory, a glob or one "
                 f"file) or a 'bucket_url'."
             )
-        head, _, tail = path.rpartition("/")
+        head, tail = _split_glob(path)
         # A leading slash is the filesystem root (`/*.jsonl` lists `/`), and
         # dlt's own `file:///x` spelling leaves `file://` as the head. A bare
         # name with no slash at all is relative and is refused below; `head`
@@ -411,6 +411,21 @@ def _check_local_location(name, bucket_url, file_glob):
                 f"looks like a file. Give it as 'bucket_url' with a "
                 f"'file_glob' to read what is inside it."
             )
+
+
+def _split_glob(path):
+    """``(directory, rest)`` split at the *first* segment holding a glob.
+
+    ``/data/exports/**/*.csv`` is the directory ``/data/exports`` and the glob
+    ``**/*.csv`` — dlt's ``file_glob`` takes the recursive form — not the
+    directory ``/data/exports/**``, which nothing can stat.
+    """
+    parts = path.split("/")
+    for index, part in enumerate(parts):
+        if any(character in part for character in GLOB_CHARACTERS):
+            return "/".join(parts[:index]), "/".join(parts[index:])
+    head, _, tail = path.rpartition("/")
+    return head, tail
 
 
 def _looks_like_file(segment):

@@ -161,7 +161,7 @@ def test_a_writer_result_puts_its_skips_and_warnings_on_the_run(
         return WriterResult(
             written=len(records) - 1,
             skipped=1,
-            warnings=["activity 'Approve' matched no node; landed with null anchor"],
+            warnings=["reference 'X-42' matched no parent record; landed unlinked"],
         )
 
     register_target(
@@ -181,7 +181,7 @@ def test_a_writer_result_puts_its_skips_and_warnings_on_the_run(
     assert projection_run.records_written == 1
     assert projection_run.records_skipped == 1
     assert projection_run.warnings == [
-        {"reason": "activity 'Approve' matched no node; landed with null anchor"}
+        {"reason": "reference 'X-42' matched no parent record; landed unlinked"}
     ]
 
 

@@ -41,6 +41,18 @@ def clear_handed():
 
 
 @pytest.fixture
+def run_committed(django_capture_on_commit_callbacks):
+    """`run_binding` with commit callbacks fired: the queue dispatch is deferred
+    to commit, and a test runs inside a transaction that never commits."""
+
+    def run(binding, trigger):
+        with django_capture_on_commit_callbacks(execute=True):
+            return run_services.run_binding(binding, trigger=trigger)
+
+    return run
+
+
+@pytest.fixture
 def queued_settings(connectors_settings, settings):
     settings.DJANGO_CONNECTORS = {
         **connectors_settings,
@@ -61,13 +73,13 @@ def test_inline_is_the_default(
 
 
 def test_a_dispatch_callable_receives_a_queued_run_and_nothing_executes(
-    queued_settings, make_binding, events_target, writer
+    queued_settings, run_committed, make_binding, events_target, writer
 ):
     binding = make_binding(config=memory_config(batches=[[RECORD], [RECORD]]))
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    run_committed(binding, RunTrigger.INITIAL)
     make_projection(binding)
 
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    run_committed(binding, RunTrigger.SCHEDULED)
 
     assert len(HANDED) == 1
     assert HANDED[0].status == ProjectionRunStatus.QUEUED
@@ -75,12 +87,12 @@ def test_a_dispatch_callable_receives_a_queued_run_and_nothing_executes(
 
 
 def test_executing_a_queued_run_projects_it_once(
-    queued_settings, make_binding, events_target, writer
+    queued_settings, run_committed, make_binding, events_target, writer
 ):
     binding = make_binding(config=memory_config(batches=[[RECORD], [RECORD]]))
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    run_committed(binding, RunTrigger.INITIAL)
     make_projection(binding)
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    run_committed(binding, RunTrigger.SCHEDULED)
     queued = HANDED[0]
 
     first = projection_services.execute_projection_run(queued.id)
@@ -94,13 +106,13 @@ def test_executing_a_queued_run_projects_it_once(
 
 
 def test_the_sweeper_executes_a_run_the_queue_dropped(
-    queued_settings, make_binding, events_target, writer
+    queued_settings, run_committed, make_binding, events_target, writer
 ):
     second = {**RECORD, "id": "e2"}
     binding = make_binding(config=memory_config(batches=[[RECORD], [second]]))
     make_projection(binding)  # before any run: every load goes through the queue
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    run_committed(binding, RunTrigger.INITIAL)
+    run_committed(binding, RunTrigger.SCHEDULED)
     assert [r.status for r in HANDED] == [ProjectionRunStatus.QUEUED] * 2
 
     # Within the grace period the sweeper leaves them to the queue — and does
@@ -145,3 +157,59 @@ def test_beat_schedule_can_route_every_entry_to_one_queue():
     routed = beat_schedule(queue="connectors")
     assert {entry["options"]["queue"] for entry in routed.values()} == {"connectors"}
     assert set(routed) == set(plain)
+
+
+def test_a_run_a_killed_worker_left_running_is_healed_after_the_timeout(
+    connectors_settings, make_binding, events_target, writer
+):
+    """Counting RUNNING as in flight forever would lose its loads for good."""
+    binding = make_binding(config=memory_config(batches=[[RECORD]]))
+    make_projection(binding)
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    stuck = ProjectionRun.objects.get()
+    ProjectionRun.objects.filter(pk=stuck.pk).update(
+        status=ProjectionRunStatus.RUNNING,
+        finished_at=None,
+        started_at=timezone.now() - dt.timedelta(minutes=5),
+    )
+    assert projection_services.dispatch_pending_projections() == []  # still credible
+
+    ProjectionRun.objects.filter(pk=stuck.pk).update(
+        started_at=timezone.now() - dt.timedelta(days=1)
+    )
+    healed = projection_services.dispatch_pending_projections()
+    assert len(healed) == 1 and healed[0].status == ProjectionRunStatus.SUCCEEDED
+
+
+def test_two_executors_cannot_both_run_one_queued_run(
+    queued_settings, run_committed, make_binding, events_target, writer
+):
+    from django_connectors.projections import runner
+
+    binding = make_binding(config=memory_config(batches=[[RECORD], [RECORD]]))
+    run_committed(binding, RunTrigger.INITIAL)
+    make_projection(binding)
+    run_committed(binding, RunTrigger.SCHEDULED)
+    queued = HANDED[0]
+    stale_copy = ProjectionRun.objects.get(pk=queued.pk)  # a second process's read
+
+    first = runner.execute(queued)
+    assert first.status == ProjectionRunStatus.SUCCEEDED
+    second = runner.execute(stale_copy)  # the claim fails; nothing runs twice
+    assert second.status == ProjectionRunStatus.SUCCEEDED
+    assert second.records_written == first.records_written
+    assert len(writer.batches) == 1
+
+
+def test_dispatch_waits_for_the_transaction_to_commit(
+    queued_settings, django_capture_on_commit_callbacks, make_binding, events_target
+):
+    binding = make_binding(config=memory_config(batches=[[RECORD], [RECORD]]))
+    with django_capture_on_commit_callbacks(execute=True):
+        run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    make_projection(binding)
+    with django_capture_on_commit_callbacks(execute=True) as callbacks:
+        run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+        assert HANDED == []  # not yet: the row is not committed
+    assert len(callbacks) == 1
+    assert len(HANDED) == 1

@@ -2516,3 +2516,39 @@ def test_default_google_scopes_can_download_drive_content():
     from django_connectors.providers.google.auth import DEFAULT_SCOPES
 
     assert "https://www.googleapis.com/auth/drive.readonly" in DEFAULT_SCOPES
+
+
+def test_drive_a_change_to_the_root_folder_itself_is_not_a_move_out(
+    drive_server, drive_binding
+):
+    """The root's parent is never in scope; renaming it must not drop everything."""
+    api = drive_server(_tree())
+    api.files["R"]["parents"] = ["MYDRIVE"]
+    binding = drive_binding(folder_id="R")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.files["R"]["name"] = "Reports (renamed)"
+    api.change("R")
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert dict(_ids(binding)) == {"a": False, "b": False}
+    api.add("n", "n.pdf", parents=["R"])
+    api.change("n")
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert ("n", False) in _ids(binding)
+
+
+def test_drive_a_folder_moved_within_scope_keeps_its_files_when_the_old_parent_goes(
+    drive_server, drive_binding
+):
+    api = drive_server(_tree())
+    api.add("S", "Sibling", mimeType=FOLDER, parents=["R"])
+    api.add("T", "Old", mimeType=FOLDER, parents=["R"])
+    api.files["Y"]["parents"] = ["T"]
+    binding = drive_binding(folder_id="R")
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api.files["Y"]["parents"] = ["S"]
+    api.change("Y")  # moved within scope
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    api.files["T"]["trashed"] = True
+    api.change("T")  # the old parent goes; Y is no longer under it
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert dict(_ids(binding))["b"] is False

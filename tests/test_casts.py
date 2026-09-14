@@ -97,7 +97,7 @@ def test_float_strip():
 
 def test_numeric_options_leave_real_numbers_alone():
     assert _cast({"cast": "decimal", "strip": "1"}, 1234) == decimal.Decimal("1234")
-    assert _cast({"cast": "float", "strip": "."}, 1.5) == 1.5
+    assert _cast({"cast": "float", "strip": "$"}, 1.5) == 1.5
 
 
 # --- compile-time validation ----------------------------------------------
@@ -186,3 +186,17 @@ def test_timezone_never_relabels_a_landed_datetime():
     landed = dt.datetime(2024, 7, 3, 8, 0)  # naive, UTC by construction
     value = _cast({"cast": "datetime", "timezone": "Europe/London"}, landed)
     assert value == dt.datetime(2024, 7, 3, 8, 0, tzinfo=dt.UTC)
+
+
+def test_strip_may_not_remove_the_decimal_separator():
+    with pytest.raises(MappingValidationError, match="silently become"):
+        compile_mapping(
+            {
+                "f": {
+                    "source": "c",
+                    "cast": "decimal",
+                    "strip": ",",
+                    "decimal_separator": ",",
+                }
+            }
+        )

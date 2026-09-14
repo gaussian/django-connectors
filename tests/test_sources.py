@@ -1088,3 +1088,24 @@ def test_filesystem_conformance(source_settings, make_binding, tmp_path):
     binding = make_binding(source="files", config=files_config(directory))
     _assert_conformant("files", binding, ["events"])
     assert len(access.sample_rows(binding, "events", limit=10)) == 2
+
+
+def test_a_local_recursive_glob_is_accepted_at_save_and_lands(
+    source_settings, make_binding, tmp_path
+):
+    """The documented form: the split happens at the first glob segment."""
+    write_jsonl(tmp_path / "exports" / "a.jsonl", [{"id": "1"}])
+    write_jsonl(tmp_path / "exports" / "2024" / "b.jsonl", [{"id": "2"}])
+    assert filesystem_source.resolve_location(
+        "r", {"path": f"{tmp_path}/exports/**/*.jsonl"}
+    ) == (f"file://{tmp_path}/exports", "**/*.jsonl")
+    spec = {
+        "path": f"{tmp_path}/exports/**/*.jsonl",
+        "format": "jsonl",
+        "primary_key": "id",
+    }
+    binding = make_binding(source="files", config={"resources": {"events": spec}})
+    binding_services.validate_binding(binding)
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == "succeeded", run.error_message
+    assert _landed_ids(binding) == ["1", "2"]

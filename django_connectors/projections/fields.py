@@ -106,6 +106,11 @@ class NumberField(Field):
             raise ValueError("'strip' must be a string of characters to remove")
         if decimal_separator not in (".", ","):
             raise ValueError("'decimal_separator' must be '.' or ','")
+        if decimal_separator in strip:
+            raise ValueError(
+                f"'strip' removes {decimal_separator!r}, which is also the "
+                f"'decimal_separator'; '1,5' would silently become 15"
+            )
         self.strip = strip
         self.decimal_separator = decimal_separator
 
