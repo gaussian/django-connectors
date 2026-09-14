@@ -141,20 +141,50 @@ def sample_resource(projection_or_binding, resource=None, *, limit=None):
     return access.sample_rows(binding, resource, limit=limit)
 
 
-def run_projection(projection, *, source_run=None, load_ids=None, mode=None):
-    """Execute a Projection over a scope of landed loads."""
+def queue_projection(projection, *, source_run=None, load_ids=None, mode=None):
+    """Record a ProjectionRun over a scope of landed loads, without executing it."""
     mode = mode or ProjectionRunMode.INCREMENTAL
     if load_ids is None:
         load_ids = list(source_run.dlt_load_ids or []) if source_run else []
-
-    projection_run = ProjectionRun.objects.create(
+    return ProjectionRun.objects.create(
         projection=projection,
         source_run=source_run,
         mode=mode,
         projection_version=projection.version,
         load_ids=list(load_ids),
     )
+
+
+def run_projection(projection, *, source_run=None, load_ids=None, mode=None):
+    """Execute a Projection over a scope of landed loads."""
+    return projection_runner.execute(
+        queue_projection(
+            projection, source_run=source_run, load_ids=load_ids, mode=mode
+        )
+    )
+
+
+def execute_projection_run(projection_run_id):
+    """Execute a queued ProjectionRun by id — the target of a dispatch callable."""
+    projection_run = ProjectionRun.objects.select_related(
+        "projection__binding__connection"
+    ).get(pk=projection_run_id)
+    if projection_run.status != ProjectionRunStatus.QUEUED:
+        # Delivered twice, or already swept up: the row says what happened.
+        return projection_run
     return projection_runner.execute(projection_run)
+
+
+def dispatcher():
+    """The configured ``PROJECTION_DISPATCH`` callable, or None for inline."""
+    from django.utils.module_loading import import_string
+
+    from django_connectors.conf import conf
+
+    path = conf.PROJECTION_DISPATCH
+    if not path:
+        return None
+    return import_string(path) if isinstance(path, str) else path
 
 
 def replay_projection(projection):
@@ -180,28 +210,55 @@ def dispatch_after_run(run):
     """Queue incremental ProjectionRuns for the resources a Run touched.
 
     The low-latency path. `dispatch_pending_projections` is the safety net that
-    heals whatever this drops.
+    heals whatever this drops. With ``PROJECTION_DISPATCH`` unset the runs
+    execute here, inline, while the Binding's lease is held; with it set they
+    are recorded as QUEUED and handed to the configured callable.
     """
     if not run.dlt_load_ids:
         return []
+    dispatch = dispatcher()
     dispatched = []
     for projection in Projection.objects.filter(
         binding=run.binding, enabled=True, status=ProjectionStatus.ACTIVE
     ):
-        dispatched.append(
-            run_projection(projection, source_run=run, load_ids=run.dlt_load_ids)
+        projection_run = queue_projection(
+            projection, source_run=run, load_ids=run.dlt_load_ids
         )
+        if dispatch is None:
+            projection_run = projection_runner.execute(projection_run)
+        else:
+            # Handed to a queue. It runs after the Binding's lease is released,
+            # in whatever worker picks it up; the sweeper heals a dropped one.
+            dispatch(projection_run)
+        dispatched.append(projection_run)
     return dispatched
 
 
 def dispatch_pending_projections(*, lookback=None):
-    """Sweep every active Projection for landed loads it has not projected."""
+    """Sweep every active Projection for landed loads it has not projected.
+
+    Also the safety net for a dispatch queue: a run still QUEUED past
+    ``PROJECTION_QUEUE_GRACE`` is one the queue dropped, and is executed here
+    before the outstanding loads are computed — so it is not counted as
+    outstanding and re-queued a second time.
+    """
+    from django.utils import timezone
+
+    from django_connectors.conf import conf
+
+    stale = timezone.now() - conf.PROJECTION_QUEUE_GRACE
     dispatched = []
     for projection in Projection.objects.filter(
         enabled=True, status=ProjectionStatus.ACTIVE
     ).select_related("binding"):
         if projection.binding.status == BindingStatus.PURGING:
             continue
+        for dropped in ProjectionRun.objects.filter(
+            projection=projection,
+            status=ProjectionRunStatus.QUEUED,
+            created_at__lt=stale,
+        ).order_by("created_at"):
+            dispatched.append(projection_runner.execute(dropped))
         for projection_run in projection_runner.dispatch_pending(
             projection, lookback=lookback
         ):

@@ -369,9 +369,18 @@ def dispatch_pending(projection, *, lookback=None):
     ).order_by("created_at"):
         landed.extend(run.dlt_load_ids or [])
 
+    # Succeeded runs have projected their loads; queued and running ones hold
+    # theirs in flight. A queued run the queue dropped is executed by the
+    # sweeper once it is older than the grace period, *before* this is
+    # computed, so counting it here would only queue a duplicate.
     projected = set()
     for previous in ProjectionRun.objects.filter(
-        projection=projection, status=ProjectionRunStatus.SUCCEEDED
+        projection=projection,
+        status__in=(
+            ProjectionRunStatus.SUCCEEDED,
+            ProjectionRunStatus.QUEUED,
+            ProjectionRunStatus.RUNNING,
+        ),
     ):
         projected.update(previous.load_ids or [])
 

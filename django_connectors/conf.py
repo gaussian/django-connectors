@@ -60,6 +60,17 @@ DEFAULTS: dict[str, Any] = {
     "DEFAULT_POLL_INTERVAL": dt.timedelta(minutes=15),
     # --- projection --------------------------------------------------------
     "PROJECTION_BATCH_SIZE": 1000,
+    # How a successful Run hands its ProjectionRuns on. None runs them inline,
+    # in the ingestion worker, while the Binding's lease is still held — so a
+    # slow writer counts against run_timeout. A dotted path to a
+    # callable(projection_run) enqueues instead; the celery extra ships
+    # "django_connectors.scheduler.celery.enqueue_projection_run". The sweeper
+    # heals whatever a queue drops, exactly as it heals a dropped inline call.
+    "PROJECTION_DISPATCH": None,
+    # A dispatched ProjectionRun still QUEUED after this long is one the queue
+    # dropped; the sweeper executes it itself. Long enough that a busy queue is
+    # not second-guessed, short enough that a lost message is not a day.
+    "PROJECTION_QUEUE_GRACE": dt.timedelta(minutes=10),
     # How far back the projection sweeper looks for un-projected loads. This is
     # the auto-heal horizon: a ProjectionRun that fails and is never retried
     # within this window is never picked up again.
