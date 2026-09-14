@@ -23,9 +23,9 @@ jobs:
           cache-dependency-glob: uv.lock
           python-version: '3.12'
       - name: Ruff lint
-        run: uv run --all-extras ruff check django_connectors/ tests/
+        run: uv run --all-extras ruff check django_connectors/ tests/ example/
       - name: Ruff format check
-        run: uv run --all-extras ruff format --check django_connectors/ tests/
+        run: uv run --all-extras ruff format --check django_connectors/ tests/ example/
       - name: Compile check
         run: uv run --all-extras python -m compileall -q django_connectors/
 
@@ -46,16 +46,120 @@ jobs:
       - name: Run tests
         run: uv run --all-extras pytest
 
+  # `--all-extras` installs every extra, so it never exercises the code path the
+  # whole optional-dependency design rests on: an extra being ABSENT. This job is
+  # the only thing that proves a bare `pip install django-connectors` works.
+  # Plain `uv run` still includes the `dev` group, so pytest is present.
+  test-minimal:
+    name: test-minimal
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: '3.12'
+      - name: Run tests with no extras installed
+        run: uv run pytest
+
+  # Landing defects that sqlite cannot express, against every backend the
+  # library supports. sqlite reports a 9999-character identifier limit where
+  # PostgreSQL truncates at 63, has no real concurrency, and returns timestamps
+  # as strings — so silent load loss under concurrent pipelines, identifier
+  # truncation and dialect type round-trips are all invisible without these.
+  test-databases:
+    name: test-databases
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: connectors
+          MYSQL_DATABASE: connectors_landing
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pconnectors"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: connectors
+          POSTGRES_DB: connectors_landing
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: '3.12'
+      - name: Run server-backed tests
+        env:
+          DJANGO_CONNECTORS_TEST_MYSQL_URL: mysql+pymysql://root:connectors@127.0.0.1:3306/connectors_landing
+          DJANGO_CONNECTORS_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:connectors@127.0.0.1:5432/connectors_landing
+        run: uv run --all-extras pytest -m serverdb
+
+  # The example project is the only test of the integration story as a host
+  # actually experiences it: autodiscovered connectors.py, a real target
+  # registration, migrations, and a full source -> landing -> projection ->
+  # host-model flow. Unit tests exercise the library from inside; this does not.
+  example-smoke:
+    name: example-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: '3.12'
+      # `manage.py demo` asserts its own outcome and exits non-zero when the
+      # Run, the ProjectionRun or the resulting host rows are not what
+      # example/README.md documents — `run_binding` records a failure as a Run
+      # status rather than raising, so a demo that only printed the status
+      # would exit 0 on almost every ingestion regression.
+      - name: Check, migrate and run the demo
+        working-directory: example
+        # `pipefail` matters: the default shell here is `bash -e`, under which
+        # a command piped into anything reports the *pipe's* status, so the
+        # demo's exit code would be discarded by the `tee` below.
+        shell: bash
+        run: |
+          uv run --all-extras --project .. python manage.py check --fail-level WARNING
+          uv run --all-extras --project .. python manage.py migrate --noinput
+          uv run --all-extras --project .. python manage.py demo | tee "$RUNNER_TEMP/demo.out"
+          grep -q '^demo ok$' "$RUNNER_TEMP/demo.out"
+          # The demo is documented as idempotent, and a second run is the only
+          # thing that exercises the already-created path a host meets on every
+          # deploy after the first.
+          uv run --all-extras --project .. python manage.py demo
+
   # Aggregate gate — the ONLY check the branch ruleset requires. Passes only if
   # every needed job succeeded. `if: always()` is required so a failed/skipped
   # upstream job can't let this be skipped (which GitHub treats as passing).
   # Add checks or matrix versions freely; the required-check name stays "ci".
   ci:
     name: ci
-    needs: [lint, test]
+    needs: [lint, test, test-minimal, test-databases, example-smoke]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: All required checks passed
         run: |
-          [ "${{ needs.lint.result }}" = "success" ] && [ "${{ needs.test.result }}" = "success" ] || { echo "a required check did not succeed"; exit 1; }
+          for r in "${{ needs.lint.result }}" \
+                   "${{ needs.test.result }}" \
+                   "${{ needs.test-minimal.result }}" \
+                   "${{ needs.test-databases.result }}" \
+                   "${{ needs.example-smoke.result }}"; do
+            [ "$r" = "success" ] || { echo "a required check did not succeed"; exit 1; }
+          done

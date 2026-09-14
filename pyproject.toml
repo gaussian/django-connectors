@@ -1,23 +1,53 @@
 [build-system]
-requires = [
-  "setuptools>=61.0",
-  "wheel"
-]
+# setuptools>=77, not 61: `license = "MIT"` below is a PEP 639 SPDX string, and
+# setuptools only began accepting one there. An older builder honouring a 61
+# floor rejects it as an invalid license table — a failure that never appears
+# locally, only in whatever environment builds the sdist.
+# `wheel` is deliberately absent; setuptools.build_meta has not needed it for
+# years.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-connectors"
-version = "0.0.1"
+version = "0.1.0"
 description = "A Django framework for connecting applications to third-party systems, with support for authentication, polling, webhooks, incremental sync, and data ingestion via dlt."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
-  "Django>=5.0",
+  # `dlt[sqlalchemy]` — not bare `dlt`. The sqlalchemy destination is the only
+  # route to a MySQL landing database, and it is not part of dlt's core install:
+  # bare `dlt` cannot construct a landing destination at all.
+  "Django>=6.0",
+  "dlt[sqlalchemy]>=1.30",
 ]
 
 [project.optional-dependencies]
-dlt = ["dlt>=1.0"]
+# Installing an extra never enables behaviour on its own — the corresponding
+# backend/source must also be named in the DJANGO_CONNECTORS setting.
+# Landing-database drivers. MySQL and PostgreSQL are both supported and both
+# covered by the `serverdb` CI tier; nothing in the landing layer is
+# dialect-specific.
+mysql = ["PyMySQL>=1.1"]
+postgres = ["psycopg2-binary>=2.9"]
+drf = ["djangorestframework>=3.15"]
+celery = ["celery>=5.4"]
+allauth = ["django-allauth>=65.0"]
+secrets = ["cryptography>=43.0"]
+sql = ["dlt[sql-database]>=1.30"]
+csv = ["pandas>=2.2"]
+parquet = ["dlt[parquet]>=1.30"]
+s3 = ["dlt[s3]>=1.30"]
+gs = ["dlt[gs]>=1.30"]
+az = ["dlt[az]>=1.30"]
+# Provider SDKs are pulled in for *credential acquisition only* — never for data
+# access. Token signing (service-account JWTs, Entra client assertions) is the
+# one thing we must not hand-roll; the API calls themselves go through dlt's
+# rest_client, which keeps the sources synchronous and mockable. This is why
+# msgraph-sdk is absent: it is async-first and dlt resources are sync generators.
+google = ["google-auth>=2.35"]
+microsoft = ["azure-identity>=1.19", "openpyxl>=3.1"]
 
 [project.urls]
 Homepage = "https://github.com/gaussian/django-connectors"
@@ -27,6 +57,7 @@ Issues = "https://github.com/gaussian/django-connectors/issues"
 dev = [
   "pytest>=8.0",
   "pytest-django>=4.9",
+  "pytest-recording>=0.13",
   "ruff>=0.10",
 ]
 
@@ -39,14 +70,58 @@ testpaths = ["tests"]
 # manage.py for pytest-django to locate the project from.
 pythonpath = ["."]
 DJANGO_SETTINGS_MODULE = "tests.settings"
+markers = [
+  # Landing defects that sqlite cannot express — silent load loss under
+  # concurrent pipelines, identifier truncation (PostgreSQL truncates at 63
+  # where sqlite reports 9999), unindexed merge cost, dialect-specific type
+  # round-trips. Parameterized over every configured backend; unconfigured ones
+  # skip. Everything unmarked must pass on sqlite with no docker.
+  "serverdb: requires a real database server (set DJANGO_CONNECTORS_TEST_MYSQL_URL and/or _POSTGRES_URL)",
+  # Replays a recorded provider exchange from tests/cassettes/. Skips when no
+  # cassette exists; records with --record-mode=rewrite and the
+  # DJANGO_CONNECTORS_RECORD_* variables. See tests/test_recorded.py.
+  "recorded: replays a recorded provider exchange (record with --record-mode=rewrite)",
+]
+
+[tool.ruff]
+target-version = "py312"
 
 [tool.ruff.lint]
-# Pin to the classic real-errors rule set (pyflakes + core pycodestyle) rather
-# than ruff 0.16+'s newer, broader default which pulls in style/modernization
-# rules (UP/SIM/I/…). Two rules excluded:
-#   F401 (imported-but-unused): fires on side-effect imports and re-exports that
-#         are load-bearing despite looking unused. F821 (undefined name) still
-#         catches genuinely-missing imports, so correctness is unaffected.
-#   F841 (unused local): the codebase has intentional demo assignments.
-select = ["E4", "E7", "E9", "F"]
-ignore = ["F401", "F841"]
+# This repo started empty, so there is no legacy code to grandfather in — the
+# rule set is deliberately broader than a "real errors only" pin. Keep it that
+# way: it is far cheaper to hold the line from commit one than to adopt these
+# rules later across a grown codebase.
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # isort — import ordering
+  "UP",       # pyupgrade — modern syntax for the target-version
+  "B",        # flake8-bugbear — likely bugs and footguns
+  "C4",       # flake8-comprehensions
+  "SIM",      # flake8-simplify
+  "DJ",       # flake8-django — Django-specific correctness
+  "RUF",      # ruff-specific rules
+]
+ignore = [
+  # Line length is the formatter's job; `ruff format` wraps what it can and
+  # E501 would then only fire on things it cannot split (long URLs, strings).
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exports in package __init__ files are load-bearing despite looking unused.
+# F821 (undefined name) still catches genuinely-missing imports.
+"__init__.py" = ["F401"]
+# Test settings modules are flat namespaces of constants by design.
+"tests/settings.py" = ["F403", "F405"]
+# Django generates `dependencies`/`operations` as mutable class attributes and
+# there is no way to make it emit tuples. Everything else still applies —
+# generated migrations are run through `ruff check --fix` + `ruff format`, which
+# is semantically inert (`makemigrations --check` still reports no changes).
+"django_connectors/migrations/*.py" = ["RUF012"]
+# The example project is linted too — sample code is copied verbatim — but
+# its generated migrations have the same constraint.
+"example/*/migrations/*.py" = ["RUF012"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["django_connectors"]
