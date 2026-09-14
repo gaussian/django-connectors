@@ -116,7 +116,7 @@ class ConnectionViewSet(BaseViewSet):
                     limit=params.get("limit"),
                 )
             )
-        except (ConnectorError, ValueError) as exc:
+        except ConnectorError as exc:
             return _error(exc)
 
 

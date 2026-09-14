@@ -56,7 +56,7 @@ from django_connectors.landing.naming import (
     RUN_ID_COLUMN,
     landing_table_name,
 )
-from django_connectors.sources.reshape import survives, unpivot, validate_unpivot
+from django_connectors.sources.reshape import unpivot
 
 # Pinned types for the injected columns. `precision` matters: without it dlt
 # maps str to MySQL TEXT, which cannot be indexed without a prefix length
@@ -177,14 +177,6 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
 
     incremental = _build_incremental(source_definition, resource.name, binding)
     if incremental is not None:
-        cursor = str(getattr(incremental, "cursor_path", "") or "")
-        if reshape and cursor and not survives(reshape, cursor):
-            raise SourceError(
-                f"resource {resource.name!r}: the incremental cursor "
-                f"{cursor!r} does not survive the unpivot (it is consumed, or "
-                f"not in 'keep'), so it would be NULL on every landed row. Keep "
-                f"it, or choose a cursor the unpivot leaves alone."
-            )
         hints["incremental"] = incremental
         dedup_column = _dedup_sort_column(resource, incremental, write_disposition)
         if dedup_column:
@@ -203,26 +195,25 @@ def _instrument_resource(resource, *, binding, run, source_definition=None):
 def _reshape_for(source_definition, resource_name, binding, primary_key):
     """The validated unpivot for a resource, or None.
 
-    Validated *here* as well as at save time: a Binding written through the
-    ORM or a fixture never met `validate_binding`, and a bare KeyError from
-    the middle of a Run names neither the field nor the cause.
+    Validated *here* as well as at save time, by the same method: a Binding
+    written through the ORM or a fixture never met `validate_binding`, and a
+    bare KeyError from the middle of a Run names neither the field nor the
+    cause.
     """
     if source_definition is None:
         return None
     spec = source_definition.reshape_for(resource_name, binding)
     if not spec:
         return None
-    if getattr(source_definition, "emits_tombstones", False):
-        raise SourceError(
-            f"resource {resource_name!r}: source {source_definition.key!r} "
-            f"emits tombstones, which cannot be unpivoted — a tombstone carries "
-            f"the case identity only, and one case-level deletion cannot become "
-            f"the per-stage deletes the landed rows would need. Deletions would "
-            f"be lost silently, so the combination is refused."
-        )
+    cursor = (source_definition.incremental_for(resource_name, binding) or {}).get(
+        "cursor_path"
+    )
     try:
-        return validate_unpivot(
-            spec, where=f"{resource_name}.unpivot", primary_key=primary_key
+        return source_definition.validate_reshape(
+            spec,
+            where=f"{resource_name}.unpivot",
+            primary_key=primary_key,
+            cursor=cursor,
         )
     except ConfigurationError as exc:
         raise SourceError(str(exc)) from exc

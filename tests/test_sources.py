@@ -842,31 +842,6 @@ def test_s3_without_its_driver_names_the_extra_at_save_time(
         binding_services.validate_binding(_s3_binding(make_binding))
 
 
-@pytest.mark.parametrize("scheme", ["ftp", "http", "memory"])
-def test_unknown_schemes_are_still_refused(source_settings, make_binding, scheme):
-    binding = make_binding(
-        source="files",
-        config={
-            "resources": {
-                "events": {"bucket_url": f"{scheme}://x/y", "primary_key": "id"}
-            }
-        },
-    )
-    with pytest.raises(ConfigurationError, match="not supported"):
-        binding_services.validate_binding(binding)
-
-
-def test_a_bucket_url_without_a_bucket_is_refused(source_settings, make_binding):
-    binding = make_binding(
-        source="files",
-        config={
-            "resources": {"events": {"bucket_url": "s3:///prefix", "primary_key": "id"}}
-        },
-    )
-    with pytest.raises(ConfigurationError, match="names no bucket"):
-        binding_services.validate_binding(binding)
-
-
 def test_s3_credentials_are_built_from_the_boto_names():
     from dlt.common.configuration.specs import AwsCredentials
 
@@ -902,50 +877,11 @@ def test_s3_refuses_a_credential_it_cannot_use(credentials):
         filesystem_source.bucket_credentials("s3://b/x", credentials)
 
 
-@pytest.mark.parametrize("path", ["orders.csv", "*.csv"])
-def test_a_bare_name_is_relative_and_refused(source_settings, make_binding, path):
-    binding = make_binding(
-        source="files",
-        config={"resources": {"events": {"path": path, "primary_key": "id"}}},
-    )
-    with pytest.raises(ConfigurationError, match="absolute"):
-        binding_services.validate_binding(binding)
-
-
 def test_a_dotted_bucket_name_is_a_bucket_not_a_file():
     bucket_url, file_glob = filesystem_source.resolve_location(
         "r", {"path": "s3://my.bucket"}
     )
     assert (bucket_url, file_glob) == ("s3://my.bucket", "*")
-
-
-def test_a_dotted_local_directory_is_checked_on_disk(
-    source_settings, make_binding, tmp_path
-):
-    (tmp_path / "release.v2").mkdir()
-    binding = make_binding(
-        source="files",
-        config={
-            "resources": {
-                "events": {"path": f"{tmp_path}/release.v2", "primary_key": "id"}
-            }
-        },
-    )
-    with pytest.raises(ConfigurationError, match="is a directory"):
-        binding_services.validate_binding(binding)
-
-
-def test_a_missing_local_directory_is_refused_at_save(
-    source_settings, make_binding, tmp_path
-):
-    binding = make_binding(
-        source="files",
-        config={
-            "resources": {"events": {"path": f"{tmp_path}/nope", "primary_key": "id"}}
-        },
-    )
-    with pytest.raises(ConfigurationError, match="not a directory"):
-        binding_services.validate_binding(binding)
 
 
 @pytest.mark.parametrize("credentials", [None, {"key": "x"}, "token"])
@@ -1109,3 +1045,32 @@ def test_a_local_recursive_glob_is_accepted_at_save_and_lands(
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     assert run.status == "succeeded", run.error_message
     assert _landed_ids(binding) == ["1", "2"]
+
+
+@pytest.mark.parametrize(
+    "spec, message",
+    [
+        pytest.param({"bucket_url": "ftp://x/y"}, "not supported", id="ftp"),
+        pytest.param({"bucket_url": "http://x/y"}, "not supported", id="http"),
+        pytest.param(
+            {"bucket_url": "memory://x/y"}, "not supported", id="memory-not-in-prod"
+        ),
+        pytest.param({"bucket_url": "s3:///prefix"}, "names no bucket", id="no-bucket"),
+        pytest.param({"path": "orders.csv"}, "absolute", id="bare-name-is-relative"),
+        pytest.param({"path": "*.csv"}, "absolute", id="bare-glob-is-relative"),
+        pytest.param(
+            {"path": "{tmp}/release.v2"}, "is a directory", id="dotted-directory"
+        ),
+        pytest.param({"path": "{tmp}/nope"}, "not a directory", id="missing-directory"),
+    ],
+)
+def test_files_bindings_refused_at_save_time(
+    source_settings, make_binding, tmp_path, spec, message
+):
+    (tmp_path / "release.v2").mkdir()
+    spec = {k: v.replace("{tmp}", str(tmp_path)) for k, v in spec.items()}
+    binding = make_binding(
+        source="files", config={"resources": {"events": {**spec, "primary_key": "id"}}}
+    )
+    with pytest.raises(ConfigurationError, match=message):
+        binding_services.validate_binding(binding)

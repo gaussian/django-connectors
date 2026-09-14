@@ -137,8 +137,6 @@ class OwnerScopedQuerysetMixin:
         )
 
     def get_serializer_context(self):
-        # The serializer's writable relations scope on this, not on the setting,
-        # so an overridden get_owner() governs writes as well as reads.
         context = super().get_serializer_context()
         context[OWNER_CONTEXT_KEY] = self.resolved_owner()
         return context

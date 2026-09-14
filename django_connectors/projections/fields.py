@@ -113,11 +113,12 @@ class NumberField(Field):
             )
         self.strip = strip
         self.decimal_separator = decimal_separator
+        self._strip_table = str.maketrans("", "", strip) if strip else None
 
     def _text(self, value):
         text = str(value).strip()
-        if self.strip:
-            text = text.translate(str.maketrans("", "", self.strip))
+        if self._strip_table:
+            text = text.translate(self._strip_table)
         if self.decimal_separator == ",":
             text = text.replace(",", ".")
         return text
@@ -299,9 +300,6 @@ CAST_TYPES = {
     "date": DateField,
     "json": JSONField,
 }
-
-#: The plain casts, for callers that need no options.
-CASTS = {name: cls() for name, cls in CAST_TYPES.items()}
 
 
 def make_cast(name, options=None):

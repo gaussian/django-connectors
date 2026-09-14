@@ -13,6 +13,8 @@ package because it costs ~0.6s per interpreter start.
 
 from typing import ClassVar
 
+from django.core import signing
+
 from django_connectors.exceptions import ConfigurationError, SourceError
 
 
@@ -94,8 +96,37 @@ class SourceDefinition:
         the landing layer applies it — before the tenant metadata is stamped,
         and with the merge key extended by the new name column so the rows one
         wide row becomes do not merge back into one. See ``sources.reshape``.
+        The default reads ``resources[name].unpivot``, the shape memory, rest
+        and filesystem share; a source with another config shape overrides.
         """
-        return None
+        return self.resource_spec(binding, resource_name).get("unpivot")
+
+    def validate_reshape(self, spec, *, where="unpivot", primary_key=(), cursor=None):
+        """Every rule an ``unpivot`` must satisfy on *this* source, in one place.
+
+        Called by a source's ``validate_config`` with the key and cursor it
+        already knows, and again by the landing layer before the reshape is
+        applied — so a Binding written past ``validate_binding`` meets the
+        same rules, and the three of them (tombstones, key survival, cursor
+        survival) cannot drift between save time and run time.
+        """
+        from django_connectors.sources.reshape import survives, validate_unpivot
+
+        spec = validate_unpivot(spec, where=where, primary_key=primary_key)
+        if self.emits_tombstones:
+            raise ConfigurationError(
+                f"{where}: source {self.key!r} emits tombstones, which cannot be "
+                f"unpivoted — a tombstone carries the case identity only, and one "
+                f"case-level deletion cannot become the per-stage deletes the landed "
+                f"rows would need. Deletions would be lost silently."
+            )
+        if cursor and not survives(spec, cursor):
+            raise ConfigurationError(
+                f"{where}: the incremental cursor {cursor!r} does not survive the "
+                f"unpivot (it is consumed, or not in 'keep'), so it would be NULL on "
+                f"every landed row. Keep it, or choose a cursor the unpivot leaves alone."
+            )
+        return spec
 
     def validate_config(self, config):
         """Raise ``ConfigurationError`` if `config` is unusable.
@@ -220,14 +251,10 @@ def sign_cursor(value, *, scope):
     tenant's token. Signing it proves it came from the provider's own response
     to *this* scope, and turns it back into what the provider gave us.
     """
-    from django.core import signing
-
     return signing.dumps(value, salt=f"django_connectors.discover:{scope}")
 
 
 def unsign_cursor(cursor, *, scope):
-    from django.core import signing
-
     try:
         return signing.loads(cursor, salt=f"django_connectors.discover:{scope}")
     except signing.BadSignature:
@@ -260,3 +287,18 @@ def read_capped(response, *, max_bytes, what, limit_hint=""):
             )
         chunks.append(chunk)
     return b"".join(chunks), response.headers.get("Content-Type")
+
+
+def name_matches(name, glob):
+    """Case-insensitive glob on a file name, because the providers are.
+
+    ``fnmatch.fnmatch`` follows the *host* filesystem's rules, so on Linux
+    ``*.xlsx`` silently misses ``Budget.XLSX`` while on macOS it matches — a
+    Binding that works on a laptop and drops half the documents in
+    production. SharePoint, OneDrive and Drive all compare names
+    case-insensitively, so the fold is explicit rather than inherited from
+    wherever the worker runs.
+    """
+    import fnmatch
+
+    return fnmatch.fnmatchcase((name or "").lower(), glob.lower())

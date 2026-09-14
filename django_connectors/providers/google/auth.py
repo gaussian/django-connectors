@@ -316,7 +316,9 @@ def google_client(*, base_url, credentials):
     return RESTClient(base_url=base_url, session=session, auth=authorize)
 
 
-def google_request(client, path, *, params=None, method="GET", json_body=None):
+def google_request(
+    client, path, *, params=None, method="GET", json_body=None, stream=False
+):
     """One request, with throttling absorbed. Returns the raw ``Response``.
 
     Nothing is raised for an error status: callers need to see a 404 before it
@@ -327,7 +329,7 @@ def google_request(client, path, *, params=None, method="GET", json_body=None):
     for attempt in range(1, MAX_THROTTLE_ATTEMPTS + 1):
         try:
             response = client.request(
-                path, method=method, params=params, json=json_body
+                path, method=method, params=params, json=json_body, stream=stream
             )
         except Exception as exc:
             # dlt's session already retried transport failures; reaching here

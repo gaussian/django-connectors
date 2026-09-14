@@ -17,7 +17,6 @@ pytest.importorskip("rest_framework")
 
 from rest_framework import viewsets
 from rest_framework.generics import GenericAPIView
-from rest_framework.test import APIClient
 
 from django_connectors.api import views as api_views
 from django_connectors.api.scoping import OwnerScopedQuerysetMixin
@@ -59,20 +58,6 @@ def reset_owner():
     CURRENT_OWNER["object_id"] = "1"
     yield
     CURRENT_OWNER["object_id"] = "1"
-
-
-@pytest.fixture
-def client_for():
-    from django.contrib.auth.models import User
-
-    def factory(username=None):
-        username = username or f"apiuser{User.objects.count()}"
-        user = User.objects.create_user(username=username, password="x")
-        client = APIClient()
-        client.force_authenticate(user=user)
-        return client
-
-    return factory
 
 
 # --- structural guarantees -------------------------------------------------

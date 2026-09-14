@@ -23,7 +23,6 @@ pytest.importorskip("rest_framework")
 
 from rest_framework.permissions import AllowAny, BasePermission, IsAuthenticated
 from rest_framework.routers import DefaultRouter
-from rest_framework.test import APIClient
 
 from django_connectors.api import views as api_views
 from django_connectors.models import Binding, Connection
@@ -96,43 +95,38 @@ def composed_settings(connectors_settings, settings):
     return settings
 
 
-@pytest.fixture
-def client_as():
-    from django.contrib.auth.models import User
-
-    def factory(username):
-        user, _ = User.objects.get_or_create(username=username)
-        client = APIClient()
-        client.force_authenticate(user=user)
-        return client
-
-    return factory
-
-
 def _url(name, **kwargs):
     return reverse(f"host:{name}", kwargs=kwargs)
+
+
+def _create_connection(client, **extra):
+    return client.post(
+        _url("connection-list"),
+        {"provider": "memory", "auth_backend": "static", "metadata": {}, **extra},
+        format="json",
+    )
 
 
 # --- reads -----------------------------------------------------------------
 
 
 def test_host_owner_scopes_reads_with_no_setting_configured(
-    composed_settings, make_connection, client_as
+    composed_settings, make_connection, client_for
 ):
     mine = make_connection(owner_id="1")
     make_connection(owner_id="2")
 
-    response = client_as("1").get(_url("connection-list"))
+    response = client_for("1").get(_url("connection-list"))
 
     assert response.status_code == 200
     assert [row["id"] for row in response.data] == [str(mine.id)]
 
 
 def test_a_host_owner_of_none_sees_nothing(
-    composed_settings, make_connection, client_as
+    composed_settings, make_connection, client_for
 ):
     make_connection(owner_id="1")
-    response = client_as("nobody").get(_url("connection-list"))
+    response = client_for("nobody").get(_url("connection-list"))
     assert response.status_code == 200
     assert response.data == []
 
@@ -141,42 +135,25 @@ def test_a_host_owner_of_none_sees_nothing(
 
 
 def test_created_connection_is_stamped_with_the_host_owner(
-    composed_settings, client_as
+    composed_settings, client_for
 ):
     """Before this, POST /connections/ was an IntegrityError — a 500."""
-    response = client_as("2").post(
-        _url("connection-list"),
-        {"provider": "memory", "auth_backend": "static", "metadata": {}},
-        format="json",
-    )
+    response = _create_connection(client_for("2"))
 
     assert response.status_code == 201, response.data
     connection = Connection.objects.get(pk=response.data["id"])
     assert connection.owner_object_id == "2"
 
 
-def test_a_client_cannot_choose_its_own_owner(composed_settings, client_as):
+def test_a_client_cannot_choose_its_own_owner(composed_settings, client_for):
     """The owner columns are absent from the serializer, so they are ignored."""
-    response = client_as("2").post(
-        _url("connection-list"),
-        {
-            "provider": "memory",
-            "auth_backend": "static",
-            "metadata": {},
-            "owner_object_id": "1",
-        },
-        format="json",
-    )
+    response = _create_connection(client_for("2"), owner_object_id="1")
     assert response.status_code == 201
     assert Connection.objects.get(pk=response.data["id"]).owner_object_id == "2"
 
 
-def test_no_owner_means_no_create_not_a_500(composed_settings, client_as):
-    response = client_as("nobody").post(
-        _url("connection-list"),
-        {"provider": "memory", "auth_backend": "static", "metadata": {}},
-        format="json",
-    )
+def test_no_owner_means_no_create_not_a_500(composed_settings, client_for):
+    response = _create_connection(client_for("nobody"))
     assert response.status_code == 403
     assert Connection.objects.count() == 0
 
@@ -185,12 +162,12 @@ def test_no_owner_means_no_create_not_a_500(composed_settings, client_as):
 
 
 def test_writable_relations_scope_on_the_host_owner(
-    composed_settings, make_connection, client_as
+    composed_settings, make_connection, client_for
 ):
     """User 2 cannot attach a Binding to user 1's Connection, and can to their own."""
     victim = make_connection(owner_id="1")
     own = make_connection(owner_id="2")
-    client = client_as("2")
+    client = client_for("2")
 
     stolen = client.post(
         _url("binding-list"),
@@ -211,10 +188,10 @@ def test_writable_relations_scope_on_the_host_owner(
 
 
 def test_reads_and_writes_agree_when_the_host_owner_is_none(
-    composed_settings, make_connection, client_as
+    composed_settings, make_connection, client_for
 ):
     own = make_connection(owner_id="nobody")
-    response = client_as("nobody").post(
+    response = client_for("nobody").post(
         _url("binding-list"),
         {"connection": str(own.id), "source": "memory", "config": VALID_CONFIG},
         format="json",
@@ -228,17 +205,19 @@ def test_reads_and_writes_agree_when_the_host_owner_is_none(
 
 
 def test_subclass_permission_classes_win_over_the_unset_setting(
-    composed_settings, make_connection, client_as
+    composed_settings, make_connection, client_for
 ):
     """With the setting unset the library default is DenyAll; the subclass wins."""
     make_connection(owner_id="1")
     make_connection(owner_id="2")
 
-    assert client_as("1").get(_url("gated-list")).status_code == 200
-    assert client_as("2").get(_url("gated-list")).status_code == 403
+    assert client_for("1").get(_url("gated-list")).status_code == 200
+    assert client_for("2").get(_url("gated-list")).status_code == 403
 
 
 def test_metadata_viewsets_honour_subclass_permissions(composed_settings):
+    from rest_framework.test import APIClient
+
     response = APIClient().get(_url("target-list"))
     assert response.status_code == 200
     assert isinstance(response.data, list)

@@ -967,7 +967,7 @@ def test_identity_is_coerced_by_the_declared_target_field_on_both_paths(
 
 @pytest.mark.parametrize("cast", [["datetime"], {}, {"name": "datetime"}])
 def test_a_non_string_cast_is_a_validation_error_not_a_type_error(cast):
-    """`cast not in CASTS` hashes the value: a list raised TypeError, i.e. a 500."""
+    """A dict lookup hashes the value: a list raised TypeError, i.e. a 500."""
     with pytest.raises(MappingValidationError, match="unknown cast"):
         compile_mapping({"a": {"source": "x", "cast": cast}})
 

@@ -64,9 +64,9 @@ from django_connectors.providers.google.drive import (
     SPREADSHEET_MIME,
     assert_drive_id,
     list_drive,
+    parse_drive_path,
 )
 from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
-from django_connectors.sources.reshape import validate_unpivot
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +204,7 @@ class GoogleSheetsSource(SourceDefinition):
             ):
                 raise ConfigurationError(f"ranges.{name}.key_column must be a string")
             if spec["unpivot"] is not None:
-                validate_unpivot(
+                self.validate_reshape(
                     spec["unpivot"],
                     where=f"ranges.{name}.unpivot",
                     primary_key=spec["key_column"] or (),
@@ -366,18 +366,10 @@ class GoogleSheetsSource(SourceDefinition):
         about what it is, and a UI must be able to hand a ``path`` back without
         knowing. ``cursor`` is Drive's own ``nextPageToken``.
         """
-        kind, _, target = (path or "").partition("/")
-        if kind == "spreadsheet" and target:
+        kind, target = parse_drive_path(path, kinds=("folder", "spreadsheet"))
+        if kind == "spreadsheet":
             return self._discover_tabs(credentials, target, query, cursor, limit)
-        if kind == "folder" and target:
-            parent = target
-        elif not path:
-            parent = None
-        else:
-            raise ConfigurationError(
-                f"google_sheets discovery path must be 'folder/<id>' or "
-                f"'spreadsheet/<id>', got {path!r}."
-            )
+        parent = target
         return self._discover_drive(credentials, parent, query, cursor, limit)
 
     def _discover_drive(self, credentials, parent, query, cursor, limit):

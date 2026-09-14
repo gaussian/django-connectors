@@ -49,7 +49,11 @@ from django_connectors.landing.naming import (
     is_internal_column,
 )
 from django_connectors.providers.google import auth as google_auth
-from django_connectors.providers.google.drive import GoogleDriveSource
+from django_connectors.providers.google.drive import (
+    FOLDER_MIME,
+    SPREADSHEET_MIME,
+    GoogleDriveSource,
+)
 from django_connectors.providers.google.gmail import GmailSource, message_record
 from django_connectors.providers.google.sheets import (
     GoogleSheetsSource,
@@ -362,6 +366,32 @@ class FakeGmail(_FakeApi):
         return _json(start_response, payload)
 
 
+def _drive_query_page(rows, query, page_size):
+    """A small model of Drive's query language over dict rows, paged by offset.
+
+    Honours every `'x' in parents` clause (the cold walk asks for several at
+    once), `mimeType = '...'` alternatives, `name contains`, and `trashed`.
+    """
+    q = query.get("q", [""])[0]
+    parents = set(re.findall(r"'([^']+)' in parents", q))
+    needle = re.search(r"name contains '([^']*)'", q)
+    needle = needle.group(1).lower() if needle else None
+    types = set(re.findall(r"mimeType = '([^']+)'", q))
+    rows = [
+        e
+        for e in rows
+        if not e.get("trashed")
+        and (not parents or parents & set(e.get("parents") or ()))
+        and (not types or e["mimeType"] in types)
+        and (needle is None or needle in e["name"].lower())
+    ]
+    start = int(query.get("pageToken", ["0"])[0])
+    payload = {"files": rows[start : start + page_size]}
+    if start + page_size < len(rows):
+        payload["nextPageToken"] = str(start + page_size)
+    return payload
+
+
 class FakeSheets(_FakeApi):
     """Sheets ``values.batchGet`` and ``spreadsheets.get``, plus Drive's file."""
 
@@ -402,26 +432,19 @@ class FakeSheets(_FakeApi):
         )
 
     def _list_files(self, start_response, query):
-        """A small model of Drive's query language: parents, mimeType, name."""
-        q = query.get("q", [""])[0]
-        parent = re.search(r"'([^']+)' in parents", q)
-        parent = parent.group(1) if parent else None
-        needle = re.search(r"name contains '([^']*)'", q)
-        needle = needle.group(1).lower() if needle else None
-        allowed_types = set(re.findall(r"mimeType = '([^']+)'", q))
         rows = [
-            {"id": i, "name": n, "mimeType": m, "modifiedTime": self.modified_time}
-            for i, n, m, parent_id in self.drive_files
-            if (parent is None or parent_id == parent)
-            and (not allowed_types or m in allowed_types)
-            and (needle is None or needle in n.lower())
+            {
+                "id": i,
+                "name": n,
+                "mimeType": m,
+                "parents": [p] if p else [],
+                "modifiedTime": self.modified_time,
+            }
+            for i, n, m, p in self.drive_files
         ]
-        start = int(query.get("pageToken", ["0"])[0])
-        page = rows[start : start + self.drive_page_size]
-        payload = {"files": page}
-        if start + self.drive_page_size < len(rows):
-            payload["nextPageToken"] = str(start + self.drive_page_size)
-        return _json(start_response, payload)
+        return _json(
+            start_response, _drive_query_page(rows, query, self.drive_page_size)
+        )
 
     def _batch_get(self, start_response, query):
         value_ranges = []
@@ -543,26 +566,10 @@ class FakeDrive(_FakeApi):
         return [data]
 
     def _list(self, start_response, query):
-        q = query.get("q", [""])[0]
-        parent = re.search(r"'([^']+)' in parents", q)
-        parent = parent.group(1) if parent else None
-        needle = re.search(r"name contains '([^']*)'", q)
-        needle = needle.group(1).lower() if needle else None
-        types = set(re.findall(r"mimeType = '([^']+)'", q))
-        rows = [
-            e
-            for e in self.files.values()
-            if not e["trashed"]
-            and (parent is None or parent in e["parents"])
-            and (not types or e["mimeType"] in types)
-            and (needle is None or needle in e["name"].lower())
-        ]
-        start = int(query.get("pageToken", ["0"])[0])
-        page = rows[start : start + self.page_size]
-        payload = {"files": page}
-        if start + self.page_size < len(rows):
-            payload["nextPageToken"] = str(start + self.page_size)
-        return _json(start_response, payload)
+        return _json(
+            start_response,
+            _drive_query_page(list(self.files.values()), query, self.page_size),
+        )
 
     def _changes(self, start_response, query):
         token = query.get("pageToken", ["0"])[0]
@@ -1692,8 +1699,8 @@ def test_sheets_check_connection(sheets_server, google_connection):
     )
 
 
-SPREADSHEET = "application/vnd.google-apps.spreadsheet"
-FOLDER = "application/vnd.google-apps.folder"
+SPREADSHEET = SPREADSHEET_MIME
+FOLDER = FOLDER_MIME
 
 
 def _drive(sheets_server):
@@ -2198,7 +2205,6 @@ def test_google_sheets_conformance(sheets_server, sheets_binding):
 
 # --- drive: three addressing modes, the changes feed, content ------------------
 
-FOLDER = "application/vnd.google-apps.folder"
 DOC = "application/vnd.google-apps.document"
 
 
@@ -2223,6 +2229,22 @@ def _ids(binding):
     return sorted((r["id"], bool(r[DELETED_COLUMN])) for r in rows)
 
 
+def _sync(binding):
+    run = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+    return run
+
+
+@pytest.fixture
+def reports(drive_server, drive_binding):
+    """The tree, a Binding scoped to `Reports/`, and its first run done."""
+    api = drive_server(_tree())
+    binding = drive_binding(folder_id="R")
+    run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    assert run.status == RunStatus.SUCCEEDED, run.error_message
+    return api, binding
+
+
 def test_drive_whole_drive_lands_every_file_and_no_folder(drive_server, drive_binding):
     drive_server(_tree())
     binding = drive_binding()
@@ -2245,13 +2267,9 @@ def test_drive_single_file(drive_server, drive_binding):
     assert _ids(binding) == [("l", False)]
 
 
-def test_drive_changes_feed_updates_adds_and_deletes_within_scope(
-    drive_server, drive_binding
-):
+def test_drive_changes_feed_updates_adds_and_deletes_within_scope(reports):
     """The cold walk takes the token first; the warm run replays the feed."""
-    api = drive_server(_tree())
-    binding = drive_binding(folder_id="R")
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api, binding = reports
 
     api.files["a"]["name"] = "a-renamed.pdf"
     api.change("a")
@@ -2277,15 +2295,13 @@ def test_drive_changes_feed_updates_adds_and_deletes_within_scope(
     assert "z" not in landed
 
 
-def test_drive_a_new_subfolder_joins_the_scope(drive_server, drive_binding):
-    api = drive_server(_tree())
-    binding = drive_binding(folder_id="R")
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+def test_drive_a_new_subfolder_joins_the_scope(reports):
+    api, binding = reports
     api.add("Q", "Q3", mimeType=FOLDER, parents=["Y"])
     api.change("Q")
     api.add("q", "q.pdf", parents=["Q"])
     api.change("q")
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     assert ("q", False) in _ids(binding)
 
 
@@ -2324,7 +2340,7 @@ def test_drive_single_file_404_is_a_deletion_only_after_it_was_seen(
     binding = drive_binding(file_id="l")
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     del api.files["l"]
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     assert _ids(binding) == [("l", True)]
 
 
@@ -2409,15 +2425,13 @@ def test_google_drive_conformance(drive_server, drive_binding):
     assert {row[BINDING_ID_COLUMN] for row in rows} == {str(binding.id)}
 
 
-def test_drive_a_file_moved_out_of_scope_is_a_deletion(drive_server, drive_binding):
+def test_drive_a_file_moved_out_of_scope_is_a_deletion(reports):
     """The feed exists so a document that is no longer there stops being live."""
-    api = drive_server(_tree())
-    binding = drive_binding(folder_id="R")
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api, binding = reports
     api.add("E", "Elsewhere", mimeType=FOLDER)
     api.files["a"]["parents"] = ["E"]
     api.change("a")
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     assert dict(_ids(binding))["a"] is True
 
 
@@ -2429,42 +2443,32 @@ def test_drive_a_file_renamed_out_of_the_glob_is_a_deletion(
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     api.files["a"]["name"] = "a.docx"
     api.change("a")
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     assert dict(_ids(binding))["a"] is True
 
 
-def test_drive_a_trashed_folder_takes_its_subtree_and_leaves_no_folder_row(
-    drive_server, drive_binding
-):
-    api = drive_server(_tree())
-    binding = drive_binding(folder_id="R")
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+def test_drive_a_trashed_folder_takes_its_subtree_and_leaves_no_folder_row(reports):
+    api, binding = reports
     api.files["Y"]["trashed"] = True
     api.change("Y")  # Drive reports the folder only; children inherit silently
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     landed = dict(_ids(binding))
     assert landed == {"a": False, "b": True}
     assert "Y" not in landed
 
 
-def test_drive_a_folder_moved_out_of_scope_takes_its_subtree(
-    drive_server, drive_binding
-):
-    api = drive_server(_tree())
-    binding = drive_binding(folder_id="R")
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+def test_drive_a_folder_moved_out_of_scope_takes_its_subtree(reports):
+    api, binding = reports
     api.add("E", "Elsewhere", mimeType=FOLDER)
     api.files["Y"]["parents"] = ["E"]
     api.change("Y")
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     assert dict(_ids(binding)) == {"a": False, "b": True}
 
 
-def test_drive_a_repointed_binding_re_enumerates(drive_server, drive_binding):
+def test_drive_a_repointed_binding_re_enumerates(reports):
     """State is keyed by scope: the old folder's feed must not filter the new one."""
-    api = drive_server(_tree())
-    binding = drive_binding(folder_id="R")
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    api, binding = reports
     api.add("O", "Other", mimeType=FOLDER)
     api.add("o", "o.pdf", parents=["O"])
     binding.config = {**binding.config, "folder_id": "O"}
@@ -2528,11 +2532,11 @@ def test_drive_a_change_to_the_root_folder_itself_is_not_a_move_out(
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     api.files["R"]["name"] = "Reports (renamed)"
     api.change("R")
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     assert dict(_ids(binding)) == {"a": False, "b": False}
     api.add("n", "n.pdf", parents=["R"])
     api.change("n")
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     assert ("n", False) in _ids(binding)
 
 
@@ -2547,8 +2551,8 @@ def test_drive_a_folder_moved_within_scope_keeps_its_files_when_the_old_parent_g
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     api.files["Y"]["parents"] = ["S"]
     api.change("Y")  # moved within scope
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     api.files["T"]["trashed"] = True
     api.change("T")  # the old parent goes; Y is no longer under it
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    _sync(binding)
     assert dict(_ids(binding))["b"] is False

@@ -43,9 +43,7 @@ class Projection(models.Model):
     filters = models.JSONField(default=list, blank=True)
 
     enabled = models.BooleanField(default=True)
-    # See InvalidRecordPolicy. Deliberately not "skip" by default: silently
-    # dropping rows is the failure this library exists to prevent, so a
-    # customer opts into it per Projection.
+    # See InvalidRecordPolicy.
     on_invalid_record = models.CharField(
         max_length=8,
         choices=InvalidRecordPolicy,

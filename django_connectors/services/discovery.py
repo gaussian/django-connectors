@@ -72,12 +72,10 @@ def discover_remote(
             f"{sources.keys()}"
         )
     definition = sources.get(key)
-    if credentials is None and connection.auth_backend:
-        from django_connectors.registry import auth_backends
+    if credentials is None:
+        from django_connectors.services.runs import credentials_for
 
-        credentials = auth_backends.get(connection.auth_backend).get_credentials(
-            connection
-        )
+        credentials = credentials_for(connection)
     limit = page_limit(limit)
     return definition.discover(
         connection=connection,

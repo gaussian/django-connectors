@@ -49,7 +49,6 @@ from django_connectors.auth.base import credential_value
 from django_connectors.errors import scrub
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.sources.base import SourceDefinition, as_config, discovery_page
-from django_connectors.sources.reshape import validate_unpivot
 
 # format -> (module it needs at read time, the extra that installs it).
 # None means "core dlt is enough".
@@ -144,12 +143,13 @@ class FilesystemSource(SourceDefinition):
                     f"appends every row again instead of updating it."
                 )
             if "unpivot" in spec:
-                validate_unpivot(spec["unpivot"], where=f"resources.{name}.unpivot")
+                self.validate_reshape(
+                    spec["unpivot"],
+                    where=f"resources.{name}.unpivot",
+                    primary_key=spec.get("primary_key") or (),
+                    cursor=spec.get("cursor"),
+                )
         return None
-
-    def reshape_for(self, resource_name, binding):
-        spec = self.resource_spec(binding, resource_name)
-        return spec.get("unpivot")
 
     # --- extraction --------------------------------------------------------
 
@@ -237,7 +237,7 @@ class FilesystemSource(SourceDefinition):
             fs = (
                 opened
                 if isinstance(opened, AbstractFileSystem)
-                else _fsspec_for(scheme, opened)
+                else _fsspec_for(bucket_url, opened)
             )
         try:
             entries = fs.ls(bucket_url, detail=True)
@@ -270,39 +270,24 @@ class FilesystemSource(SourceDefinition):
         return discovery_page(items, cursor=cursor, limit=limit, query=query)
 
 
-#: The method on each dlt credential spec that yields fsspec's kwargs. Named
-#: explicitly: `to_native_credentials` exists on every spec and returns an SDK
-#: object, which `fsspec.filesystem(**obj)` rejects with a TypeError.
-FSSPEC_KWARGS_METHOD = {
-    "s3": "to_s3fs_credentials",
-    "gs": "to_gcs_credentials",
-    "gcs": "to_gcs_credentials",
-    "az": "to_adlfs_credentials",
-    "abfss": "to_adlfs_credentials",
-}
+def _fsspec_for(bucket_url, spec):
+    """An fsspec filesystem from a dlt credential spec, for listing only.
 
+    dlt's own factory knows which method each spec exposes (``to_s3fs_...``,
+    ``to_gcs_...``, ``to_adlfs_...``) and the listing-cache settings it uses
+    itself; hand-rolling that table once produced a TypeError for GCS. It
+    takes the bucket URL, not the bare scheme — its docstring says otherwise,
+    and a bare scheme quietly becomes a relative local path.
+    """
+    from dlt.common.storages.fsspec_filesystem import fsspec_filesystem
 
-def _fsspec_for(scheme, spec):
-    """An fsspec filesystem from a dlt credential spec, for listing only."""
-    import fsspec
-
-    method = getattr(spec, FSSPEC_KWARGS_METHOD.get(scheme, ""), None)
-    if method is None:
-        raise ConfigurationError(
-            f"{scheme}:// credentials of type {type(spec).__name__} cannot be "
-            f"turned into an fsspec filesystem for listing."
-        )
-    return fsspec.filesystem(scheme, **method())
+    fs, _ = fsspec_filesystem(bucket_url, spec)
+    return fs
 
 
 def _rejoin(bucket_url, name):
     """`bucket_url` + one path segment, in the form a Binding would accept."""
-    prefix = (
-        bucket_url.removeprefix("file://")
-        if bucket_url.startswith("file://")
-        else bucket_url
-    )
-    return f"{prefix.rstrip('/')}/{name}"
+    return f"{bucket_url.removeprefix('file://').rstrip('/')}/{name}"
 
 
 def _reader(spec):

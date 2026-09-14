@@ -40,6 +40,7 @@ refusal costs nothing real and prevents a silent loss.
 """
 
 import fnmatch
+import re
 
 from django_connectors.exceptions import ConfigurationError, SourceError
 
@@ -134,6 +135,7 @@ def unpivot(spec):
     """A one-to-many record map for ``DltResource.add_yield_map``."""
     listed = tuple(spec.get("columns") or ())
     pattern = spec.get("columns_matching")
+    matches = re.compile(fnmatch.translate(pattern)).match if pattern else None
     name_to, value_to = spec["name_to"], spec["value_to"]
     keep = spec.get("keep")
     drop_empty = spec.get("drop_empty", True)
@@ -141,7 +143,7 @@ def unpivot(spec):
     def stages_of(row):
         if listed:
             return [c for c in listed if c in row]
-        return [c for c in row if fnmatch.fnmatchcase(c, pattern)]
+        return [c for c in row if matches(c)]
 
     def reshape(row):
         stages = stages_of(row)
@@ -157,8 +159,9 @@ def unpivot(spec):
                 f"{sorted(row)}; check the column names against the landed "
                 f"headers, which are normalised to snake_case"
             )
+        staged = set(stages)
         base = (
-            {k: v for k, v in row.items() if k not in stages}
+            {k: v for k, v in row.items() if k not in staged}
             if keep is None
             else {k: row.get(k) for k in keep}
         )

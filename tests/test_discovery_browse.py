@@ -134,24 +134,24 @@ def test_filesystem_enters_a_folder_whose_name_looks_like_a_file(
         assert [i["name"] for i in below["items"]] in (["inner.jsonl"], ["deep.jsonl"])
 
 
-def test_every_bucket_scheme_has_a_real_fsspec_accessor():
-    from dlt.common.configuration.specs import (
-        AwsCredentials,
-        AzureCredentials,
-        GcpServiceAccountCredentials,
-    )
+def test_every_bucket_scheme_builds_a_listing_filesystem():
+    """dlt's factory knows each spec's accessor; the hand-rolled table did not."""
+    pytest.importorskip("s3fs")
+    from dlt.common.configuration.specs import AwsCredentials
 
     from django_connectors.sources import filesystem as fs_source
 
-    spec_for = {
-        "s3": AwsCredentials,
-        "gs": GcpServiceAccountCredentials,
-        "gcs": GcpServiceAccountCredentials,
-        "az": AzureCredentials,
-        "abfss": AzureCredentials,
-    }
-    for scheme, method in fs_source.FSSPEC_KWARGS_METHOD.items():
-        assert callable(getattr(spec_for[scheme], method)), (scheme, method)
+    fs = fs_source._fsspec_for(
+        "s3://bucket/x",
+        AwsCredentials(aws_access_key_id="k", aws_secret_access_key="s"),
+    )
+    assert type(fs).__name__ == "S3FileSystem"
+    for scheme in fs_source.SCHEME_REQUIREMENTS:
+        assert scheme == "file" or fs_source.SCHEME_REQUIREMENTS[scheme][1] in (
+            "s3",
+            "gs",
+            "az",
+        )
 
 
 def test_filesystem_needs_somewhere_to_start(source_settings, make_connection):
@@ -172,7 +172,7 @@ def test_filesystem_reports_a_missing_directory(
 
 
 def test_the_api_passes_every_browsing_parameter_through(
-    connectors_settings, make_connection, settings
+    connectors_settings, make_connection, settings, client_for
 ):
     pytest.importorskip("rest_framework")
     from django.urls import reverse

@@ -114,13 +114,9 @@ def test_bad_specs_are_configuration_errors(spec, message):
 # --- end to end through the landing layer ------------------------------------
 
 
-def _wide_config(extra=None, **spec_overrides):
-    return memory_config(
-        batches=[[WIDE, {**WIDE, "case": "C2"}]],
-        primary_key="case",
-        unpivot={**SPEC, **spec_overrides},
-        **(extra or {}),
-    )
+WIDE_CONFIG = memory_config(
+    batches=[[WIDE, {**WIDE, "case": "C2"}]], primary_key="case", unpivot=SPEC
+)
 
 
 def _landed(binding):
@@ -135,7 +131,7 @@ def _landed(binding):
 def test_wide_rows_land_long_with_the_stage_in_the_merge_key(
     connectors_settings, make_binding
 ):
-    binding = make_binding(source="wide", config=_wide_config())
+    binding = make_binding(source="wide", config=WIDE_CONFIG)
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     assert run.status == "succeeded", run.error_message
 
@@ -155,30 +151,11 @@ def test_wide_rows_land_long_with_the_stage_in_the_merge_key(
     assert merge_key == {BINDING_ID_COLUMN, "case", "stage"}
 
 
-def test_a_second_run_updates_the_stage_rows_instead_of_stacking_them(
-    connectors_settings, make_binding
-):
-    later = {**WIDE, "approved_at": "d2-fixed", "shipped_at": "d3"}
-    binding = make_binding(
-        source="wide",
-        config=memory_config(
-            batches=[[WIDE], [later]], primary_key="case", unpivot=SPEC
-        ),
-    )
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
-    assert _landed(binding) == [
-        ("C1", "approved_at", "d2-fixed"),
-        ("C1", "received_at", "d1"),
-        ("C1", "shipped_at", "d3"),
-    ]
-
-
 def test_every_landed_row_carries_tenant_metadata_after_the_reshape(
     connectors_settings, make_binding
 ):
     """The injector runs after the reshape, so it stamps what actually lands."""
-    binding = make_binding(source="wide", config=_wide_config())
+    binding = make_binding(source="wide", config=WIDE_CONFIG)
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     rows = list(
         access.iter_rows(access.binding_relation(binding, "events"), binding=binding)
@@ -221,7 +198,7 @@ def test_the_projection_can_identify_by_case_and_stage(
     from django_connectors.services import projections as projection_services
     from tests.conftest import make_projection
 
-    binding = make_binding(source="wide", config=_wide_config())
+    binding = make_binding(source="wide", config=WIDE_CONFIG)
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     projection = make_projection(
         binding,
@@ -253,24 +230,10 @@ def test_a_source_that_emits_tombstones_cannot_be_unpivoted(
     connectors_settings, make_binding
 ):
     """A case-level tombstone cannot become per-stage deletes; refuse, do not lose."""
-    binding = make_binding(source="memory", config=_wide_config())
+    binding = make_binding(source="memory", config=WIDE_CONFIG)
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     assert run.status == "failed"
     assert "emits tombstones" in run.error_message
-
-
-def test_a_cleared_stage_cell_removes_its_landed_row(connectors_settings, make_binding):
-    """merge_key on the case: a re-emitted case replaces every stage row it had."""
-    cleared = {**WIDE, "approved_at": ""}
-    binding = make_binding(
-        source="wide",
-        config=memory_config(
-            batches=[[WIDE], [cleared]], primary_key="case", unpivot=SPEC
-        ),
-    )
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
-    assert _landed(binding) == [("C1", "received_at", "d1")]
 
 
 def test_a_row_with_none_of_the_stage_columns_is_a_header_mismatch(
@@ -358,26 +321,6 @@ def test_sheets_refuses_an_unpivot_that_consumes_the_key_column_at_save_time():
         )
 
 
-def test_a_case_with_every_stage_cleared_replaces_its_rows_with_nulls(
-    connectors_settings, make_binding
-):
-    """Absent from the package, the case would keep its old stage rows."""
-    cleared = {**WIDE, "received_at": "", "approved_at": None, "shipped_at": ""}
-    binding = make_binding(
-        source="wide",
-        config=memory_config(
-            batches=[[WIDE], [cleared]], primary_key="case", unpivot=SPEC
-        ),
-    )
-    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
-    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
-    assert _landed(binding) == [
-        ("C1", "approved_at", None),
-        ("C1", "received_at", None),
-        ("C1", "shipped_at", None),
-    ]
-
-
 def test_excel_checks_the_whole_landed_key_at_save_time():
     from django_connectors.providers.microsoft.excel import EntraExcelSource
 
@@ -394,3 +337,46 @@ def test_excel_checks_the_whole_landed_key_at_save_time():
                 },
             }
         )
+
+
+@pytest.mark.parametrize(
+    "later, expected",
+    [
+        pytest.param(
+            {**WIDE, "approved_at": "d2-fixed", "shipped_at": "d3"},
+            [
+                ("C1", "approved_at", "d2-fixed"),
+                ("C1", "received_at", "d1"),
+                ("C1", "shipped_at", "d3"),
+            ],
+            id="updated-and-extended",
+        ),
+        pytest.param(
+            {**WIDE, "approved_at": ""},
+            [("C1", "received_at", "d1")],
+            id="cleared-cell-removes-its-row",
+        ),
+        pytest.param(
+            {**WIDE, "received_at": "", "approved_at": None, "shipped_at": ""},
+            [
+                ("C1", "approved_at", None),
+                ("C1", "received_at", None),
+                ("C1", "shipped_at", None),
+            ],
+            id="all-cleared-lands-nulls-not-stale-rows",
+        ),
+    ],
+)
+def test_a_second_run_replaces_a_cases_stage_rows(
+    connectors_settings, make_binding, later, expected
+):
+    """merge_key on the case: a re-emitted case replaces every stage row it had."""
+    binding = make_binding(
+        source="wide",
+        config=memory_config(
+            batches=[[WIDE], [later]], primary_key="case", unpivot=SPEC
+        ),
+    )
+    run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
+    run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
+    assert _landed(binding) == expected

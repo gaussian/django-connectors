@@ -42,7 +42,7 @@ def fetch_record_content(binding, resource, reference, *, max_bytes=None):
     give, a reference that matches nothing landed, and a payload over the
     ceiling.
     """
-    from django_connectors.services.runs import _credentials_for
+    from django_connectors.services.runs import credentials_for
 
     definition = sources.get(binding.source)
     if not getattr(definition, "provides_content", False):
@@ -60,7 +60,7 @@ def fetch_record_content(binding, resource, reference, *, max_bytes=None):
     )
     data, content_type = definition.fetch_content(
         binding=binding,
-        credentials=_credentials_for(binding.connection),
+        credentials=credentials_for(binding.connection),
         resource=resource,
         reference=reference,
         max_bytes=limit,
@@ -84,10 +84,13 @@ def _assert_landed(binding, resource, reference):
             f"missing {missing}"
         )
     wanted = {column: str(reference[column]) for column in key}
+    # Pushed into SQL: the business-key columns carry no precision hint, so
+    # the cast dlt renders for `where` is plain, on every dialect.
     relation = access.binding_relation(binding, resource)
-    for row in access.iter_rows(relation, binding=binding):
-        if all(str(row.get(column)) == value for column, value in wanted.items()):
-            return
+    for column, value in wanted.items():
+        relation = relation.where(column, "eq", value)
+    if any(True for _ in access.iter_rows(relation.limit(1), binding=binding)):
+        return
     raise SourceError(
         f"no landed {resource!r} row of this binding matches {wanted}; content "
         f"is fetched only for records this binding landed"

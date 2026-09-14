@@ -43,7 +43,7 @@ from django_connectors.enums import (
     ProjectionStatus,
 )
 from django_connectors.errors import describe
-from django_connectors.exceptions import CastError, InvalidRecordError, TargetWriteError
+from django_connectors.exceptions import InvalidRecordError, TargetWriteError
 from django_connectors.landing import access
 from django_connectors.landing.naming import (
     DELETED_COLUMN,
@@ -156,7 +156,7 @@ def _run(projection_run, projection):
             continue
         try:
             batch.append(_project(row, compiled, target))
-        except (InvalidRecordError, CastError) as exc:
+        except InvalidRecordError as exc:
             # Only what one row's data can cause. A MappingValidationError —
             # a column that is not in the landed row — is the mapping's fault,
             # and skipping every row over it would report success on nothing.
@@ -267,18 +267,15 @@ def _write(
             f"target {target.key!r} writer failed on batch {batch_index}: {exc}"
         ) from exc
 
+    if not isinstance(result, WriterResult):
+        result = WriterResult()  # an int, or nothing: applied as handed over
     upserts = sum(1 for r in records if r.operation == "upsert")
     deletes = sum(1 for r in records if r.operation == "delete")
-    if isinstance(result, WriterResult):
-        counts["written"] += upserts if result.written is None else result.written
-        counts["deleted"] += deletes if result.deleted is None else result.deleted
-        counts["skipped"] += result.skipped
-        for warning in result.warnings:
-            _skip(counts, str(warning), count=False)
-    else:
-        # An int, or nothing: the batch was applied as handed over.
-        counts["written"] += upserts
-        counts["deleted"] += deletes
+    counts["written"] += upserts if result.written is None else result.written
+    counts["deleted"] += deletes if result.deleted is None else result.deleted
+    counts["skipped"] += result.skipped
+    for warning in result.warnings:
+        _skip(counts, str(warning), count=False)
 
 
 def _skip(counts, reason, *, row=None, count=True):
@@ -378,13 +375,10 @@ def dispatch_pending(projection, *, lookback=None):
     ).order_by("created_at"):
         landed.extend(run.dlt_load_ids or [])
 
-    # Succeeded runs have projected their loads. Queued and running ones hold
-    # theirs in flight — but only for as long as that claim is credible: a
-    # queued run past the grace period is one the queue dropped (the sweeper
-    # executes it before calling this), and a running run past the run
-    # timeout is one a killed worker left behind, which no reaper answers.
-    # Counting either forever would lose its loads for good.
-    now = timezone.now()
+    # Succeeded runs have projected their loads; queued and running ones hold
+    # theirs in flight. No clock here: `reap_stale_projection_runs` answers a
+    # dropped queued run and an abandoned running one before the sweeper
+    # calls this, so what is still QUEUED or RUNNING is credibly in flight.
     projected = set()
     for previous in ProjectionRun.objects.filter(
         projection=projection,
@@ -394,15 +388,6 @@ def dispatch_pending(projection, *, lookback=None):
             ProjectionRunStatus.RUNNING,
         ),
     ):
-        if previous.status == ProjectionRunStatus.QUEUED and (
-            previous.created_at < now - conf.PROJECTION_QUEUE_GRACE
-        ):
-            continue
-        if previous.status == ProjectionRunStatus.RUNNING and (
-            (previous.started_at or previous.created_at)
-            < now - conf.DEFAULT_RUN_TIMEOUT
-        ):
-            continue
         projected.update(previous.load_ids or [])
 
     outstanding = [load_id for load_id in landed if load_id not in projected]

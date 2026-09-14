@@ -53,6 +53,17 @@ def run_committed(django_capture_on_commit_callbacks):
 
 
 @pytest.fixture
+def queued_run(queued_settings, run_committed, make_binding, events_target):
+    """Two loads landed, the projection created between them: one queued run."""
+    binding = make_binding(config=memory_config(batches=[[RECORD], [RECORD]]))
+    run_committed(binding, RunTrigger.INITIAL)
+    make_projection(binding)
+    run_committed(binding, RunTrigger.SCHEDULED)
+    assert len(HANDED) == 1
+    return HANDED[0]
+
+
+@pytest.fixture
 def queued_settings(connectors_settings, settings):
     settings.DJANGO_CONNECTORS = {
         **connectors_settings,
@@ -73,34 +84,19 @@ def test_inline_is_the_default(
 
 
 def test_a_dispatch_callable_receives_a_queued_run_and_nothing_executes(
-    queued_settings, run_committed, make_binding, events_target, writer
+    queued_run, writer
 ):
-    binding = make_binding(config=memory_config(batches=[[RECORD], [RECORD]]))
-    run_committed(binding, RunTrigger.INITIAL)
-    make_projection(binding)
-
-    run_committed(binding, RunTrigger.SCHEDULED)
-
-    assert len(HANDED) == 1
-    assert HANDED[0].status == ProjectionRunStatus.QUEUED
+    assert queued_run.status == ProjectionRunStatus.QUEUED
     assert writer.records == []
 
 
-def test_executing_a_queued_run_projects_it_once(
-    queued_settings, run_committed, make_binding, events_target, writer
-):
-    binding = make_binding(config=memory_config(batches=[[RECORD], [RECORD]]))
-    run_committed(binding, RunTrigger.INITIAL)
-    make_projection(binding)
-    run_committed(binding, RunTrigger.SCHEDULED)
-    queued = HANDED[0]
-
-    first = projection_services.execute_projection_run(queued.id)
+def test_executing_a_queued_run_projects_it_once(queued_run, writer):
+    first = projection_services.execute_projection_run(queued_run.id)
     assert first.status == ProjectionRunStatus.SUCCEEDED
     assert len(writer.records) == 1
 
     # Delivered again: the row says it already ran, so nothing happens.
-    again = projection_services.execute_projection_run(queued.id)
+    again = projection_services.execute_projection_run(queued_run.id)
     assert again.status == ProjectionRunStatus.SUCCEEDED
     assert len(writer.records) == 1
 
@@ -159,10 +155,10 @@ def test_beat_schedule_can_route_every_entry_to_one_queue():
     assert set(routed) == set(plain)
 
 
-def test_a_run_a_killed_worker_left_running_is_healed_after_the_timeout(
+def test_a_run_a_killed_worker_left_running_is_failed_then_re_projected(
     connectors_settings, make_binding, events_target, writer
 ):
-    """Counting RUNNING as in flight forever would lose its loads for good."""
+    """A SIGKILL is invisible to the runner; the reaper answers it visibly."""
     binding = make_binding(config=memory_config(batches=[[RECORD]]))
     make_projection(binding)
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
@@ -178,22 +174,17 @@ def test_a_run_a_killed_worker_left_running_is_healed_after_the_timeout(
         started_at=timezone.now() - dt.timedelta(days=1)
     )
     healed = projection_services.dispatch_pending_projections()
+    stuck.refresh_from_db()
+    assert stuck.status == ProjectionRunStatus.FAILED
+    assert stuck.error_type == "abandoned"
     assert len(healed) == 1 and healed[0].status == ProjectionRunStatus.SUCCEEDED
 
 
-def test_two_executors_cannot_both_run_one_queued_run(
-    queued_settings, run_committed, make_binding, events_target, writer
-):
+def test_two_executors_cannot_both_run_one_queued_run(queued_run, writer):
     from django_connectors.projections import runner
 
-    binding = make_binding(config=memory_config(batches=[[RECORD], [RECORD]]))
-    run_committed(binding, RunTrigger.INITIAL)
-    make_projection(binding)
-    run_committed(binding, RunTrigger.SCHEDULED)
-    queued = HANDED[0]
-    stale_copy = ProjectionRun.objects.get(pk=queued.pk)  # a second process's read
-
-    first = runner.execute(queued)
+    stale_copy = ProjectionRun.objects.get(pk=queued_run.pk)  # a second process's read
+    first = runner.execute(queued_run)
     assert first.status == ProjectionRunStatus.SUCCEEDED
     second = runner.execute(stale_copy)  # the claim fails; nothing runs twice
     assert second.status == ProjectionRunStatus.SUCCEEDED

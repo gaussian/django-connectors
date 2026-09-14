@@ -66,12 +66,11 @@ from django_connectors.providers.microsoft.files import (
     EntraFilesSource,
     access_token,
     assert_single_item,
-    download_item_content,
+    download_item,
     graph_session,
     item_record,
 )
 from django_connectors.sources.base import as_config
-from django_connectors.sources.reshape import validate_unpivot
 
 DEFAULT_RESOURCE = "worksheet_rows"
 
@@ -238,15 +237,8 @@ class EntraExcelSource(EntraFilesSource):
         if glob is not None and not isinstance(glob, str):
             raise ConfigurationError("'name_glob' must be a string like '*.xlsx'.")
         if "unpivot" in config:
-            # The landed merge key carries the file and sheet as well as the
-            # customer's columns; an unpivot must leave all of them standing.
-            validate_unpivot(
-                config["unpivot"],
-                primary_key=(
-                    FILE_ID_COLUMN,
-                    SHEET_NAME_COLUMN,
-                    *self.key_columns(config),
-                ),
+            self.validate_reshape(
+                config["unpivot"], primary_key=self.landed_key(config)
             )
         return None
 
@@ -281,7 +273,7 @@ class EntraExcelSource(EntraFilesSource):
                 # business key legitimately appears in two workbooks and in two
                 # tabs of one workbook; merging those together would have one
                 # sheet's rows quietly overwrite the other's.
-                primary_key=(FILE_ID_COLUMN, SHEET_NAME_COLUMN, *key_columns),
+                primary_key=self.landed_key(config),
                 write_disposition="merge",
             )()
         else:
@@ -296,6 +288,15 @@ class EntraExcelSource(EntraFilesSource):
             normalize_identifier(str(column))
             for column in (config or {}).get("key_columns") or ()
         )
+
+    def landed_key(self, config):
+        """The merge key as it lands: the file and sheet lead the customer's columns.
+
+        The same business key legitimately appears in two workbooks and in two
+        tabs of one workbook; merging those together would have one sheet's
+        rows quietly overwrite the other's.
+        """
+        return (FILE_ID_COLUMN, SHEET_NAME_COLUMN, *self.key_columns(config))
 
     def iter_rows(self, config, token):
         """Yield one record per worksheet row of every workbook in scope."""
@@ -315,7 +316,7 @@ class EntraExcelSource(EntraFilesSource):
                         f"addressed. This is a Graph response shape this source "
                         f"does not understand rather than a configuration error."
                     )
-                data = download_item_content(
+                data, _ = download_item(
                     session,
                     base_url=base,
                     drive_id=drive_id,

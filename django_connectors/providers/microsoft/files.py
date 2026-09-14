@@ -31,7 +31,7 @@ the wrong place for a 40MB spreadsheet — it makes every merge rewrite the blob
 it exceeds MySQL's ``TEXT`` limits and wedges the load package, and it puts
 customer document content in a table whose whole purpose is to be sampled and
 previewed in a UI. Content download is available as a separate, explicit call:
-:func:`download_item_content`, which is what
+:func:`download_item`, which is what
 :mod:`django_connectors.providers.microsoft.excel` is built on.
 
 **Unverified against a live provider.** Written against Microsoft's published
@@ -47,7 +47,6 @@ drive root.
 """
 
 import datetime as dt
-import fnmatch
 import re
 import time
 from email.utils import parsedate_to_datetime
@@ -65,6 +64,7 @@ from django_connectors.exceptions import (
 from django_connectors.sources.base import (
     SourceDefinition,
     as_config,
+    name_matches,
     read_capped,
     sign_cursor,
     unsign_cursor,
@@ -752,27 +752,6 @@ def raise_for_graph_error(response, *, what):
     raise SourceError(f"Graph failed the {what}. {detail}")
 
 
-def download_item_content(
-    session,
-    *,
-    base_url,
-    drive_id,
-    item_id,
-    max_bytes,
-    limit_hint="",
-):
-    """The bytes of one ``driveItem``; see :func:`download_item`."""
-    data, _ = download_item(
-        session,
-        base_url=base_url,
-        drive_id=drive_id,
-        item_id=item_id,
-        max_bytes=max_bytes,
-        limit_hint=limit_hint,
-    )
-    return data
-
-
 def download_item(
     session,
     *,
@@ -849,19 +828,6 @@ def item_record(item, *, drive_id=""):
         "created_by": identity_name(item.get("createdBy")),
         "last_modified_by": identity_name(item.get("lastModifiedBy")),
     }
-
-
-def name_matches(name, glob):
-    """Case-insensitive glob match, because SharePoint file names are.
-
-    ``fnmatch.fnmatch`` follows the *host* filesystem's rules, so on Linux
-    ``*.xlsx`` silently fails to match ``Budget.XLSX`` while on macOS it
-    matches — a Binding that works on a developer's laptop and drops half the
-    documents in production. Neither of those is the provider's rule: SharePoint
-    and OneDrive treat names case-insensitively, so the comparison is folded
-    explicitly rather than inherited from wherever the worker happens to run.
-    """
-    return fnmatch.fnmatchcase(name.lower(), glob.lower())
 
 
 def identity_name(identity_set):

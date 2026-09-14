@@ -280,3 +280,24 @@ def make_projection(binding, mapping=None, *, filters=None, target="events"):
         filters=filters or [],
         status=ProjectionStatus.ACTIVE,
     )
+
+
+@pytest.fixture
+def client_for(db):
+    """An APIClient authenticated as a user, created on demand by name.
+
+    The DRF import stays inside so the minimal tier (no `drf` extra) still
+    collects this module; modules that use the fixture skip themselves.
+    """
+    from django.contrib.auth.models import User
+
+    def factory(username=None):
+        from rest_framework.test import APIClient
+
+        username = username or f"apiuser{User.objects.count()}"
+        user, _ = User.objects.get_or_create(username=username)
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    return factory

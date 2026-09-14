@@ -3,7 +3,9 @@
 import logging
 
 from django.db import transaction
+from django.utils import timezone
 
+from django_connectors.conf import conf
 from django_connectors.enums import (
     BindingStatus,
     ProjectionRunMode,
@@ -133,8 +135,6 @@ def preview_projection(projection, *, limit=None):
 
 
 def sample_resource(projection_or_binding, resource=None, *, limit=None):
-    from django_connectors.conf import conf
-
     binding = getattr(projection_or_binding, "binding", projection_or_binding)
     resource = resource or getattr(projection_or_binding, "resource", None)
     limit = min(limit or conf.SAMPLE_MAX_ROWS, conf.SAMPLE_MAX_ROWS)
@@ -169,17 +169,14 @@ def execute_projection_run(projection_run_id):
     projection_run = ProjectionRun.objects.select_related(
         "projection__binding__connection"
     ).get(pk=projection_run_id)
-    if projection_run.status != ProjectionRunStatus.QUEUED:
-        # Delivered twice, or already swept up: the row says what happened.
-        return projection_run
+    # The runner claims the row atomically; a run delivered twice, or already
+    # swept up, comes back as the row says.
     return projection_runner.execute(projection_run)
 
 
 def dispatcher():
     """The configured ``PROJECTION_DISPATCH`` callable, or None for inline."""
     from django.utils.module_loading import import_string
-
-    from django_connectors.conf import conf
 
     path = conf.PROJECTION_DISPATCH
     if not path:
@@ -236,31 +233,62 @@ def dispatch_after_run(run):
     return dispatched
 
 
+def reap_stale_projection_runs():
+    """Answer the two claims that stop being credible with age.
+
+    A run still QUEUED past ``PROJECTION_QUEUE_GRACE`` is one the queue
+    dropped: it is executed here. A run still RUNNING past
+    ``DEFAULT_RUN_TIMEOUT`` is one a killed worker left behind — the
+    ``except BaseException`` in the runner cannot see a SIGKILL — and is
+    marked FAILED so it is visible, retryable, and its loads outstanding
+    again. Returns ``{"executed": [...], "failed": [...]}``. Called by the
+    sweeper before it computes what is outstanding, so ``dispatch_pending``
+    can treat every QUEUED and RUNNING row as in flight with no clock in it.
+    """
+    now = timezone.now()
+    executed = [
+        projection_runner.execute(dropped)
+        for dropped in ProjectionRun.objects.filter(
+            status=ProjectionRunStatus.QUEUED,
+            created_at__lt=now - conf.PROJECTION_QUEUE_GRACE,
+            projection__enabled=True,
+            projection__status=ProjectionStatus.ACTIVE,
+        )
+        .exclude(projection__binding__status=BindingStatus.PURGING)
+        .select_related("projection__binding__connection")
+        .order_by("created_at")
+    ]
+    abandoned = list(
+        ProjectionRun.objects.filter(
+            status=ProjectionRunStatus.RUNNING,
+            started_at__lt=now - conf.DEFAULT_RUN_TIMEOUT,
+        )
+    )
+    for run in abandoned:
+        run.status = ProjectionRunStatus.FAILED
+        run.finished_at = now
+        run.error_type = "abandoned"
+        run.error_message = (
+            f"still running after {conf.DEFAULT_RUN_TIMEOUT}; the worker was "
+            f"killed without finishing. Retry it, or let the sweeper re-project."
+        )
+        run.save(update_fields=["status", "finished_at", "error_type", "error_message"])
+    return {"executed": executed, "failed": abandoned}
+
+
 def dispatch_pending_projections(*, lookback=None):
     """Sweep every active Projection for landed loads it has not projected.
 
-    Also the safety net for a dispatch queue: a run still QUEUED past
-    ``PROJECTION_QUEUE_GRACE`` is one the queue dropped, and is executed here
-    before the outstanding loads are computed — so it is not counted as
-    outstanding and re-queued a second time.
+    Reaps first: a dropped queued run is executed and an abandoned running
+    run is failed before outstanding loads are computed, so neither is counted
+    as in flight forever nor queued a second time.
     """
-    from django.utils import timezone
-
-    from django_connectors.conf import conf
-
-    stale = timezone.now() - conf.PROJECTION_QUEUE_GRACE
-    dispatched = []
+    dispatched = list(reap_stale_projection_runs()["executed"])
     for projection in Projection.objects.filter(
         enabled=True, status=ProjectionStatus.ACTIVE
     ).select_related("binding"):
         if projection.binding.status == BindingStatus.PURGING:
             continue
-        for dropped in ProjectionRun.objects.filter(
-            projection=projection,
-            status=ProjectionRunStatus.QUEUED,
-            created_at__lt=stale,
-        ).order_by("created_at"):
-            dispatched.append(projection_runner.execute(dropped))
         for projection_run in projection_runner.dispatch_pending(
             projection, lookback=lookback
         ):

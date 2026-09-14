@@ -37,7 +37,6 @@ membership changes, files with several parents, ``changes.list`` paging over a
 very large drive, export size limits on big documents, and real throttling.
 """
 
-import fnmatch
 import logging
 import re
 from typing import ClassVar
@@ -45,12 +44,19 @@ from typing import ClassVar
 from django_connectors.exceptions import ConfigurationError, SourceError
 from django_connectors.providers.google.auth import (
     bearer_token,
+    error_payload,
     google_client,
     google_json,
     google_request,
+    paginate,
     raise_for_google_error,
 )
-from django_connectors.sources.base import SourceDefinition, as_config, read_capped
+from django_connectors.sources.base import (
+    SourceDefinition,
+    as_config,
+    name_matches,
+    read_capped,
+)
 from django_connectors.sources.memory import tombstone
 
 logger = logging.getLogger(__name__)
@@ -67,6 +73,8 @@ DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 DEFAULT_RESOURCE = "drive_files"
 DEFAULT_PAGE_SIZE = 200
 MAX_PAGE_SIZE = 1000
+#: Pending folders asked for in one `files.list` query on the cold walk.
+FOLDERS_PER_QUERY = 20
 
 #: Everything this source keeps in dlt's resource state lives under one key,
 #: with the Binding's *scope* recorded beside it: a Binding repointed from one
@@ -109,10 +117,7 @@ def _token_rejected(response):
         return True
     if response.status_code != 400:
         return False
-    try:
-        errors = ((response.json() or {}).get("error") or {}).get("errors") or []
-    except ValueError:
-        return False
+    errors = error_payload(response).get("errors") or []
     return any(
         (error or {}).get("reason") == "invalid"
         and "pagetoken" in str((error or {}).get("location") or "").lower()
@@ -294,40 +299,41 @@ class GoogleDriveSource(SourceDefinition):
         return token
 
     def _cold_walk(self, client, config, entry):
-        """Every in-scope file now, by listing; folders and files recorded."""
+        """Every in-scope file now, by listing; folders and files recorded.
+
+        Drive-wide: one listing. Folder-scoped: a breadth-first walk, asking
+        for several pending folders per request (``'a' in parents or 'b' in
+        parents``), since a deep, sparse tree is the common shape.
+        """
         folder_id = config.get("folder_id")
         glob = config.get("name_glob")
+        tracking = bool(folder_id or glob)
         entry["folders"], entry["files"] = {}, {}
-        if not folder_id:
-            for record in self._list(client, config, query="trashed = false"):
-                if record["is_folder"] or (
-                    glob and not name_matches(record["name"], glob)
-                ):
-                    continue
-                if glob:
-                    entry["files"][record["id"]] = record["parent_id"]
-                yield record
-            return
-        assert_drive_id(folder_id)
-        entry["folders"][folder_id] = None
-        pending = [folder_id]
+        if folder_id:
+            assert_drive_id(folder_id)
+            entry["folders"][folder_id] = None
+        pending = [folder_id] if folder_id else [None]
         while pending:
-            parent = pending.pop()
-            for record in self._list(
-                client, config, query=f"'{parent}' in parents and trashed = false"
-            ):
+            batch, pending = pending[:FOLDERS_PER_QUERY], pending[FOLDERS_PER_QUERY:]
+            if batch == [None]:
+                query = "trashed = false"
+            else:
+                parents = " or ".join(f"'{parent}' in parents" for parent in batch)
+                query = f"({parents}) and trashed = false"
+            for record in self._list(client, config, query=query):
                 if record["is_folder"]:
-                    if record["id"] not in entry["folders"]:
-                        entry["folders"][record["id"]] = parent
+                    if folder_id and record["id"] not in entry["folders"]:
+                        entry["folders"][record["id"]] = record["parent_id"]
                         pending.append(record["id"])
                     continue
                 if glob and not name_matches(record["name"], glob):
                     continue
-                entry["files"][record["id"]] = parent
+                if tracking:
+                    entry["files"][record["id"]] = record["parent_id"]
                 yield record
 
     def _list(self, client, config, *, query):
-        """``files.list`` over `query`, paged, as records; folders included."""
+        """``files.list`` over `query`, every page, as records; folders included."""
         params = {
             "q": query,
             "fields": LIST_FIELDS,
@@ -337,16 +343,11 @@ class GoogleDriveSource(SourceDefinition):
         }
         if config.get("drive_id"):
             params.update({"corpora": "drive", "driveId": config["drive_id"]})
-        while True:
-            payload = google_json(
-                client, "files", params=params, what="listing Drive files"
-            )
+        for payload in paginate(
+            client, "files", params=params, what="listing Drive files"
+        ):
             for item in payload.get("files") or []:
                 yield file_record(item)
-            token = payload.get("nextPageToken")
-            if not token:
-                return
-            params["pageToken"] = token
 
     def _changes(self, client, config, entry):
         """Replay the feed from the stored token, scoped, and store the new one.
@@ -376,14 +377,16 @@ class GoogleDriveSource(SourceDefinition):
 
         def drop_subtree(folder_id):
             """Tombstone every landed file under `folder_id`, and forget the tree."""
-            gone = {folder_id}
-            grew = True
-            while grew:
-                grew = False
-                for child, parent in list(folders.items()):
-                    if parent in gone and child not in gone:
+            children = {}
+            for child, parent in folders.items():
+                children.setdefault(parent, []).append(child)
+            gone, frontier = {folder_id}, [folder_id]
+            while frontier:
+                current = frontier.pop()
+                for child in children.get(current, ()):
+                    if child not in gone:
                         gone.add(child)
-                        grew = True
+                        frontier.append(child)
             for child in gone:
                 folders.pop(child, None)
             for file_id, parent in list(files.items()):
@@ -513,15 +516,7 @@ class GoogleDriveSource(SourceDefinition):
         self, *, connection, credentials, query=None, path=None, cursor=None, limit=None
     ):
         """Folders and files: the drive at the top, a folder under ``folder/<id>``."""
-        kind, _, target = (path or "").partition("/")
-        if not path:
-            parent = None
-        elif kind == "folder" and target:
-            parent = target
-        else:
-            raise ConfigurationError(
-                f"google_drive discovery path must be 'folder/<id>', got {path!r}."
-            )
+        _, parent = parse_drive_path(path)
         client = google_client(base_url=self.api_base_url, credentials=credentials)
         return list_drive(
             client, parent=parent, query=query, cursor=cursor, limit=limit
@@ -529,6 +524,19 @@ class GoogleDriveSource(SourceDefinition):
 
 
 # --- shared with the Sheets source -----------------------------------------
+
+
+def parse_drive_path(path, *, kinds=("folder",)):
+    """``(kind, id)`` from a discovery path such as ``folder/<id>``, or
+    ``(None, None)`` for the top. Raises for a path this source did not issue."""
+    if not path:
+        return None, None
+    kind, _, target = path.partition("/")
+    if kind in kinds and target:
+        assert_drive_id(target)
+        return kind, target
+    expected = " or ".join(f"'{kind}/<id>'" for kind in kinds)
+    raise ConfigurationError(f"discovery path must be {expected}, got {path!r}.")
 
 
 def assert_drive_id(value):
@@ -631,19 +639,9 @@ def file_record(entry):
     }
 
 
-def name_matches(name, glob):
-    """Case-insensitive, as Drive's own search is."""
-    return fnmatch.fnmatchcase((name or "").lower(), glob.lower())
-
-
 def _stream(client, path, params, *, max_bytes, what):
     """``(bytes, content_type)`` under `max_bytes`, checked while streaming."""
-    response = client.session.get(
-        f"{client.base_url.rstrip('/')}/{path}",
-        params=params,
-        stream=True,
-        auth=client.auth,
-    )
+    response = google_request(client, path, params=params, stream=True)
     try:
         raise_for_google_error(response, what=f"downloading {what}")
         return read_capped(response, max_bytes=max_bytes, what=what)

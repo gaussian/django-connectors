@@ -52,7 +52,6 @@ from django_connectors.exceptions import (
     SourceError,
 )
 from django_connectors.sources.base import SourceDefinition, as_config
-from django_connectors.sources.reshape import validate_unpivot
 
 # Only these two reach a network the way a customer expects. `file:`, `ftp:` and
 # friends turn a "call an API" feature into "read the worker's filesystem".
@@ -177,7 +176,12 @@ class RestSource(SourceDefinition):
 
         for name, spec in resources.items():
             if isinstance(spec, dict) and "unpivot" in spec:
-                validate_unpivot(spec["unpivot"], where=f"resources.{name}.unpivot")
+                self.validate_reshape(
+                    spec["unpivot"],
+                    where=f"resources.{name}.unpivot",
+                    primary_key=spec.get("primary_key") or (),
+                    cursor=(spec.get("incremental") or {}).get("cursor_path"),
+                )
             self._validate_resource(name, spec)
 
         self._validate_auth(config.get("auth"))
@@ -277,10 +281,6 @@ class RestSource(SourceDefinition):
             raise ConfigurationError(_readable_validation_error(exc, order)) from exc
 
     # --- extraction --------------------------------------------------------
-
-    def reshape_for(self, resource_name, binding):
-        spec = self.resource_spec(binding, resource_name)
-        return spec.get("unpivot")
 
     def incremental_for(self, resource_name, binding):
         """Cursor kwargs only. See ``SourceDefinition.incremental_for``."""

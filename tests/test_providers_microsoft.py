@@ -1898,13 +1898,7 @@ def test_the_file_source_fetches_a_landed_items_bytes(
     graph.files["F1"] = b"%PDF-1.7 hello"
     binding = make_graph_binding()
     run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
-    row = next(
-        iter(
-            access.iter_rows(
-                access.binding_relation(binding, "drive_items"), binding=binding
-            )
-        )
-    )
+    row = access.sample_rows(binding, "drive_items", limit=1)[0]
 
     fetched = fetch_record_content(
         binding, "drive_items", {"id": row["id"], "drive_id": row["drive_id"]}
@@ -1997,11 +1991,7 @@ def test_a_single_item_binding_lands_that_item_only(
     binding = make_graph_binding(item_id="F1")
     run = run_services.run_binding(binding, trigger=RunTrigger.INITIAL)
     assert run.status == "succeeded", run.error_message
-    rows = list(
-        access.iter_rows(
-            access.binding_relation(binding, "drive_items"), binding=binding
-        )
-    )
+    rows = access.sample_rows(binding, "drive_items", limit=10)
     assert [r["id"] for r in rows] == ["F1"]
 
 
@@ -2014,11 +2004,7 @@ def test_a_deleted_single_item_lands_as_a_tombstone(
     del graph.items["F1"]
     second = run_services.run_binding(binding, trigger=RunTrigger.SCHEDULED)
     assert second.status == "succeeded", second.error_message
-    rows = list(
-        access.iter_rows(
-            access.binding_relation(binding, "drive_items"), binding=binding
-        )
-    )
+    rows = access.sample_rows(binding, "drive_items", limit=10)
     assert len(rows) == 1 and bool(rows[0][DELETED_COLUMN]) is True
 
 
