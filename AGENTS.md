@@ -12,6 +12,7 @@ ingestion via dlt. Django library published to PyPI.
   `ruff format --check django_connectors/ tests/ example/` (config in `pyproject.toml`).
   `example/` is linted because hosts copy it verbatim.
 - Default working branch: `develop`. Releases flow `develop` → `main`.
+- Dependency cooldown: a 7-day cooldown is `exclude-newer` under `[tool.uv]` in `pyproject.toml`; for an urgent fix, add `<pkg> = false` under `exclude-newer-package`, run `uv lock --upgrade-package <pkg>`, and remove the exemption once the release is over 7 days old.
 
 ## Test tiers
 
