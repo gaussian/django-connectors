@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-connectors"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Django framework for connecting applications to third-party systems, with support for authentication, polling, webhooks, incremental sync, and data ingestion via dlt."
 readme = "README.md"
 license = "MIT"
@@ -82,6 +82,10 @@ markers = [
   # DJANGO_CONNECTORS_RECORD_* variables. See tests/test_recorded.py.
   "recorded: replays a recorded provider exchange (record with --record-mode=rewrite)",
 ]
+
+[tool.uv]
+# Dependency cooldown: never resolve a release under 7 days old.
+exclude-newer = "7 days"
 
 [tool.ruff]
 target-version = "py312"
