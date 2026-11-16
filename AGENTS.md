@@ -9,8 +9,10 @@ ingestion via dlt. Django library published to PyPI.
 - Source: `django_connectors/`
 - Tests: `tests/` — run with `uv run --all-extras pytest`. See "Test tiers" below.
 - Lint + format: `uv run --all-extras ruff check django_connectors/ tests/ example/` and
-  `ruff format --check django_connectors/ tests/ example/` (config in `pyproject.toml`).
-  `example/` is linted because hosts copy it verbatim.
+  `uv run --all-extras ruff format --check django_connectors/ tests/ example/` (config in
+  `pyproject.toml`). `example/` is linted because hosts copy it verbatim.
+- Type-check: none configured (no mypy/pyright). CI's `lint` job runs a compile check
+  instead: `uv run --all-extras python -m compileall -q django_connectors/`.
 - Default working branch: `develop`. Releases flow `develop` → `main`.
 - Dependency cooldown: a 7-day cooldown is `exclude-newer` under `[tool.uv]` in `pyproject.toml`; for an urgent fix, add `<pkg> = false` under `exclude-newer-package`, run `uv lock --upgrade-package <pkg>`, and remove the exemption once the release is over 7 days old.
 
@@ -82,5 +84,6 @@ The version is a static string (`pyproject.toml`, `django_connectors/__init__.py
 `uv.lock`) and is **not** bumped automatically on merge — it must be bumped
 deliberately, or no release is cut.
 
-**Follow the `create-merge-pr` skill** (`.agents/skills/create-merge-pr/`) for the
-full PR workflow, including when and how to bump the version.
+**Follow the `create-merge-pr` skill** (the machine-wide skill, installed by lobster
+into `~/.agents/skills/create-merge-pr/`) for the full PR workflow, including when
+and how to bump the version.
